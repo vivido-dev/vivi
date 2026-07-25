@@ -274,7 +274,7 @@ pub fn play(
         info.sar_num,
         info.sar_den,
         config.zoom,
-        TerminalGeometry::current(),
+        TerminalGeometry::settled_presenter(client),
     );
 
     let source_id = client.allocate_id()?;

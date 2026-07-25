@@ -29,7 +29,12 @@ pub fn view(
     let (width, height) = image::ImageReader::open(path)?
         .with_guessed_format()?
         .into_dimensions()?;
-    let display = display_size(width, height, config.zoom, TerminalGeometry::current());
+    let display = display_size(
+        width,
+        height,
+        config.zoom,
+        TerminalGeometry::settled_presenter(client),
+    );
 
     let source_id = client.allocate_id()?;
     let node_id = client.allocate_id()?;

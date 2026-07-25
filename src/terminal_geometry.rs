@@ -1,9 +1,9 @@
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_CELL_WIDTH_PX: u32 = 10;
 const DEFAULT_CELL_HEIGHT_PX: u32 = 20;
+const DISPLAY_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const CSI_CELL_SIZE_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -42,6 +42,29 @@ impl TerminalGeometry {
 
     pub fn from_cells(cols: u16, rows: u16) -> Self {
         Self::with_cell_size(cols, rows, DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX)
+    }
+
+    fn from_settled_display(display: vivid_sdk::DisplayState) -> Option<Self> {
+        if !display.settled {
+            return None;
+        }
+        let cols = u16::try_from(display.grid_columns).ok()?;
+        let rows = u16::try_from(display.grid_rows).ok()?;
+        (cols > 0 && rows > 0)
+            .then(|| Self::with_cell_size(cols, rows, display.cell_width, display.cell_height))
+    }
+
+    pub fn settled_presenter(session: &vivid_sdk::ProducerSession) -> Self {
+        let deadline = Instant::now() + DISPLAY_SETTLE_TIMEOUT;
+        loop {
+            if let Some(geometry) = Self::from_settled_display(session.display_state()) {
+                return geometry;
+            }
+            if Instant::now() >= deadline {
+                return Self::current();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub fn with_cell_size(cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> Self {
@@ -132,8 +155,6 @@ fn query_cell_size_with_csi() -> Option<(u32, u32)> {
     use std::fs::OpenOptions;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
-    use std::time::Instant;
-
     struct RestoreTermios {
         fd: libc::c_int,
         original: libc::termios,
@@ -231,6 +252,7 @@ fn parse_csi_16t_response(data: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vivid_sdk::DisplayState;
 
     #[test]
     fn cell_count_rounds_up() {
@@ -241,5 +263,25 @@ mod tests {
     #[test]
     fn parses_cell_size_response() {
         assert_eq!(parse_csi_16t_response(b"noise\x1b[6;19;9t"), Some((9, 19)));
+    }
+
+    #[test]
+    fn presenter_geometry_is_accepted_only_after_settling() {
+        let mut display = DisplayState {
+            display_generation: 2,
+            viewport_width: 900,
+            viewport_height: 600,
+            grid_columns: 90,
+            grid_rows: 30,
+            cell_width: 10,
+            cell_height: 20,
+            settled: false,
+        };
+        assert!(TerminalGeometry::from_settled_display(display).is_none());
+        display.settled = true;
+        assert_eq!(
+            TerminalGeometry::from_settled_display(display),
+            Some(TerminalGeometry::with_cell_size(90, 30, 10, 20))
+        );
     }
 }
