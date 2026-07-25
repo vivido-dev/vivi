@@ -18,12 +18,28 @@ const AUDIO_PREBUFFER_US: u64 = 100_000;
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(30);
 const PLAYBACK_COMPLETION_GRACE: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackPhase {
+    Pending,
+    Streaming,
+    IngressClosed,
+}
+
+impl PlaybackPhase {
+    fn admitted(self) -> bool {
+        self != Self::Pending
+    }
+
+    fn may_join_presenter_wait(self) -> bool {
+        self == Self::IngressClosed
+    }
+}
+
 struct PlaybackState {
     packet_id: u64,
     encoded_bytes: u64,
-    playback_admitted: bool,
+    playback_phase: PlaybackPhase,
     playback_wait: Option<SourceWaitHandle>,
-    playback_minimum_buffer_us: u64,
     audio_started: bool,
     first_pts_us: Option<i64>,
     last_pts_us: Option<i64>,
@@ -38,9 +54,8 @@ impl PlaybackState {
         Self {
             packet_id: 0,
             encoded_bytes: 0,
-            playback_admitted: false,
+            playback_phase: PlaybackPhase::Pending,
             playback_wait: None,
-            playback_minimum_buffer_us: 0,
             audio_started: false,
             first_pts_us: None,
             last_pts_us: None,
@@ -56,9 +71,8 @@ impl PlaybackState {
     /// stream start would schedule every resumed frame `already-played` seconds of wall time
     /// into the future, leaving the source blank and its linked audio silent.
     fn begin_recovery_restart(&mut self) {
-        self.playback_admitted = false;
+        self.playback_phase = PlaybackPhase::Pending;
         self.playback_wait = None;
-        self.playback_minimum_buffer_us = 0;
         self.first_pts_us = None;
         self.audio_buffered_us = 0;
         self.audio_horizon_us = None;
@@ -112,8 +126,7 @@ fn start_playback(
         state.first_pts_us.unwrap_or(0),
         minimum_buffer_us,
     )?;
-    state.playback_minimum_buffer_us = minimum_buffer_us;
-    state.playback_admitted = true;
+    state.playback_phase = PlaybackPhase::Streaming;
     if !state.audio_started
         && let Some(playback) = audio.as_ref()
     {
@@ -150,24 +163,6 @@ fn admit_playback(
         .transpose()?;
     client.play_at(source_id, start_pts_us, minimum_buffer_us)?;
     Ok(wait)
-}
-
-fn playback_prebuffer_ready(state: &PlaybackState) -> bool {
-    match (state.first_pts_us, state.last_pts_us) {
-        (Some(first), Some(last)) => {
-            last.saturating_sub(first).max(0) as u64 >= state.playback_minimum_buffer_us
-        }
-        _ => false,
-    }
-}
-
-fn confirm_playback_started(state: &mut PlaybackState) -> io::Result<()> {
-    if playback_prebuffer_ready(state)
-        && let Some(mut wait) = state.playback_wait.take()
-    {
-        wait.wait()?;
-    }
-    Ok(())
 }
 
 struct VideoSubmitter<'a> {
@@ -214,7 +209,6 @@ impl VideoSubmitter<'_> {
                     state.first_pts_us.unwrap_or(0),
                     INITIAL_BUFFER_US,
                 )?;
-                state.playback_minimum_buffer_us = INITIAL_BUFFER_US;
                 if state.audio_started
                     && let Some(playback) = self.audio.as_ref()
                 {
@@ -256,7 +250,7 @@ impl VideoSubmitter<'_> {
             );
         }
 
-        if !state.playback_admitted && start_after_packet {
+        if !state.playback_phase.admitted() && start_after_packet {
             start_playback(
                 self.client,
                 self.source_id,
@@ -266,7 +260,6 @@ impl VideoSubmitter<'_> {
                 self.path,
             )?;
         }
-        confirm_playback_started(state)?;
         if state.packet_id.is_multiple_of(120) {
             self.client.verbose(format_args!(
                 "video source {}: sent {} packets / {} bytes",
@@ -447,7 +440,7 @@ pub fn play(
         }
 
         if vivid_audio.is_some() {
-            if !state.playback_admitted
+            if !state.playback_phase.admitted()
                 && linked_start_ready(&state, &mut pending_video)
                 && state.audio_buffered_us >= AUDIO_PREBUFFER_US
             {
@@ -460,7 +453,7 @@ pub fn play(
                     path,
                 )?;
             }
-            while state.playback_admitted
+            while state.playback_phase.admitted()
                 && pending_video
                     .front()
                     .is_some_and(|packet| audio_covers_video(packet, state.audio_horizon_us))
@@ -491,7 +484,7 @@ pub fn play(
         }
     }
 
-    if state.packet_id == 0 && !pending_video.is_empty() && !state.playback_admitted {
+    if state.packet_id == 0 && !pending_video.is_empty() && !state.playback_phase.admitted() {
         start_playback(
             client,
             source_id,
@@ -515,7 +508,7 @@ pub fn play(
     if state.packet_id == 0 {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "video has no packets").into());
     }
-    if !state.playback_admitted {
+    if !state.playback_phase.admitted() {
         start_playback(
             client,
             source_id,
@@ -526,6 +519,8 @@ pub fn play(
         )?;
     }
     client.eos(source_id, state.epoch)?;
+    state.playback_phase = PlaybackPhase::IngressClosed;
+    debug_assert!(state.playback_phase.may_join_presenter_wait());
     if let Some(mut wait) = state.playback_wait.take() {
         wait.wait()?;
     }
@@ -617,13 +612,13 @@ mod tests {
     fn keyframe_recovery_restarts_at_the_recovery_position() {
         let mut state = PlaybackState::new();
         state.packet_id = 240;
-        state.playback_admitted = true;
+        state.playback_phase = PlaybackPhase::Streaming;
         state.first_pts_us = Some(0);
         state.last_pts_us = Some(8_000_000);
         state.observe_audio_packet(8_000_000, 21_333);
 
         state.begin_recovery_restart();
-        assert!(!state.playback_admitted);
+        assert_eq!(state.playback_phase, PlaybackPhase::Pending);
         assert_eq!(
             state.first_pts_us, None,
             "the restarted PLAY must begin at the recovery keyframe, not the original stream start"
@@ -633,19 +628,13 @@ mod tests {
     }
 
     #[test]
-    fn playback_confirmation_waits_until_video_prebuffer_can_satisfy_presenter() {
-        let mut state = PlaybackState::new();
-        state.playback_admitted = true;
-        state.playback_minimum_buffer_us = 100_000;
-        state.first_pts_us = Some(1_000_000);
-        state.last_pts_us = Some(1_033_000);
+    fn presenter_start_wait_is_joined_only_after_ingress_closes() {
+        assert!(!PlaybackPhase::Pending.may_join_presenter_wait());
         assert!(
-            !playback_prebuffer_ready(&state),
-            "joining PLAYBACK_STARTED before queued pre-roll is sent deadlocks the producer"
+            !PlaybackPhase::Streaming.may_join_presenter_wait(),
+            "blocking while H.264 packets are still streaming can starve decoder reordering"
         );
-
-        state.last_pts_us = Some(1_100_000);
-        assert!(playback_prebuffer_ready(&state));
+        assert!(PlaybackPhase::IngressClosed.may_join_presenter_wait());
     }
 
     #[test]
