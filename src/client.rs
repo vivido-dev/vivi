@@ -62,6 +62,7 @@ pub fn producer_config(config: &Config) -> ProducerConfig {
         verbose: config.verbose,
         producer: "vivi".into(),
         producer_version: env!("CARGO_PKG_VERSION").into(),
+        authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
         allow_version_retry: false,
         required_features: vec![
             messages::FEATURE_RASTER_RGBA8,
