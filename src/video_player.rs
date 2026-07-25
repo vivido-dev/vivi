@@ -565,15 +565,15 @@ pub fn play(
             path,
         )?;
     }
-    client.eos(source_id, state.epoch)?;
+    client.eos_sender(&sender, state.epoch)?;
     state.playback_phase = PlaybackPhase::IngressClosed;
     debug_assert!(state.playback_phase.may_join_presenter_wait());
     if let Some(mut wait) = state.playback_wait.take() {
         wait.wait()?;
     }
-    if let Some((audio_id, _, _)) = vivid_audio.as_ref()
+    if let Some((audio_id, audio_sender, _)) = vivid_audio.as_ref()
         && let Err(error) = client
-            .eos(*audio_id, state.epoch)
+            .eos_sender(audio_sender, state.epoch)
             .and_then(|_| client.drain(*audio_id))
     {
         eprintln!(

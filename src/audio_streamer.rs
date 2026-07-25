@@ -66,7 +66,7 @@ pub fn play(client: &mut VividClient, path: &Path) -> Result<(), Box<dyn std::er
             client.play_at(source_id, info.first_pts_us.unwrap_or(0), buffered_us)?;
         }
     }
-    client.eos(source_id, 1)?;
+    client.eos_sender(&sender, 1)?;
     client.drain(source_id)?;
     client.verbose(format_args!(
         "audio source {source_id}: EOS after {packet_id} packets"
