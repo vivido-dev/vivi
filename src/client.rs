@@ -62,6 +62,7 @@ pub fn producer_config(config: &Config) -> ProducerConfig {
         verbose: config.verbose,
         producer: "vivi".into(),
         producer_version: env!("CARGO_PKG_VERSION").into(),
+        allow_version_retry: false,
         required_features: vec![
             messages::FEATURE_RASTER_RGBA8,
             messages::FEATURE_SCENE_TRANSACTIONS,
