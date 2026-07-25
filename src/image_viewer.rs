@@ -1,10 +1,11 @@
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 use crate::cli::Config;
-use crate::client::VividClient;
+use crate::client::{VividClient, WaitSource};
 use crate::protocol::HARD_MAX_RECORD_BODY;
 use crate::protocol::wire::ConnectionKind;
 use crate::terminal_geometry::{TerminalGeometry, cells_for_pixels, reserve_rows};
@@ -12,6 +13,7 @@ use crate::terminal_geometry::{TerminalGeometry, cells_for_pixels, reserve_rows}
 const FIT_MARGIN_COLS: u16 = 4;
 const FIT_MARGIN_ROWS: u16 = 2;
 const RASTER_OVERHEAD: usize = 48 + 24;
+const PRESENTATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DisplaySize {
@@ -89,6 +91,15 @@ pub fn view(
         }
         let mut sender = client.open_media_sender(source, ConnectionKind::Raster)?;
         sender.send_raster(1, 1, width, height, &rgba)?;
+    }
+    if !config.no_wait && client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1)
+    {
+        client.wait_source(WaitSource {
+            source_id,
+            condition: crate::protocol::messages::WAIT_FIRST_VISIBLE_PRESENTATION,
+            value: None,
+            timeout_us: u64::try_from(PRESENTATION_TIMEOUT.as_micros()).unwrap(),
+        })?;
     }
     client.verbose(format_args!(
         "image {}: {width}x{height} RGBA -> {}x{} cells",

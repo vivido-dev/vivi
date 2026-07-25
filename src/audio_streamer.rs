@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::client::VividClient;
 use crate::ffmpeg::AudioDemuxer;
@@ -7,6 +8,7 @@ use crate::protocol::media::AudioPacket;
 use crate::protocol::wire::ConnectionKind;
 
 const INITIAL_BUFFER_US: u64 = 100_000;
+const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn play(client: &mut VividClient, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let info = AudioDemuxer::inspect(path)?;
@@ -36,7 +38,16 @@ pub fn play(client: &mut VividClient, path: &Path) -> Result<(), Box<dyn std::er
         })?;
         buffered_us = buffered_us.saturating_add(packet.duration_us);
         if !started && buffered_us >= INITIAL_BUFFER_US {
-            client.play_at(source_id, info.first_pts_us.unwrap_or(0), INITIAL_BUFFER_US)?;
+            if client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1) {
+                client.play_and_wait_until_playing(
+                    source_id,
+                    info.first_pts_us.unwrap_or(0),
+                    INITIAL_BUFFER_US,
+                    PLAYBACK_START_TIMEOUT,
+                )?;
+            } else {
+                client.play_at(source_id, info.first_pts_us.unwrap_or(0), INITIAL_BUFFER_US)?;
+            }
             started = true;
         }
     }
@@ -44,7 +55,16 @@ pub fn play(client: &mut VividClient, path: &Path) -> Result<(), Box<dyn std::er
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "audio has no packets").into());
     }
     if !started {
-        client.play_at(source_id, info.first_pts_us.unwrap_or(0), buffered_us)?;
+        if client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1) {
+            client.play_and_wait_until_playing(
+                source_id,
+                info.first_pts_us.unwrap_or(0),
+                buffered_us,
+                PLAYBACK_START_TIMEOUT,
+            )?;
+        } else {
+            client.play_at(source_id, info.first_pts_us.unwrap_or(0), buffered_us)?;
+        }
     }
     client.eos(source_id, 1)?;
     client.drain(source_id)?;

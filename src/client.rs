@@ -3,7 +3,7 @@ use crate::ffmpeg::{AudioInfo, VideoInfo};
 use crate::protocol::messages;
 
 use vivid_sdk::{AudioConfig, ProducerConfig, VideoConfig};
-pub use vivid_sdk::{MediaSender, ProducerSession as VividClient};
+pub use vivid_sdk::{MediaSender, ProducerSession as VividClient, WaitSource};
 
 impl VideoConfig for VideoInfo {
     fn vivid_video_config(&self, source_id: u64) -> messages::VideoSourceConfig<'_> {
@@ -79,6 +79,7 @@ pub fn producer_config(config: &Config) -> ProducerConfig {
             messages::FEATURE_VIDEO_CONTROL_V1,
             messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
             messages::FEATURE_DECODER_DESCRIPTION_V1,
+            messages::FEATURE_OBSERVABILITY_CORE_V1,
         ],
     }
 }

@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::audio_player;
 use crate::cli::Config;
-use crate::client::{MediaSender, VividClient};
+use crate::client::{MediaSender, VividClient, WaitSource};
 use crate::ffmpeg::{EncodedMediaPacket, EncodedPacket, VideoDemuxer};
 use crate::protocol::media::{AudioPacket, VideoPacket};
 use crate::protocol::wire::ConnectionKind;
@@ -15,13 +15,14 @@ const FIT_MARGIN_COLS: u16 = 4;
 const FIT_MARGIN_ROWS: u16 = 2;
 const INITIAL_BUFFER_US: u64 = 33_000;
 const AUDIO_PREBUFFER_US: u64 = 100_000;
+const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(30);
+const PLAYBACK_COMPLETION_GRACE: Duration = Duration::from_secs(30);
 
 struct PlaybackState {
     packet_id: u64,
     encoded_bytes: u64,
     playback_started: bool,
     audio_started: bool,
-    playback_wall_start: Option<Instant>,
     first_pts_us: Option<i64>,
     last_pts_us: Option<i64>,
     epoch: u32,
@@ -37,7 +38,6 @@ impl PlaybackState {
             encoded_bytes: 0,
             playback_started: false,
             audio_started: false,
-            playback_wall_start: None,
             first_pts_us: None,
             last_pts_us: None,
             epoch: 1,
@@ -100,13 +100,21 @@ fn start_playback(
     state: &mut PlaybackState,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    client.play_at(
-        source_id,
-        state.first_pts_us.unwrap_or(0),
-        minimum_buffer_us,
-    )?;
+    if client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1) {
+        client.play_and_wait_until_playing(
+            source_id,
+            state.first_pts_us.unwrap_or(0),
+            minimum_buffer_us,
+            PLAYBACK_START_TIMEOUT,
+        )?;
+    } else {
+        client.play_at(
+            source_id,
+            state.first_pts_us.unwrap_or(0),
+            minimum_buffer_us,
+        )?;
+    }
     state.playback_started = true;
-    state.playback_wall_start = Some(Instant::now());
     if !state.audio_started
         && let Some(playback) = audio.as_ref()
     {
@@ -162,11 +170,23 @@ impl VideoSubmitter<'_> {
                 }
                 self.client.pause(self.source_id)?;
                 self.client.wait_until_visible(self.sender.source_mut())?;
-                self.client.play_at(
-                    self.source_id,
-                    state.first_pts_us.unwrap_or(0),
-                    INITIAL_BUFFER_US,
-                )?;
+                if self
+                    .client
+                    .supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1)
+                {
+                    self.client.play_and_wait_until_playing(
+                        self.source_id,
+                        state.first_pts_us.unwrap_or(0),
+                        INITIAL_BUFFER_US,
+                        PLAYBACK_START_TIMEOUT,
+                    )?;
+                } else {
+                    self.client.play_at(
+                        self.source_id,
+                        state.first_pts_us.unwrap_or(0),
+                        INITIAL_BUFFER_US,
+                    )?;
+                }
                 if state.audio_started
                     && let Some(playback) = self.audio.as_ref()
                 {
@@ -488,21 +508,20 @@ pub fn play(
         );
     }
     if !config.no_wait
-        && let (Some(started), Some(first_pts), Some(last_pts)) = (
-            state.playback_wall_start,
-            state.first_pts_us,
-            state.last_pts_us,
-        )
+        && client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1)
+        && let (Some(first_pts), Some(last_pts)) = (state.first_pts_us, state.last_pts_us)
     {
-        let timeline = Duration::from_micros(last_pts.saturating_sub(first_pts).max(0) as u64);
-        let remaining = timeline.saturating_sub(started.elapsed()) + Duration::from_millis(250);
-        if !remaining.is_zero() {
-            client.verbose(format_args!(
-                "waiting {:.2?} for presenter playback",
-                remaining
-            ));
-            std::thread::sleep(remaining);
-        }
+        let timeline_us = last_pts.saturating_sub(first_pts).max(0) as u64;
+        let timeout = Duration::from_micros(timeline_us).saturating_add(PLAYBACK_COMPLETION_GRACE);
+        client.verbose(format_args!(
+            "waiting for presenter playback-ended milestone"
+        ));
+        client.wait_source(WaitSource {
+            source_id,
+            condition: crate::protocol::messages::WAIT_PLAYBACK_ENDED,
+            value: None,
+            timeout_us: u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX),
+        })?;
     }
     if state.audio_started
         && let Some(playback) = audio.as_mut()
