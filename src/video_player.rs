@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::audio_player;
 use crate::cli::Config;
-use crate::client::{MediaSender, SourceWaitHandle, VividClient, WaitSource};
+use crate::client::{MediaSender, PresenterError, SourceWaitHandle, VividClient, WaitSource};
 use crate::ffmpeg::{EncodedMediaPacket, EncodedPacket, VideoDemuxer};
 use crate::protocol::media::{AudioPacket, VideoPacket};
 use crate::protocol::wire::ConnectionKind;
@@ -17,6 +17,7 @@ const INITIAL_BUFFER_US: u64 = 33_000;
 const AUDIO_PREBUFFER_US: u64 = 100_000;
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(30);
 const PLAYBACK_COMPLETION_GRACE: Duration = Duration::from_secs(30);
+const SOURCE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaybackPhase {
@@ -163,6 +164,52 @@ fn admit_playback(
         .transpose()?;
     client.play_at(source_id, start_pts_us, minimum_buffer_us)?;
     Ok(wait)
+}
+
+fn is_presenter_timeout(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<PresenterError>())
+        .is_some_and(|error| error.code == crate::protocol::messages::ERROR_TIMEOUT)
+}
+
+fn wait_in_source_timeout_slices(
+    total_timeout: Duration,
+    mut wait: impl FnMut(Duration) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut remaining = total_timeout;
+    while !remaining.is_zero() {
+        let timeout = remaining.min(SOURCE_WAIT_TIMEOUT);
+        match wait(timeout) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_presenter_timeout(&error) => {
+                remaining = remaining.saturating_sub(timeout);
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_playback_end(
+    client: &mut VividClient,
+    source_id: u64,
+    total_timeout: Duration,
+) -> io::Result<()> {
+    wait_in_source_timeout_slices(total_timeout, |timeout| {
+        client
+            .wait_source(WaitSource {
+                source_id,
+                condition: crate::protocol::messages::WAIT_PLAYBACK_ENDED,
+                value: None,
+                timeout_us: u64::try_from(timeout.as_micros())
+                    .expect("bounded source wait timeout fits in u64"),
+            })
+            .map(|_| ())
+    })
 }
 
 struct VideoSubmitter<'a> {
@@ -543,12 +590,7 @@ pub fn play(
         client.verbose(format_args!(
             "waiting for presenter playback-ended milestone"
         ));
-        client.wait_source(WaitSource {
-            source_id,
-            condition: crate::protocol::messages::WAIT_PLAYBACK_ENDED,
-            value: None,
-            timeout_us: u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX),
-        })?;
+        wait_for_playback_end(client, source_id, timeout)?;
     }
     if state.audio_started
         && let Some(playback) = audio.as_mut()
@@ -596,6 +638,16 @@ fn display_size(
 mod tests {
     use super::*;
 
+    fn presenter_error(code: u64) -> io::Error {
+        io::Error::other(PresenterError {
+            code,
+            request_id: 1,
+            fatal: false,
+            detail: crate::protocol::messages::ErrorDetail::new(),
+            diagnostic: String::from("test presenter error"),
+        })
+    }
+
     #[test]
     fn video_fit_preserves_aspect_ratio() {
         let geometry = TerminalGeometry::with_cell_size(80, 24, 10, 20);
@@ -635,6 +687,44 @@ mod tests {
             "blocking while H.264 packets are still streaming can starve decoder reordering"
         );
         assert!(PlaybackPhase::IngressClosed.may_join_presenter_wait());
+    }
+
+    #[test]
+    fn long_playback_completion_waits_use_presenter_bounded_slices() {
+        let mut timeouts = Vec::new();
+        let mut attempts = 0;
+        wait_in_source_timeout_slices(Duration::from_secs(95), |timeout| {
+            timeouts.push(timeout);
+            attempts += 1;
+            if attempts < 4 {
+                Err(presenter_error(crate::protocol::messages::ERROR_TIMEOUT))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            timeouts,
+            [
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_completion_wait_does_not_hide_non_timeout_errors() {
+        let error = wait_in_source_timeout_slices(Duration::from_secs(60), |_| {
+            Err(presenter_error(
+                crate::protocol::messages::ERROR_LIMIT_EXCEEDED,
+            ))
+        })
+        .unwrap_err();
+
+        assert!(!is_presenter_timeout(&error));
     }
 
     #[test]
