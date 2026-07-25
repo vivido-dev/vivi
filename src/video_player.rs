@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio_player;
 use crate::cli::Config;
-use crate::client::{MediaChannel, SourceHandle, VividClient};
+use crate::client::{MediaSender, VividClient};
 use crate::ffmpeg::{EncodedMediaPacket, EncodedPacket, VideoDemuxer};
 use crate::protocol::media::{AudioPacket, VideoPacket};
 use crate::protocol::wire::ConnectionKind;
@@ -128,8 +128,7 @@ struct VideoSubmitter<'a> {
     client: &'a mut VividClient,
     path: &'a Path,
     source_id: u64,
-    source: &'a mut SourceHandle,
-    channel: &'a mut MediaChannel,
+    sender: &'a mut MediaSender,
     audio: &'a mut Option<audio_player::AudioPlayback>,
 }
 
@@ -140,45 +139,65 @@ impl VideoSubmitter<'_> {
         packet: EncodedPacket,
         start_after_packet: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.client.apply_pending_source_events(self.source)?;
-        if let Some(minimum_epoch) = self.source.take_keyframe_request() {
-            state.epoch = state.epoch.saturating_add(1).max(minimum_epoch);
-            state.awaiting_keyframe = true;
-        }
-        if state.awaiting_keyframe && !packet.key {
-            return Ok(());
-        }
-        if state.awaiting_keyframe {
-            self.client.flush(self.source_id, state.epoch)?;
-            state.awaiting_keyframe = false;
-            state.begin_recovery_restart();
-        }
-        if !self.source.is_visible() {
-            if state.audio_started
-                && let Some(playback) = self.audio.as_ref()
-            {
-                playback.pause();
+        loop {
+            self.client
+                .apply_pending_source_events(self.sender.source_mut())?;
+            if let Some(minimum_epoch) = self.sender.source_mut().take_keyframe_request() {
+                state.epoch = state.epoch.saturating_add(1).max(minimum_epoch);
+                state.awaiting_keyframe = true;
             }
-            self.client.pause(self.source_id)?;
-            self.client.wait_until_visible(self.source)?;
-            self.client.play_at(
-                self.source_id,
-                state.first_pts_us.unwrap_or(0),
-                INITIAL_BUFFER_US,
-            )?;
-            if state.audio_started
-                && let Some(playback) = self.audio.as_ref()
-            {
-                playback.resume();
+            if state.awaiting_keyframe && !packet.key {
+                return Ok(());
+            }
+            if state.awaiting_keyframe {
+                self.client.flush(self.source_id, state.epoch)?;
+                state.awaiting_keyframe = false;
+                state.begin_recovery_restart();
+            }
+            if !self.sender.source().is_visible() {
+                if state.audio_started
+                    && let Some(playback) = self.audio.as_ref()
+                {
+                    playback.pause();
+                }
+                self.client.pause(self.source_id)?;
+                self.client.wait_until_visible(self.sender.source_mut())?;
+                self.client.play_at(
+                    self.source_id,
+                    state.first_pts_us.unwrap_or(0),
+                    INITIAL_BUFFER_US,
+                )?;
+                if state.audio_started
+                    && let Some(playback) = self.audio.as_ref()
+                {
+                    playback.resume();
+                }
+            }
+            if packet.data.is_empty() {
+                return Ok(());
+            }
+            let packet_id = state
+                .packet_id
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("video packet ID space exhausted"))?;
+            let result = self.sender.send_video(VideoPacket {
+                epoch: state.epoch,
+                packet_id,
+                pts_us: packet.pts_us,
+                dts_us: packet.dts_us,
+                duration_us: 0,
+                key: packet.key,
+                data: &packet.data,
+            });
+            match result {
+                Ok(()) => {
+                    state.packet_id = packet_id;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
             }
         }
-        if packet.data.is_empty() {
-            return Ok(());
-        }
-        state.packet_id = state
-            .packet_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("video packet ID space exhausted"))?;
         state.encoded_bytes = state.encoded_bytes.saturating_add(packet.data.len() as u64);
         if packet.pts_us != i64::MIN {
             state.first_pts_us.get_or_insert(packet.pts_us);
@@ -188,19 +207,6 @@ impl VideoSubmitter<'_> {
                     .map_or(packet.pts_us, |last: i64| last.max(packet.pts_us)),
             );
         }
-        self.client.send_video_packet(
-            self.source,
-            self.channel,
-            VideoPacket {
-                epoch: state.epoch,
-                packet_id: state.packet_id,
-                pts_us: packet.pts_us,
-                dts_us: packet.dts_us,
-                duration_us: 0,
-                key: packet.key,
-                data: &packet.data,
-            },
-        )?;
 
         if !state.playback_started && start_after_packet {
             start_playback(
@@ -276,7 +282,7 @@ pub fn play(
     let audio_id = vivid_audio_available
         .then(|| client.allocate_id())
         .transpose()?;
-    let (mut source, presenter_audio) = if let Some(audio_id) = audio_id {
+    let (source, presenter_audio) = if let Some(audio_id) = audio_id {
         let (video, audio) = client.create_linked_av_sources(
             source_id,
             &info,
@@ -290,9 +296,8 @@ pub fn play(
     let mut vivid_audio = if let Some((audio_id, presenter_audio)) = presenter_audio {
         match presenter_audio {
             Ok(audio_source) => {
-                let audio_channel =
-                    client.open_media_channel(&audio_source, ConnectionKind::Audio)?;
-                Some((audio_id, audio_source, audio_channel, 0_u64))
+                let audio_sender = client.open_media_sender(audio_source, ConnectionKind::Audio)?;
+                Some((audio_id, audio_sender, 0_u64))
             }
             Err(error) => {
                 if !remote_session && !config.is_dry_run() {
@@ -326,7 +331,7 @@ pub fn play(
     if !config.is_dry_run() {
         reserve_rows(rows)?;
     }
-    let mut channel = client.open_media_channel(&source, ConnectionKind::Video)?;
+    let mut sender = client.open_media_sender(source, ConnectionKind::Video)?;
 
     client.verbose(format_args!(
         "video {}: codec={} packetization={} {}x{} -> {columns}x{rows} cells",
@@ -347,26 +352,22 @@ pub fn play(
         match media_packet {
             EncodedMediaPacket::Audio(packet) => {
                 let mut failed = None;
-                if let Some((_, audio_source, audio_channel, packet_id)) = vivid_audio.as_mut()
+                if let Some((_, audio_sender, packet_id)) = vivid_audio.as_mut()
                     && !packet.data.is_empty()
                 {
                     *packet_id = packet_id
                         .checked_add(1)
                         .ok_or_else(|| io::Error::other("audio packet ID space exhausted"))?;
-                    if let Err(error) = client.send_audio_packet(
-                        audio_source,
-                        audio_channel,
-                        AudioPacket {
-                            epoch: state.epoch,
-                            packet_id: *packet_id,
-                            pts_us: packet.pts_us,
-                            dts_us: packet.dts_us,
-                            duration_us: packet.duration_us,
-                            trim_start_samples: packet.trim_start_samples,
-                            trim_end_samples: packet.trim_end_samples,
-                            data: &packet.data,
-                        },
-                    ) {
+                    if let Err(error) = audio_sender.send_audio(AudioPacket {
+                        epoch: state.epoch,
+                        packet_id: *packet_id,
+                        pts_us: packet.pts_us,
+                        dts_us: packet.dts_us,
+                        duration_us: packet.duration_us,
+                        trim_start_samples: packet.trim_start_samples,
+                        trim_end_samples: packet.trim_end_samples,
+                        data: &packet.data,
+                    }) {
                         failed = Some(error);
                     } else {
                         state.observe_audio_packet(packet.pts_us, packet.duration_us);
@@ -388,8 +389,7 @@ pub fn play(
                         client,
                         path,
                         source_id,
-                        source: &mut source,
-                        channel: &mut channel,
+                        sender: &mut sender,
                         audio: &mut audio,
                     }
                     .submit(&mut state, packet, true)?;
@@ -423,8 +423,7 @@ pub fn play(
                     client,
                     path,
                     source_id,
-                    source: &mut source,
-                    channel: &mut channel,
+                    sender: &mut sender,
                     audio: &mut audio,
                 }
                 .submit(&mut state, packet, false)?;
@@ -435,8 +434,7 @@ pub fn play(
                     client,
                     path,
                     source_id,
-                    source: &mut source,
-                    channel: &mut channel,
+                    sender: &mut sender,
                     audio: &mut audio,
                 }
                 .submit(&mut state, packet, true)?;
@@ -459,8 +457,7 @@ pub fn play(
             client,
             path,
             source_id,
-            source: &mut source,
-            channel: &mut channel,
+            sender: &mut sender,
             audio: &mut audio,
         }
         .submit(&mut state, packet, true)?;
@@ -480,7 +477,7 @@ pub fn play(
         )?;
     }
     client.eos(source_id, state.epoch)?;
-    if let Some((audio_id, _, _, _)) = vivid_audio.as_ref()
+    if let Some((audio_id, _, _)) = vivid_audio.as_ref()
         && let Err(error) = client
             .eos(*audio_id, state.epoch)
             .and_then(|_| client.drain(*audio_id))

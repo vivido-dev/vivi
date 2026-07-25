@@ -53,13 +53,13 @@ pub fn view(
             })?,
             sha256: Some(hash),
         };
-        let mut source = client.create_image_source(&image_config)?;
+        let source = client.create_image_source(&image_config)?;
         client.place_source(source_id, node_id, anchor_id, display.columns, display.rows)?;
         if !config.is_dry_run() {
             reserve_rows(display.rows)?;
         }
-        let mut channel = client.open_media_channel(&source, ConnectionKind::Blob)?;
-        client.send_image_data(&mut source, &mut channel, &encoded)?;
+        let mut sender = client.open_media_sender(source, ConnectionKind::Blob)?;
+        sender.send_image(&encoded)?;
     } else {
         let image = image::open(path)?;
         let rgba = image.into_rgba8().into_raw();
@@ -77,13 +77,13 @@ pub fn view(
             )
             .into());
         }
-        let mut source = client.create_raster_source(source_id, width, height)?;
+        let source = client.create_raster_source(source_id, width, height)?;
         client.place_source(source_id, node_id, anchor_id, display.columns, display.rows)?;
         if !config.is_dry_run() {
             reserve_rows(display.rows)?;
         }
-        let mut channel = client.open_media_channel(&source, ConnectionKind::Raster)?;
-        client.send_raster_frame(&mut source, &mut channel, 1, 1, (width, height), &rgba)?;
+        let mut sender = client.open_media_sender(source, ConnectionKind::Raster)?;
+        sender.send_raster(1, 1, width, height, &rgba)?;
     }
     client.verbose(format_args!(
         "image {}: {width}x{height} RGBA -> {}x{} cells",

@@ -12,8 +12,8 @@ pub fn play(client: &mut VividClient, path: &Path) -> Result<(), Box<dyn std::er
     let info = AudioDemuxer::inspect(path)?;
     let mut demuxer = AudioDemuxer::open(path)?;
     let source_id = client.allocate_id()?;
-    let mut source = client.create_audio_source(source_id, None, &info)?;
-    let mut channel = client.open_media_channel(&source, ConnectionKind::Audio)?;
+    let source = client.create_audio_source(source_id, None, &info)?;
+    let mut sender = client.open_media_sender(source, ConnectionKind::Audio)?;
     let mut packet_id = 0_u64;
     let mut started = false;
     let mut buffered_us = 0_u64;
@@ -24,20 +24,16 @@ pub fn play(client: &mut VividClient, path: &Path) -> Result<(), Box<dyn std::er
         packet_id = packet_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("audio packet ID space exhausted"))?;
-        client.send_audio_packet(
-            &mut source,
-            &mut channel,
-            AudioPacket {
-                epoch: 1,
-                packet_id,
-                pts_us: packet.pts_us,
-                dts_us: packet.dts_us,
-                duration_us: packet.duration_us,
-                trim_start_samples: packet.trim_start_samples,
-                trim_end_samples: packet.trim_end_samples,
-                data: &packet.data,
-            },
-        )?;
+        sender.send_audio(AudioPacket {
+            epoch: 1,
+            packet_id,
+            pts_us: packet.pts_us,
+            dts_us: packet.dts_us,
+            duration_us: packet.duration_us,
+            trim_start_samples: packet.trim_start_samples,
+            trim_end_samples: packet.trim_end_samples,
+            data: &packet.data,
+        })?;
         buffered_us = buffered_us.saturating_add(packet.duration_us);
         if !started && buffered_us >= INITIAL_BUFFER_US {
             client.play_at(source_id, info.first_pts_us.unwrap_or(0), INITIAL_BUFFER_US)?;
