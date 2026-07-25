@@ -1127,8 +1127,8 @@ unsafe fn video_info(parameters: *mut AVCodecParameters) -> io::Result<(VideoInf
         unsafe { std::slice::from_raw_parts(parameters.extradata, extradata_size) }.to_vec()
     };
 
-    // Retain the container decoder-configuration box (avcC/hvcC/av1C) before Annex-B
-    // normalization so `decoder-description-v1` can carry it verbatim.
+    // Retain the container decoder-configuration box (avcC/hvcC/av1C) before wire
+    // normalization so `decoder-description-v1` can describe the original stream.
     let container_box = (!extradata.is_empty() && extradata[0] != 0).then(|| extradata.clone());
     let (packetization, extradata, nal_length_size) = match codec.as_str() {
         "h264" => {
@@ -1140,7 +1140,11 @@ unsafe fn video_info(parameters: *mut AVCodecParameters) -> io::Result<(VideoInf
             ("hevc-annexb-au-v1".to_owned(), data, length)
         }
         "vp9" => ("vp9-frame-v1".to_owned(), Vec::new(), None),
-        "av1" => ("av1-low-overhead-tu-v1".to_owned(), extradata, None),
+        "av1" => (
+            "av1-low-overhead-tu-v1".to_owned(),
+            normalize_av1_extradata(&extradata)?,
+            None,
+        ),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1577,6 +1581,22 @@ fn normalize_h26x_extradata(data: &[u8], hevc: bool) -> io::Result<(Vec<u8>, Opt
     }
 }
 
+/// Convert an AV1CodecConfigurationRecord into the canonical sequence-header OBU carried by
+/// Vivid. FFmpeg exposes Matroska/WebM CodecPrivate as av1C, while Vivid's low-overhead profile
+/// deliberately excludes container framing.
+fn normalize_av1_extradata(data: &[u8]) -> io::Result<Vec<u8>> {
+    if data.is_empty() || data[0] & 0x80 == 0 {
+        return Ok(data.to_vec());
+    }
+    if data.len() < 4 || data[0] != 0x81 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported AV1 codec configuration",
+        ));
+    }
+    Ok(data[4..].to_vec())
+}
+
 fn append_config_nal(data: &[u8], offset: &mut usize, output: &mut Vec<u8>) -> io::Result<()> {
     if *offset + 2 > data.len() {
         return Err(io::Error::new(
@@ -1804,6 +1824,17 @@ mod tests {
         assert_eq!(normalize_flac_extradata(&flac).unwrap(), streaminfo);
 
         assert!(normalize_audio_extradata("opus", b"not-an-opus-head").is_err());
+    }
+
+    #[test]
+    fn av1_container_private_data_is_canonicalized() {
+        let av1c = [
+            0x81, 0x04, 0x0c, 0x00, 0x0a, 0x0e, 0x00, 0x00, 0x00, 0x24, 0xc4, 0xff, 0xdf, 0x30,
+            0xbf, 0x44, 0x04, 0x04, 0x04, 0x10,
+        ];
+        assert_eq!(normalize_av1_extradata(&av1c).unwrap(), av1c[4..]);
+        assert_eq!(normalize_av1_extradata(&av1c[4..]).unwrap(), av1c[4..]);
+        assert!(normalize_av1_extradata(&[0x82, 0, 0, 0]).is_err());
     }
 
     #[test]

@@ -79,6 +79,5 @@ pub fn producer_config(config: &Config) -> ProducerConfig {
             messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
             messages::FEATURE_DECODER_DESCRIPTION_V1,
         ],
-        allow_version_retry: false,
     }
 }
