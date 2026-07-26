@@ -1,7 +1,7 @@
 # Vivi
 
-`vivi` is the Vivid Protocol 1.0 image viewer and media player for
-[Vivido](../vivido/). It requires a presenter that selects Vivid 1.0; there is no fallback to the
+`vivi` is the Vivid Protocol 1.1 image viewer and media player for
+[Vivido](../vivido/). It requires a presenter that selects Vivid 1.1; there is no fallback to the
 retired pre-current profile, anchor-v1, or FFmpeg-packet-v0.
 
 Vivi streams encoded embedded audio and standalone MP3, M4A, FLAC, Ogg/Opus, Ogg/Vorbis, and WAV
@@ -130,7 +130,7 @@ vivi --dry-run --verbose photo.png
 vivi --trace-dir /tmp/vivi-trace --verbose clip.mkv
 ```
 
-Each trace begins with the version-1.0 `VIVD` preface and contains Vivid 1.0 records.
+Each trace begins with the version-1.1 `VIVD` preface and contains Vivid 1.1 records.
 Dry-run and trace modes emit deterministic audio control/media records and never open an audio
 output device.
 
@@ -147,4 +147,4 @@ rejected. Windows uses a private loopback TCP endpoint; non-loopback TCP endpoin
 `vvssh`.
 
 The normative wire contract is
-[vivid-protocol-1.0-spec.md](../vivid_protocol/vivid-protocol-1.0-spec.md).
+[vivid-protocol-1.1-spec.md](../vivid_protocol/vivid-protocol-1.1-spec.md).
