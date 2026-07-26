@@ -83,9 +83,33 @@ pub fn producer_config(config: &Config) -> ProducerConfig {
             messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
             messages::FEATURE_DECODER_DESCRIPTION_V1,
             messages::FEATURE_OBSERVABILITY_CORE_V1,
-            messages::FEATURE_MEDIA_ORDER_BARRIER_V1,
             messages::FEATURE_IMAGE_CACHE_V1,
+            messages::FEATURE_MEDIA_ORDER_BARRIER_V1,
             messages::FEATURE_CLOCK_SAMPLING_V1,
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn producer_features_form_valid_strictly_increasing_sets() {
+        let config = Config {
+            files: vec![PathBuf::from("image.png")],
+            zoom: 1.0,
+            endpoint: None,
+            bulk_endpoint: None,
+            token: None,
+            dry_run: true,
+            trace_dir: None,
+            verbose: false,
+            no_wait: false,
+        };
+
+        producer_config(&config).validate().unwrap();
     }
 }
