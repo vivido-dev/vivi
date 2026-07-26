@@ -186,10 +186,10 @@ fn start_playback(
         match playback.start() {
             Ok(()) => state.audio_started = true,
             Err(error) => {
-                eprintln!(
-                    "vivi: warning: could not start audio for {}: {error}; continuing without sound",
+                client.verbose(format_args!(
+                    "audio disabled for {} after output start failed: {error}",
                     path.display()
-                );
+                ));
                 *audio = None;
             }
         }
@@ -389,14 +389,14 @@ pub fn play(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = VideoDemuxer::inspect(path)?;
     if info.colorimetry_inferred {
-        eprintln!(
-            "vivi: warning: {} does not declare complete colorimetry; using primaries={}, transfer={}, matrix={}, range={}",
+        client.verbose(format_args!(
+            "video {}: inferred missing colorimetry as primaries={}, transfer={}, matrix={}, range={}",
             path.display(),
             info.color_primaries,
             info.transfer,
             info.matrix,
             info.range
-        );
+        ));
     }
     let mut demuxer = VideoDemuxer::open(path)?;
     let vivid_audio_available = info.audio.is_some()
@@ -412,10 +412,10 @@ pub fn play(
         match audio_player::prepare_video(path, info.first_pts_us) {
             Ok(playback) => Some(playback),
             Err(error) => {
-                eprintln!(
-                    "vivi: warning: could not prepare audio for {}: {error}; continuing without sound",
+                client.verbose(format_args!(
+                    "audio disabled for {} after local output preparation failed: {error}",
                     path.display()
-                );
+                ));
                 None
             }
         }
@@ -457,26 +457,26 @@ pub fn play(
                 if !remote_session && !config.is_dry_run() {
                     match audio_player::prepare_video(path, info.first_pts_us) {
                         Ok(playback) => audio = Some(playback),
-                        Err(fallback_error) => eprintln!(
-                            "vivi: warning: could not create presenter audio for {}: {error}; direct audio fallback also failed: {fallback_error}; continuing without sound",
+                        Err(fallback_error) => client.verbose(format_args!(
+                            "audio disabled for {} after presenter output failed ({error}) and local output preparation failed ({fallback_error})",
                             path.display(),
-                        ),
+                        )),
                     }
                 } else {
-                    eprintln!(
-                        "vivi: warning: could not create presenter audio for {}: {error}; continuing without sound",
+                    client.verbose(format_args!(
+                        "audio disabled for {} after presenter output failed: {error}",
                         path.display()
-                    );
+                    ));
                 }
                 None
             }
         }
     } else {
         if info.has_audio && remote_session && !config.no_wait {
-            eprintln!(
-                "vivi: warning: presenter lacks remote audio for {}; continuing without sound",
+            client.verbose(format_args!(
+                "audio disabled for {} because the remote presenter lacks audio support",
                 path.display()
-            );
+            ));
         }
         None
     };
@@ -528,10 +528,10 @@ pub fn play(
                     }
                 }
                 if let Some(error) = failed {
-                    eprintln!(
-                        "vivi: warning: presenter audio failed for {}: {error}; continuing without sound",
+                    client.verbose(format_args!(
+                        "audio disabled for {} after presenter streaming failed: {error}",
                         path.display()
-                    );
+                    ));
                     vivid_audio = None;
                 }
             }
@@ -641,10 +641,10 @@ pub fn play(
             .eos_sender(audio_sender, state.epoch)
             .and_then(|_| client.drain(*audio_id))
     {
-        eprintln!(
-            "vivi: warning: presenter audio drain failed for {}: {error}; video playback completed",
+        client.verbose(format_args!(
+            "video {} completed, but presenter audio drain failed: {error}",
             path.display()
-        );
+        ));
     }
     if !config.no_wait
         && client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1)
@@ -661,10 +661,10 @@ pub fn play(
         && let Some(playback) = audio.as_mut()
         && let Err(error) = playback.wait()
     {
-        eprintln!(
-            "vivi: warning: audio playback failed for {}: {error}; video playback completed",
+        client.verbose(format_args!(
+            "video {} completed, but local audio playback failed: {error}",
             path.display()
-        );
+        ));
     }
     client.verbose(format_args!(
         "video source {source_id}: EOS after {} packets / {} bytes",

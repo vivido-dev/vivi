@@ -93,10 +93,10 @@ fn play_audio(
                 .into());
             }
             Err(error) if config.is_dry_run() => return Err(error),
-            Err(error) => eprintln!(
-                "vivi: warning: presenter audio failed for {}: {error}; using direct audio output",
+            Err(error) => client.verbose(format_args!(
+                "presenter audio failed for {}: {error}; using local audio output",
                 path.display()
-            ),
+            )),
         }
     }
     if std::env::var_os("VIVID_REMOTE").is_some() {
