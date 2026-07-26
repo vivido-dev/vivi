@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use crate::audio_player;
 use crate::cli::Config;
-use crate::client::{MediaSender, PresenterError, SourceWaitHandle, VividClient, WaitSource};
+use crate::client::{
+    KeyframeRequest, MediaSender, PresenterError, SourceWaitHandle, VividClient, WaitSource,
+};
 use crate::ffmpeg::{EncodedMediaPacket, EncodedPacket, VideoDemuxer};
 use crate::protocol::media::{AudioPacket, VideoPacket};
 use crate::protocol::wire::ConnectionKind;
@@ -46,6 +48,7 @@ struct PlaybackState {
     last_pts_us: Option<i64>,
     epoch: u32,
     awaiting_keyframe: bool,
+    recovery_requires_flush: bool,
     audio_buffered_us: u64,
     audio_horizon_us: Option<i64>,
 }
@@ -62,9 +65,23 @@ impl PlaybackState {
             last_pts_us: None,
             epoch: 1,
             awaiting_keyframe: false,
+            recovery_requires_flush: false,
             audio_buffered_us: 0,
             audio_horizon_us: None,
         }
+    }
+
+    fn note_keyframe_request(&mut self, request: KeyframeRequest) {
+        if request.minimum_epoch > self.epoch {
+            self.epoch = request.minimum_epoch;
+            self.recovery_requires_flush = true;
+        }
+        self.awaiting_keyframe = true;
+    }
+
+    fn take_recovery_flush(&mut self) -> bool {
+        self.awaiting_keyframe = false;
+        std::mem::take(&mut self.recovery_requires_flush)
     }
 
     /// FLUSH invalidates the presenter's PLAY state, so playback must restart. The restarted
@@ -230,16 +247,14 @@ impl VideoSubmitter<'_> {
         loop {
             self.client
                 .apply_pending_source_events(self.sender.source_mut())?;
-            if let Some(minimum_epoch) = self.sender.source_mut().take_keyframe_request() {
-                state.epoch = state.epoch.saturating_add(1).max(minimum_epoch);
-                state.awaiting_keyframe = true;
+            if let Some(request) = self.sender.source_mut().take_keyframe_request_detailed() {
+                state.note_keyframe_request(request);
             }
             if state.awaiting_keyframe && !packet.key {
                 return Ok(());
             }
-            if state.awaiting_keyframe {
+            if state.awaiting_keyframe && state.take_recovery_flush() {
                 self.client.flush(self.source_id, state.epoch)?;
-                state.awaiting_keyframe = false;
                 state.begin_recovery_restart();
             }
             if !self.sender.source().is_visible() {
@@ -677,6 +692,44 @@ mod tests {
         );
         assert_eq!(state.audio_buffered_us, 0);
         assert_eq!(state.audio_horizon_us, None);
+    }
+
+    #[test]
+    fn same_epoch_keyframe_recovery_preserves_playback_without_flush() {
+        let mut state = PlaybackState::new();
+        state.playback_phase = PlaybackPhase::Streaming;
+        state.first_pts_us = Some(0);
+        state.note_keyframe_request(KeyframeRequest {
+            minimum_epoch: 1,
+            reason: crate::protocol::messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+        });
+
+        assert!(state.awaiting_keyframe);
+        assert_eq!(state.epoch, 1);
+        assert!(!state.take_recovery_flush());
+        assert_eq!(state.playback_phase, PlaybackPhase::Streaming);
+        assert_eq!(state.first_pts_us, Some(0));
+    }
+
+    #[test]
+    fn greater_epoch_keyframe_recovery_flushes_once_and_never_moves_backwards() {
+        let mut state = PlaybackState::new();
+        state.playback_phase = PlaybackPhase::Streaming;
+        state.note_keyframe_request(KeyframeRequest {
+            minimum_epoch: 4,
+            reason: crate::protocol::messages::KEYFRAME_REASON_DECODER_ERROR,
+        });
+        state.note_keyframe_request(KeyframeRequest {
+            minimum_epoch: 2,
+            reason: crate::protocol::messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+        });
+
+        assert_eq!(state.epoch, 4);
+        assert!(state.take_recovery_flush());
+        assert!(
+            !state.take_recovery_flush(),
+            "FLUSH is required exactly once"
+        );
     }
 
     #[test]

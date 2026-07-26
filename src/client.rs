@@ -4,7 +4,8 @@ use crate::protocol::messages;
 
 use vivid_sdk::{AudioConfig, ProducerConfig, VideoConfig};
 pub use vivid_sdk::{
-    MediaSender, PresenterError, ProducerSession as VividClient, SourceWaitHandle, WaitSource,
+    KeyframeRequest, MediaSender, PresenterError, ProducerSession as VividClient, SourceWaitHandle,
+    WaitSource,
 };
 
 impl VideoConfig for VideoInfo {
