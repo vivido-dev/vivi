@@ -84,6 +84,8 @@ pub fn producer_config(config: &Config) -> ProducerConfig {
             messages::FEATURE_DECODER_DESCRIPTION_V1,
             messages::FEATURE_OBSERVABILITY_CORE_V1,
             messages::FEATURE_MEDIA_ORDER_BARRIER_V1,
+            messages::FEATURE_IMAGE_CACHE_V1,
+            messages::FEATURE_CLOCK_SAMPLING_V1,
         ],
     }
 }

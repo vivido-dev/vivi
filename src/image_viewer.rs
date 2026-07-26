@@ -60,13 +60,26 @@ pub fn view(
             })?,
             sha256: Some(hash),
         };
-        let source = client.create_image_source(&image_config)?;
+        let source = if client.supports(crate::protocol::messages::FEATURE_IMAGE_CACHE_V1) {
+            client.create_image_source_with_cache(&image_config)?
+        } else {
+            client.create_image_source(&image_config)?
+        };
+        let cache_hit = source.is_cache_hit();
         client.place_source(source_id, node_id, anchor_id, display.columns, display.rows)?;
         if !config.is_dry_run() {
             reserve_rows(display.rows)?;
         }
-        let mut sender = client.open_media_sender(source, ConnectionKind::Blob)?;
-        sender.send_image(&encoded)?;
+        if source_requires_media(cache_hit) {
+            let mut sender = client.open_media_sender(source, ConnectionKind::Blob)?;
+            sender.send_image(&encoded)?;
+        } else {
+            client.verbose(format_args!(
+                "image {}: presenter cache hit; skipped {} encoded bytes",
+                path.display(),
+                encoded.len()
+            ));
+        }
     } else {
         let image = image::open(path)?;
         let rgba = image.into_rgba8().into_raw();
@@ -108,6 +121,10 @@ pub fn view(
         display.rows
     ));
     Ok(())
+}
+
+fn source_requires_media(cache_hit: bool) -> bool {
+    !cache_hit
 }
 
 fn display_size(width: u32, height: u32, zoom: f32, geometry: TerminalGeometry) -> DisplaySize {
@@ -153,5 +170,11 @@ mod tests {
                 rows: 22
             }
         );
+    }
+
+    #[test]
+    fn cache_hits_skip_the_blob_media_channel() {
+        assert!(!source_requires_media(true));
+        assert!(source_requires_media(false));
     }
 }
