@@ -28,6 +28,13 @@ enum PlaybackPhase {
     IngressClosed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryAction {
+    None,
+    Flush,
+    RebasePlayback,
+}
+
 impl PlaybackPhase {
     fn admitted(self) -> bool {
         self != Self::Pending
@@ -49,6 +56,7 @@ struct PlaybackState {
     epoch: u32,
     awaiting_keyframe: bool,
     recovery_requires_flush: bool,
+    recovery_rebases_playback: bool,
     audio_buffered_us: u64,
     audio_horizon_us: Option<i64>,
 }
@@ -66,6 +74,7 @@ impl PlaybackState {
             epoch: 1,
             awaiting_keyframe: false,
             recovery_requires_flush: false,
+            recovery_rebases_playback: false,
             audio_buffered_us: 0,
             audio_horizon_us: None,
         }
@@ -75,13 +84,27 @@ impl PlaybackState {
         if request.minimum_epoch > self.epoch {
             self.epoch = request.minimum_epoch;
             self.recovery_requires_flush = true;
+        } else if request.reason == crate::protocol::messages::KEYFRAME_REASON_INITIAL
+            && self.playback_phase.admitted()
+        {
+            // The bridge uses INITIAL when a tab switch recreated the outer decoder. This is not
+            // transport loss: the new source has no useful PLAY clock. Keep the current epoch, but
+            // reissue PLAY at the recovery keyframe before forwarding that packet.
+            self.recovery_rebases_playback = true;
         }
         self.awaiting_keyframe = true;
     }
 
-    fn take_recovery_flush(&mut self) -> bool {
+    fn take_recovery_action(&mut self) -> RecoveryAction {
         self.awaiting_keyframe = false;
-        std::mem::take(&mut self.recovery_requires_flush)
+        if std::mem::take(&mut self.recovery_requires_flush) {
+            self.recovery_rebases_playback = false;
+            RecoveryAction::Flush
+        } else if std::mem::take(&mut self.recovery_rebases_playback) {
+            RecoveryAction::RebasePlayback
+        } else {
+            RecoveryAction::None
+        }
     }
 
     /// FLUSH invalidates the presenter's PLAY state, so playback must restart. The restarted
@@ -104,6 +127,18 @@ impl PlaybackState {
             self.audio_horizon_us = Some(self.audio_horizon_us.map_or(end, |last| last.max(end)));
         } else if let Some(horizon) = self.audio_horizon_us.as_mut() {
             *horizon = horizon.saturating_add(duration_us);
+        }
+    }
+
+    /// Resume at the packet that will be submitted after visibility returns. Reusing the
+    /// stream's first PTS restarts the presenter clock at the beginning while ingress is already
+    /// much later, which leaves resumed video scheduled in the future and lets linked audio
+    /// drain against the stale clock.
+    fn visibility_resume_pts(&self, packet_pts_us: i64) -> i64 {
+        if packet_pts_us != i64::MIN {
+            packet_pts_us
+        } else {
+            self.last_pts_us.or(self.first_pts_us).unwrap_or(0)
         }
     }
 }
@@ -253,10 +288,16 @@ impl VideoSubmitter<'_> {
             if state.awaiting_keyframe && !packet.key {
                 return Ok(());
             }
-            if state.awaiting_keyframe && state.take_recovery_flush() {
+            let recovery_action = if state.awaiting_keyframe {
+                state.take_recovery_action()
+            } else {
+                RecoveryAction::None
+            };
+            if recovery_action == RecoveryAction::Flush {
                 self.client.flush(self.source_id, state.epoch)?;
                 state.begin_recovery_restart();
             }
+            let mut rebase_playback = recovery_action == RecoveryAction::RebasePlayback;
             if !self.sender.source().is_visible() {
                 if state.audio_started
                     && let Some(playback) = self.audio.as_ref()
@@ -268,14 +309,23 @@ impl VideoSubmitter<'_> {
                 state.playback_wait = admit_playback(
                     self.client,
                     self.source_id,
-                    state.first_pts_us.unwrap_or(0),
+                    state.visibility_resume_pts(packet.pts_us),
                     INITIAL_BUFFER_US,
                 )?;
+                rebase_playback = false;
                 if state.audio_started
                     && let Some(playback) = self.audio.as_ref()
                 {
                     playback.resume();
                 }
+            }
+            if rebase_playback {
+                state.playback_wait = admit_playback(
+                    self.client,
+                    self.source_id,
+                    state.visibility_resume_pts(packet.pts_us),
+                    INITIAL_BUFFER_US,
+                )?;
             }
             if packet.data.is_empty() {
                 return Ok(());
@@ -706,9 +756,45 @@ mod tests {
 
         assert!(state.awaiting_keyframe);
         assert_eq!(state.epoch, 1);
-        assert!(!state.take_recovery_flush());
+        assert_eq!(state.take_recovery_action(), RecoveryAction::None);
         assert_eq!(state.playback_phase, PlaybackPhase::Streaming);
         assert_eq!(state.first_pts_us, Some(0));
+    }
+
+    #[test]
+    fn same_epoch_initial_recovery_rebases_started_playback() {
+        let mut state = PlaybackState::new();
+        state.packet_id = 240;
+        state.playback_phase = PlaybackPhase::Streaming;
+        state.note_keyframe_request(KeyframeRequest {
+            minimum_epoch: 1,
+            reason: crate::protocol::messages::KEYFRAME_REASON_INITIAL,
+        });
+
+        assert_eq!(
+            state.take_recovery_action(),
+            RecoveryAction::RebasePlayback,
+            "a recreated decoder needs a fresh PLAY at its recovery keyframe"
+        );
+        assert_eq!(state.take_recovery_action(), RecoveryAction::None);
+    }
+
+    #[test]
+    fn visibility_resume_rebases_play_at_the_pending_packet() {
+        let mut state = PlaybackState::new();
+        state.first_pts_us = Some(0);
+        state.last_pts_us = Some(8_000_000);
+
+        assert_eq!(
+            state.visibility_resume_pts(8_033_333),
+            8_033_333,
+            "PLAY must resume where packet submission resumes, not at the stream origin"
+        );
+        assert_eq!(
+            state.visibility_resume_pts(i64::MIN),
+            8_000_000,
+            "a packet without a timestamp falls back to the last known media position"
+        );
     }
 
     #[test]
@@ -725,9 +811,10 @@ mod tests {
         });
 
         assert_eq!(state.epoch, 4);
-        assert!(state.take_recovery_flush());
-        assert!(
-            !state.take_recovery_flush(),
+        assert_eq!(state.take_recovery_action(), RecoveryAction::Flush);
+        assert_eq!(
+            state.take_recovery_action(),
+            RecoveryAction::None,
             "FLUSH is required exactly once"
         );
     }
