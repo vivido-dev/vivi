@@ -765,12 +765,10 @@ pub fn play(
             path,
         )?;
     }
-    client.eos_sender(&sender, state.epoch)?;
-    state.playback_phase = PlaybackPhase::IngressClosed;
-    debug_assert!(state.playback_phase.may_join_presenter_wait());
-    if let Some(mut wait) = state.playback_wait.take() {
-        wait.wait()?;
-    }
+    // The audio media connection is independent and may still be submitting access units after
+    // the video demuxer reaches EOF. Join it and apply its source-scoped media-order barrier before
+    // closing video ingress, so no final audio record can race a linked video EOS.
+    let mut audio_to_drain = None;
     if let Some(stream) = vivid_audio.take() {
         let audio_id = stream.source_id;
         match stream.join() {
@@ -781,14 +779,14 @@ pub fn play(
                         path.display(),
                         outcome.packet_id
                     ));
-                } else if let Err(error) = client
-                    .eos_sender(&outcome.sender, state.epoch)
-                    .and_then(|_| client.drain(audio_id))
-                {
-                    client.verbose(format_args!(
-                        "video {} completed, but presenter audio drain failed: {error}",
-                        path.display()
-                    ));
+                } else {
+                    match client.eos_sender(&outcome.sender, state.epoch) {
+                        Ok(()) => audio_to_drain = Some(audio_id),
+                        Err(error) => client.verbose(format_args!(
+                            "video {} completed, but presenter audio EOS failed: {error}",
+                            path.display()
+                        )),
+                    }
                 }
             }
             Err(error) => client.verbose(format_args!(
@@ -796,6 +794,20 @@ pub fn play(
                 path.display()
             )),
         }
+    }
+    client.eos_sender(&sender, state.epoch)?;
+    state.playback_phase = PlaybackPhase::IngressClosed;
+    debug_assert!(state.playback_phase.may_join_presenter_wait());
+    if let Some(mut wait) = state.playback_wait.take() {
+        wait.wait()?;
+    }
+    if let Some(audio_id) = audio_to_drain
+        && let Err(error) = client.drain(audio_id)
+    {
+        client.verbose(format_args!(
+            "video {} completed, but presenter audio drain failed: {error}",
+            path.display()
+        ));
     }
     if !config.no_wait
         && client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1)
