@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use crate::audio_player;
@@ -8,7 +10,7 @@ use crate::cli::Config;
 use crate::client::{
     KeyframeRequest, MediaSender, PresenterError, SourceWaitHandle, VividClient, WaitSource,
 };
-use crate::ffmpeg::{EncodedMediaPacket, EncodedPacket, VideoDemuxer};
+use crate::ffmpeg::{AudioDemuxer, EncodedMediaPacket, EncodedPacket, VideoDemuxer};
 use crate::protocol::media::{AudioPacket, VideoPacket};
 use crate::protocol::wire::ConnectionKind;
 use crate::terminal_geometry::{TerminalGeometry, cells_for_pixels, reserve_rows};
@@ -59,6 +61,149 @@ struct PlaybackState {
     recovery_rebases_playback: bool,
     audio_buffered_us: u64,
     audio_horizon_us: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AudioStreamSnapshot {
+    buffered_us: u64,
+    horizon_us: Option<i64>,
+    finished: bool,
+    failed: bool,
+}
+
+#[derive(Default)]
+struct AudioStreamProgress {
+    state: Mutex<AudioStreamSnapshot>,
+    changed: Condvar,
+}
+
+impl AudioStreamProgress {
+    fn observe(&self, pts_us: i64, duration_us: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.buffered_us = state.buffered_us.saturating_add(duration_us);
+        let duration_us = i64::try_from(duration_us).unwrap_or(i64::MAX);
+        if pts_us != i64::MIN {
+            let end = pts_us.saturating_add(duration_us);
+            state.horizon_us = Some(state.horizon_us.map_or(end, |last| last.max(end)));
+        } else if let Some(horizon) = state.horizon_us.as_mut() {
+            *horizon = horizon.saturating_add(duration_us);
+        }
+        self.changed.notify_all();
+    }
+
+    fn finish(&self, failed: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.finished = true;
+        state.failed = failed;
+        self.changed.notify_all();
+    }
+
+    fn snapshot(&self) -> AudioStreamSnapshot {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait_for_prebuffer(&self, minimum_us: u64, timeout: Duration) -> AudioStreamSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.buffered_us < minimum_us && !state.finished
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state
+    }
+}
+
+struct AudioStreamOutcome {
+    sender: MediaSender,
+    packet_id: u64,
+    error: Option<io::Error>,
+}
+
+struct VividAudioStream {
+    source_id: u64,
+    progress: Arc<AudioStreamProgress>,
+    worker: thread::JoinHandle<AudioStreamOutcome>,
+}
+
+impl VividAudioStream {
+    fn start(path: &Path, source_id: u64, sender: MediaSender, epoch: u32) -> Self {
+        let progress = Arc::new(AudioStreamProgress::default());
+        let worker_progress = progress.clone();
+        let path = path.to_path_buf();
+        let worker = thread::spawn(move || {
+            let mut sender = sender;
+            let mut packet_id = 0_u64;
+            let result = (|| -> io::Result<()> {
+                let mut demuxer = AudioDemuxer::open(&path)?;
+                while let Some(packet) = demuxer.next_packet()? {
+                    if packet.data.is_empty() {
+                        continue;
+                    }
+                    packet_id = packet_id
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("audio packet ID space exhausted"))?;
+                    sender.send_audio(AudioPacket {
+                        epoch,
+                        packet_id,
+                        pts_us: packet.pts_us,
+                        dts_us: packet.dts_us,
+                        duration_us: packet.duration_us,
+                        trim_start_samples: packet.trim_start_samples,
+                        trim_end_samples: packet.trim_end_samples,
+                        data: &packet.data,
+                    })?;
+                    worker_progress.observe(packet.pts_us, packet.duration_us);
+                }
+                Ok(())
+            })();
+            worker_progress.finish(result.is_err());
+            AudioStreamOutcome {
+                sender,
+                packet_id,
+                error: result.err(),
+            }
+        });
+        Self {
+            source_id,
+            progress,
+            worker,
+        }
+    }
+
+    fn apply_progress(&self, state: &mut PlaybackState) -> AudioStreamSnapshot {
+        let progress = self.progress.snapshot();
+        state.audio_buffered_us = progress.buffered_us;
+        state.audio_horizon_us = progress.horizon_us;
+        progress
+    }
+
+    fn wait_for_prebuffer(&self, state: &mut PlaybackState) -> AudioStreamSnapshot {
+        let progress = self
+            .progress
+            .wait_for_prebuffer(AUDIO_PREBUFFER_US, PLAYBACK_START_TIMEOUT);
+        state.audio_buffered_us = progress.buffered_us;
+        state.audio_horizon_us = progress.horizon_us;
+        progress
+    }
+
+    fn join(self) -> io::Result<AudioStreamOutcome> {
+        self.worker
+            .join()
+            .map_err(|_| io::Error::other("audio media worker panicked"))
+    }
 }
 
 impl PlaybackState {
@@ -119,6 +264,7 @@ impl PlaybackState {
         self.audio_horizon_us = None;
     }
 
+    #[cfg(test)]
     fn observe_audio_packet(&mut self, pts_us: i64, duration_us: u64) {
         self.audio_buffered_us = self.audio_buffered_us.saturating_add(duration_us);
         let duration_us = i64::try_from(duration_us).unwrap_or(i64::MAX);
@@ -154,15 +300,6 @@ fn linked_start_ready(state: &PlaybackState, pending_video: &mut VecDeque<Encode
         pending_video.pop_front();
     }
     pending_video.front().is_some_and(|packet| packet.key)
-}
-
-fn audio_covers_video(packet: &EncodedPacket, audio_horizon_us: Option<i64>) -> bool {
-    let timestamp = if packet.pts_us != i64::MIN {
-        packet.pts_us
-    } else {
-        packet.dts_us
-    };
-    timestamp == i64::MIN || audio_horizon_us.is_some_and(|horizon| timestamp <= horizon)
 }
 
 fn start_playback(
@@ -447,11 +584,17 @@ pub fn play(
     } else {
         (client.create_video_source(source_id, &info)?, None)
     };
+    let mut state = PlaybackState::new();
     let mut vivid_audio = if let Some((audio_id, presenter_audio)) = presenter_audio {
         match presenter_audio {
             Ok(audio_source) => {
                 let audio_sender = client.open_media_sender(audio_source, ConnectionKind::Audio)?;
-                Some((audio_id, audio_sender, 0_u64))
+                Some(VividAudioStream::start(
+                    path,
+                    audio_id,
+                    audio_sender,
+                    state.epoch,
+                ))
             }
             Err(error) => {
                 if !remote_session && !config.is_dry_run() {
@@ -496,45 +639,16 @@ pub fn play(
         info.height
     ));
 
-    let mut state = PlaybackState::new();
     // The media channels are independent, so preserve each stream's decode order rather than the
     // container's cross-stream packet order. Some MP4s front-load enough video to fill the video
-    // socket before their first audio packet; buffering those video access units lets audio reach
-    // the presenter and start its master clock without a circular wait.
+    // socket before their first audio packet. The linked audio worker uses an independent demuxer
+    // and sender so backpressure on either browser decoder cannot starve the other stream.
     let mut pending_video = VecDeque::new();
     while let Some(media_packet) = demuxer.next_media_packet()? {
         match media_packet {
-            EncodedMediaPacket::Audio(packet) => {
-                let mut failed = None;
-                if let Some((_, audio_sender, packet_id)) = vivid_audio.as_mut()
-                    && !packet.data.is_empty()
-                {
-                    *packet_id = packet_id
-                        .checked_add(1)
-                        .ok_or_else(|| io::Error::other("audio packet ID space exhausted"))?;
-                    if let Err(error) = audio_sender.send_audio(AudioPacket {
-                        epoch: state.epoch,
-                        packet_id: *packet_id,
-                        pts_us: packet.pts_us,
-                        dts_us: packet.dts_us,
-                        duration_us: packet.duration_us,
-                        trim_start_samples: packet.trim_start_samples,
-                        trim_end_samples: packet.trim_end_samples,
-                        data: &packet.data,
-                    }) {
-                        failed = Some(error);
-                    } else {
-                        state.observe_audio_packet(packet.pts_us, packet.duration_us);
-                    }
-                }
-                if let Some(error) = failed {
-                    client.verbose(format_args!(
-                        "audio disabled for {} after presenter streaming failed: {error}",
-                        path.display()
-                    ));
-                    vivid_audio = None;
-                }
-            }
+            // A separate AudioDemuxer feeds the audio media connection. Reading past the
+            // container's audio packets here keeps the video demuxer source-specific too.
+            EncodedMediaPacket::Audio(_) => {}
             EncodedMediaPacket::Video(packet) => {
                 if vivid_audio.is_some() {
                     pending_video.push_back(packet);
@@ -551,25 +665,46 @@ pub fn play(
             }
         }
 
-        if vivid_audio.is_some() {
-            if !state.playback_phase.admitted()
-                && linked_start_ready(&state, &mut pending_video)
-                && state.audio_buffered_us >= AUDIO_PREBUFFER_US
-            {
-                start_playback(
-                    client,
-                    source_id,
-                    AUDIO_PREBUFFER_US,
-                    &mut audio,
-                    &mut state,
-                    path,
-                )?;
+        if vivid_audio
+            .as_ref()
+            .is_some_and(|stream| stream.progress.snapshot().failed)
+        {
+            let stream = vivid_audio.take().expect("failed audio stream exists");
+            let source_id = stream.source_id;
+            match stream.join() {
+                Ok(outcome) => {
+                    client.verbose(format_args!(
+                        "audio source {source_id} disabled after {} packets: {}",
+                        outcome.packet_id,
+                        outcome.error.map_or_else(
+                            || "media worker stopped".into(),
+                            |error| error.to_string()
+                        )
+                    ));
+                }
+                Err(error) => client.verbose(format_args!(
+                    "audio source {source_id} disabled after media worker failure: {error}"
+                )),
             }
-            while state.playback_phase.admitted()
-                && pending_video
-                    .front()
-                    .is_some_and(|packet| audio_covers_video(packet, state.audio_horizon_us))
-            {
+        }
+
+        if let Some(stream) = vivid_audio.as_ref() {
+            if !state.playback_phase.admitted() && linked_start_ready(&state, &mut pending_video) {
+                let progress = stream.wait_for_prebuffer(&mut state);
+                if !progress.failed {
+                    start_playback(
+                        client,
+                        source_id,
+                        progress.buffered_us.min(AUDIO_PREBUFFER_US),
+                        &mut audio,
+                        &mut state,
+                        path,
+                    )?;
+                }
+            } else {
+                stream.apply_progress(&mut state);
+            }
+            while state.playback_phase.admitted() && !pending_video.is_empty() {
                 let packet = pending_video
                     .pop_front()
                     .expect("pending video packet exists");
@@ -636,15 +771,31 @@ pub fn play(
     if let Some(mut wait) = state.playback_wait.take() {
         wait.wait()?;
     }
-    if let Some((audio_id, audio_sender, _)) = vivid_audio.as_ref()
-        && let Err(error) = client
-            .eos_sender(audio_sender, state.epoch)
-            .and_then(|_| client.drain(*audio_id))
-    {
-        client.verbose(format_args!(
-            "video {} completed, but presenter audio drain failed: {error}",
-            path.display()
-        ));
+    if let Some(stream) = vivid_audio.take() {
+        let audio_id = stream.source_id;
+        match stream.join() {
+            Ok(outcome) => {
+                if let Some(error) = outcome.error {
+                    client.verbose(format_args!(
+                        "video {} completed, but presenter audio stopped after {} packets: {error}",
+                        path.display(),
+                        outcome.packet_id
+                    ));
+                } else if let Err(error) = client
+                    .eos_sender(&outcome.sender, state.epoch)
+                    .and_then(|_| client.drain(audio_id))
+                {
+                    client.verbose(format_args!(
+                        "video {} completed, but presenter audio drain failed: {error}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(error) => client.verbose(format_args!(
+                "video {} completed, but presenter audio worker failed: {error}",
+                path.display()
+            )),
+        }
     }
     if !config.no_wait
         && client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1)
@@ -902,31 +1053,32 @@ mod tests {
     }
 
     #[test]
-    fn audio_horizon_gates_video_from_front_loaded_muxes() {
+    fn audio_progress_tracks_prebuffer_and_timeline_horizon() {
         let mut state = PlaybackState::new();
         for pts_us in [-21_333, 0, 21_333, 42_667, 64_000] {
             state.observe_audio_packet(pts_us, 21_333);
         }
         assert!(state.audio_buffered_us >= AUDIO_PREBUFFER_US);
         assert_eq!(state.audio_horizon_us, Some(85_333));
+    }
 
-        let covered = EncodedPacket {
-            data: vec![1],
-            pts_us: 83_333,
-            dts_us: 0,
-            key: true,
-        };
-        let video_ahead_of_audio = EncodedPacket {
-            data: vec![2],
-            pts_us: 250_000,
-            dts_us: 41_667,
-            key: false,
-        };
-        assert!(audio_covers_video(&covered, state.audio_horizon_us));
-        assert!(!audio_covers_video(
-            &video_ahead_of_audio,
-            state.audio_horizon_us
-        ));
-        assert!(!audio_covers_video(&covered, None));
+    #[test]
+    fn linked_audio_prebuffers_on_its_own_worker() {
+        let progress = Arc::new(AudioStreamProgress::default());
+        let worker_progress = progress.clone();
+        let worker = thread::spawn(move || {
+            for pts_us in [0, 20_000, 40_000, 60_000, 80_000] {
+                worker_progress.observe(pts_us, 20_000);
+            }
+            worker_progress.finish(false);
+        });
+
+        let snapshot = progress.wait_for_prebuffer(AUDIO_PREBUFFER_US, Duration::from_secs(1));
+        worker.join().unwrap();
+        let finished = progress.snapshot();
+        assert_eq!(snapshot.buffered_us, AUDIO_PREBUFFER_US);
+        assert_eq!(snapshot.horizon_us, Some(AUDIO_PREBUFFER_US as i64));
+        assert!(finished.finished);
+        assert!(!finished.failed);
     }
 }
