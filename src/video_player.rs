@@ -262,9 +262,11 @@ pub fn play(
                 client.verbose(format_args!(
                     "presenter audio failed before activation; continuing with video"
                 ));
-                presenter_audio = None;
+                if let Some(failed) = presenter_audio.take() {
+                    let _ = failed.worker.join();
+                }
             }
-            activate_and_play(
+            let audio_active = activate_and_play(
                 config,
                 client,
                 &surface,
@@ -273,6 +275,9 @@ pub fn play(
                 first_pts.unwrap_or(packet.pts_us),
                 audio_ready.map_or(0, |state| state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)),
             )?;
+            if !audio_active && let Some(failed) = presenter_audio.take() {
+                let _ = failed.worker.join();
+            }
             if let Some(audio) = local_audio.as_ref()
                 && let Err(error) = audio.start()
             {
@@ -293,10 +298,13 @@ pub fn play(
             .as_ref()
             .map(|audio| audio.progress.wait_for_prebuffer())
             .filter(|state| !state.failed);
-        if presenter_audio.is_some() && audio_ready.is_none() {
-            presenter_audio = None;
+        if presenter_audio.is_some()
+            && audio_ready.is_none()
+            && let Some(failed) = presenter_audio.take()
+        {
+            let _ = failed.worker.join();
         }
-        activate_and_play(
+        let audio_active = activate_and_play(
             config,
             client,
             &surface,
@@ -305,6 +313,9 @@ pub fn play(
             first_pts.unwrap_or(0),
             audio_ready.map_or(0, |state| state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)),
         )?;
+        if !audio_active && let Some(failed) = presenter_audio.take() {
+            let _ = failed.worker.join();
+        }
         if let Some(audio) = local_audio.as_ref()
             && let Err(error) = audio.start()
         {
@@ -484,7 +495,7 @@ fn activate_and_play(
     audio: Option<&Track>,
     start_pts_us: i64,
     minimum_buffer_us: u64,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     client.wait_track(
         video,
         TrackWaitCondition::MilestoneSet,
@@ -497,13 +508,28 @@ fn activate_and_play(
         expected_channel_generation: video.channel_generation(),
         required_milestone: MILESTONE_OUTPUT_READY,
     }];
-    if let Some(audio) = audio {
-        client.wait_track(
+    let mut audio_active = audio.is_some();
+    if let Some(audio) = audio
+        && let Err(wait_error) = client.wait_track(
             audio,
             TrackWaitCondition::MilestoneSet,
             Some(MILESTONE_OUTPUT_READY),
             timeout_us(PLAYBACK_START_TIMEOUT),
-        )?;
+        )
+    {
+        let status = client.query_track(audio)?;
+        if status.lifecycle == 6 {
+            client.verbose(format_args!(
+                "presenter audio track {} was lost before activation ({wait_error}); continuing with video",
+                audio.id()
+            ));
+            audio_active = false;
+        } else {
+            return Err(wait_error);
+        }
+    }
+    if audio_active {
+        let audio = audio.expect("active presenter audio track exists");
         bindings.push(SlotBinding {
             slot: SLOT_AUDIO,
             track_id: audio.id(),
@@ -511,8 +537,38 @@ fn activate_and_play(
             required_milestone: MILESTONE_OUTPUT_READY,
         });
     }
-    client.activate_tracks(surface, &bindings, &RequestMetadata::default())?;
-    let clock = audio.unwrap_or(video);
+    if let Err(activation_error) =
+        client.activate_tracks(surface, &bindings, &RequestMetadata::default())
+    {
+        let video_status = client.query_track(video)?;
+        let audio_lost = if let Some(audio) = audio {
+            client
+                .query_track(audio)
+                .is_ok_and(|status| status.lifecycle == 6)
+        } else {
+            false
+        };
+        if audio_active
+            && audio_lost
+            && video_status.lifecycle != 6
+            && video_status.channel_generation == video.channel_generation()
+            && video_status.milestones & MILESTONE_OUTPUT_READY != 0
+        {
+            client.verbose(format_args!(
+                "presenter audio was lost during atomic activation ({activation_error}); retrying video alone"
+            ));
+            audio_active = false;
+            bindings.truncate(1);
+            client.activate_tracks(surface, &bindings, &RequestMetadata::default())?;
+        } else {
+            return Err(activation_error);
+        }
+    }
+    let clock = if audio_active {
+        audio.expect("active presenter audio track exists")
+    } else {
+        video
+    };
     client.play(clock, start_pts_us, minimum_buffer_us, MAXIMUM_LATENCY_US)?;
     if !config.no_wait {
         client.wait_track(
@@ -522,7 +578,7 @@ fn activate_and_play(
             timeout_us(PLAYBACK_START_TIMEOUT),
         )?;
     }
-    Ok(())
+    Ok(audio_active)
 }
 
 fn take_video_recovery(channel: &TrackChannel) -> io::Result<Option<VideoRecovery>> {
