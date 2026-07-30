@@ -130,14 +130,6 @@ mod platform {
             Ok(())
         }
 
-        pub fn pause(&self) {
-            self.shared.enabled.store(false, Ordering::SeqCst);
-        }
-
-        pub fn resume(&self) {
-            self.shared.enabled.store(true, Ordering::SeqCst);
-        }
-
         pub fn wait(&mut self) -> io::Result<()> {
             if let Some(worker) = self.worker.take()
                 && worker.join().is_err()
@@ -416,10 +408,6 @@ mod platform_stub {
         pub fn start(&self) -> io::Result<()> {
             Ok(())
         }
-
-        pub fn pause(&self) {}
-
-        pub fn resume(&self) {}
 
         pub fn wait(&mut self) -> io::Result<()> {
             Ok(())

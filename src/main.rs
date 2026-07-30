@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use crate::cli::Config;
-use crate::client::{VividClient, producer_config};
+use crate::client::VividClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaHint {
@@ -38,7 +38,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
     config.validate()?;
 
-    let mut client = VividClient::connect(&producer_config(&config))?;
+    let mut client = VividClient::connect(&config)?;
     for file in &config.files {
         let result = match media_hint(file) {
             MediaHint::Video => video_player::play(&config, &mut client, file),
@@ -62,7 +62,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         result?;
     }
 
-    client.goodbye()?;
+    client.close()?;
     Ok(())
 }
 
@@ -81,9 +81,8 @@ fn play_audio(
     client: &mut VividClient,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    validate_audio_mode(config)?;
-    if client.supports(crate::protocol::messages::FEATURE_AUDIO_ACCESS_UNIT_V1) {
-        match audio_streamer::play(client, path) {
+    if client.supports(crate::protocol::registry::TIMED_MEDIA) {
+        match audio_streamer::play(config, client, path) {
             Ok(()) => return Ok(()),
             Err(error) if std::env::var_os("VIVID_REMOTE").is_some() => {
                 return Err(std::io::Error::new(
@@ -92,7 +91,7 @@ fn play_audio(
                 )
                 .into());
             }
-            Err(error) if config.is_dry_run() => return Err(error),
+            Err(error) if config.is_dry_run() || config.no_wait => return Err(error),
             Err(error) => client.verbose(format_args!(
                 "presenter audio failed for {}: {error}; using local audio output",
                 path.display()
@@ -102,21 +101,11 @@ fn play_audio(
     if std::env::var_os("VIVID_REMOTE").is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "remote audio requires a presenter with audio-access-unit-v1",
+            "remote audio requires a presenter supporting timed-media-v1",
         )
         .into());
     }
     audio_player::play(path)?;
-    Ok(())
-}
-
-fn validate_audio_mode(config: &Config) -> std::io::Result<()> {
-    if config.no_wait {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "--no-wait cannot play an audio-only file because audio output is local",
-        ));
-    }
     Ok(())
 }
 
@@ -166,24 +155,5 @@ mod tests {
         assert_eq!(media_hint(Path::new("clip.mp4")), MediaHint::Video);
         assert_eq!(media_hint(Path::new("song.m4a")), MediaHint::Audio);
         assert_eq!(media_hint(Path::new("extensionless")), MediaHint::Unknown);
-    }
-
-    #[test]
-    fn audio_only_rejects_no_wait_but_allows_deterministic_dry_run() {
-        let mut config = Config {
-            files: vec!["song.mp3".into()],
-            zoom: 1.0,
-            endpoint: None,
-            bulk_endpoint: None,
-            token: None,
-            dry_run: false,
-            trace_dir: None,
-            verbose: false,
-            no_wait: true,
-        };
-        assert!(validate_audio_mode(&config).is_err());
-        config.no_wait = false;
-        config.dry_run = true;
-        assert!(validate_audio_mode(&config).is_ok());
     }
 }

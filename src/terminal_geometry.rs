@@ -1,6 +1,12 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+use vivid_protocol::messages::PayloadMap;
+use vivid_protocol::{cbor::Value, registry};
+use vivid_sdk::{Fit, RequestMetadata, SceneNode, SessionEvent, Surface};
+
+use crate::client::VividClient;
+
 const DEFAULT_CELL_WIDTH_PX: u32 = 10;
 const DEFAULT_CELL_HEIGHT_PX: u32 = 20;
 const DISPLAY_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -44,26 +50,82 @@ impl TerminalGeometry {
         Self::with_cell_size(cols, rows, DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX)
     }
 
-    fn from_settled_display(display: vivid_sdk::DisplayState) -> Option<Self> {
-        if !display.settled {
-            return None;
+    pub fn from_target_descriptor(descriptor: &PayloadMap) -> io::Result<Self> {
+        if descriptor.len() != 9
+            || descriptor
+                .iter()
+                .enumerate()
+                .any(|(index, (key, _))| *key != index as u64)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "terminal target descriptor must contain exactly keys 0 through 8",
+            ));
         }
-        let cols = u16::try_from(display.grid_columns).ok()?;
-        let rows = u16::try_from(display.grid_rows).ok()?;
-        (cols > 0 && rows > 0)
-            .then(|| Self::with_cell_size(cols, rows, display.cell_width, display.cell_height))
+        let unsigned = |key: usize| {
+            descriptor[key].1.as_u64().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("terminal target descriptor key {key} is not unsigned"),
+                )
+            })
+        };
+        let cols = u16::try_from(unsigned(2)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "grid columns exceed u16"))?;
+        let rows = u16::try_from(unsigned(3)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "grid rows exceed u16"))?;
+        let cell_width = u32::try_from(unsigned(4)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "cell width exceeds u32"))?;
+        let cell_height = u32::try_from(unsigned(5)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "cell height exceeds u32"))?;
+        let settled = descriptor[6].1.as_bool().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "terminal target descriptor settled flag is not boolean",
+            )
+        })?;
+        if unsigned(0)? == 0
+            || unsigned(1)? == 0
+            || cols == 0
+            || rows == 0
+            || cell_width == 0
+            || cell_height == 0
+            || unsigned(7)? != 3
+            || unsigned(8)? == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "terminal target descriptor contains invalid dimensions or anchor capabilities",
+            ));
+        }
+        if !settled {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "terminal target geometry is not settled",
+            ));
+        }
+        Ok(Self::with_cell_size(cols, rows, cell_width, cell_height))
     }
 
-    pub fn settled_presenter(session: &vivid_sdk::ProducerSession) -> Self {
+    pub fn settled_presenter(client: &mut VividClient) -> Self {
         let deadline = Instant::now() + DISPLAY_SETTLE_TIMEOUT;
         loop {
-            if let Some(geometry) = Self::from_settled_display(session.display_state()) {
-                return geometry;
+            match Self::from_target_descriptor(&client.info().target_descriptor) {
+                Ok(geometry) => return geometry,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => return Self::current(),
+            }
+            while let Ok(Some(event)) = client.take_event() {
+                if let SessionEvent::TargetChanged(payload) = event
+                    && client.apply_target_changed(&payload).is_err()
+                {
+                    return Self::current();
+                }
             }
             if Instant::now() >= deadline {
                 return Self::current();
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -98,6 +160,142 @@ pub fn reserve_rows(rows: u32) -> io::Result<()> {
         stdout.write_all(b"\r\n")?;
     }
     stdout.flush()
+}
+
+pub fn place_surface(
+    client: &mut VividClient,
+    surface: &Surface,
+    node_id: u64,
+    columns: u32,
+    rows: u32,
+) -> io::Result<()> {
+    let width = fixed_cells(columns)?;
+    let height = fixed_cells(rows)?;
+    let trusted_anchor_path = std::env::var_os("TMUX").is_none()
+        && std::env::var_os("STY").is_none()
+        && client.info().target_descriptor[7].1.as_u64() == Some(3);
+    if !trusted_anchor_path {
+        client.place_terminal_surface(surface, node_id, 0, 0, width, height, 1)?;
+        return Ok(());
+    }
+
+    let context_id = client.info().root_context_id;
+    let anchor_id = random_nonzero_u64()?;
+    let marker = if std::env::var_os("VIVID_ANCHOR_TRANSPORT").as_deref()
+        == Some(std::ffi::OsStr::new("conpty"))
+    {
+        client.conpty_anchor_marker(context_id, anchor_id)?
+    } else {
+        client.anchor_marker(context_id, anchor_id)?
+    };
+    if !client.is_offline() {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(marker.as_bytes())?;
+        stdout.flush()?;
+        wait_for_anchor(client, context_id, anchor_id)?;
+    }
+
+    let node = SceneNode {
+        owning_context_id: context_id,
+        node_id,
+        surface_context_id: surface.context_id(),
+        surface_id: surface.id(),
+        geometry: vec![
+            (0, Value::Unsigned(2)),
+            (1, signed(0)),
+            (2, signed(0)),
+            (3, signed(width)),
+            (4, signed(height)),
+            (5, Value::Unsigned(1)),
+            (6, Value::Unsigned(context_id)),
+            (7, Value::Unsigned(anchor_id)),
+        ],
+        fit: Fit::Contain,
+        linear_sampling: true,
+        z_index: 0,
+        visible: true,
+        opacity: u16::MAX,
+        clip: None,
+    };
+    create_node_with_target_retry(client, &node)
+}
+
+fn create_node_with_target_retry(client: &mut VividClient, node: &SceneNode) -> io::Result<()> {
+    match client.create_node(node, &RequestMetadata::default()) {
+        Ok(_) => Ok(()),
+        Err(error) if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) => {
+            let mut applied = false;
+            while let Some(event) = client.take_event()? {
+                if let SessionEvent::TargetChanged(payload) = event {
+                    client.apply_target_changed(&payload)?;
+                    applied = true;
+                }
+            }
+            if !applied {
+                return Err(error);
+            }
+            client
+                .create_node(node, &RequestMetadata::default())
+                .map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn wait_for_anchor(client: &mut VividClient, context_id: u64, anchor_id: u64) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        while let Some(event) = client.take_event()? {
+            match event {
+                SessionEvent::AnchorReady {
+                    context_id: event_context,
+                    anchor_id: event_anchor,
+                    ..
+                } if event_context == context_id && event_anchor == anchor_id => return Ok(()),
+                SessionEvent::TargetChanged(payload) => {
+                    client.apply_target_changed(&payload)?;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "presenter did not acknowledge the terminal anchor",
+    ))
+}
+
+fn presenter_code(error: &io::Error) -> Option<u64> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<vivid_sdk::PresenterError>())
+        .map(|error| error.code)
+}
+
+fn fixed_cells(cells: u32) -> io::Result<i64> {
+    i64::from(cells)
+        .checked_shl(32)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cell geometry overflows"))
+}
+
+fn signed(value: i64) -> Value {
+    if value >= 0 {
+        Value::Unsigned(value as u64)
+    } else {
+        Value::Negative(value)
+    }
+}
+
+fn random_nonzero_u64() -> io::Result<u64> {
+    loop {
+        let mut bytes = [0_u8; 8];
+        getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+        let value = u64::from_be_bytes(bytes);
+        if value != 0 {
+            return Ok(value);
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -252,7 +450,6 @@ fn parse_csi_16t_response(data: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivid_sdk::DisplayState;
 
     #[test]
     fn cell_count_rounds_up() {
@@ -267,21 +464,27 @@ mod tests {
 
     #[test]
     fn presenter_geometry_is_accepted_only_after_settling() {
-        let mut display = DisplayState {
-            display_generation: 2,
-            viewport_width: 900,
-            viewport_height: 600,
-            grid_columns: 90,
-            grid_rows: 30,
-            cell_width: 10,
-            cell_height: 20,
-            settled: false,
-        };
-        assert!(TerminalGeometry::from_settled_display(display).is_none());
-        display.settled = true;
+        let mut descriptor = vec![
+            (0, Value::Unsigned(900)),
+            (1, Value::Unsigned(600)),
+            (2, Value::Unsigned(90)),
+            (3, Value::Unsigned(30)),
+            (4, Value::Unsigned(10)),
+            (5, Value::Unsigned(20)),
+            (6, Value::Bool(false)),
+            (7, Value::Unsigned(3)),
+            (8, Value::Unsigned(64)),
+        ];
         assert_eq!(
-            TerminalGeometry::from_settled_display(display),
-            Some(TerminalGeometry::with_cell_size(90, 30, 10, 20))
+            TerminalGeometry::from_target_descriptor(&descriptor)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        descriptor[6].1 = Value::Bool(true);
+        assert_eq!(
+            TerminalGeometry::from_target_descriptor(&descriptor).unwrap(),
+            TerminalGeometry::with_cell_size(90, 30, 10, 20)
         );
     }
 }

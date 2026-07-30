@@ -20,17 +20,17 @@ pub struct Config {
     #[arg(short = 'z', long, default_value_t = 1.0)]
     pub zoom: f32,
 
-    /// Vivid endpoint, normally inherited from Vivido as VIVID_ENDPOINT.
-    #[arg(long, env = "VIVID_ENDPOINT")]
-    pub endpoint: Option<String>,
+    /// Vivid control endpoint, normally inherited as VIVID_ENDPOINT_CONTROL.
+    #[arg(long, env = "VIVID_ENDPOINT_CONTROL")]
+    pub control_endpoint: Option<String>,
+
+    /// Optional realtime endpoint, normally inherited as VIVID_ENDPOINT_REALTIME.
+    #[arg(long, env = "VIVID_ENDPOINT_REALTIME")]
+    pub realtime_endpoint: Option<String>,
 
     /// Alternate endpoint for media connections, normally inherited as VIVID_ENDPOINT_BULK.
     #[arg(long, env = "VIVID_ENDPOINT_BULK")]
     pub bulk_endpoint: Option<String>,
-
-    /// Vivid capability token, normally inherited from Vivido as VIVID_TOKEN.
-    #[arg(long, env = "VIVID_TOKEN", hide_env_values = true)]
-    pub token: Option<String>,
 
     /// Build the complete request stream without connecting to Vivido.
     #[arg(long)]
@@ -41,7 +41,7 @@ pub struct Config {
     #[arg(long, value_name = "DIRECTORY")]
     pub trace_dir: Option<PathBuf>,
 
-    /// Print source, placement, packet, and protocol progress.
+    /// Print surface, track, channel, placement, and playback progress.
     #[arg(short, long)]
     pub verbose: bool,
 
@@ -60,19 +60,11 @@ impl Config {
             .into());
         }
 
-        if !self.is_dry_run() && self.endpoint.is_none() {
+        if !self.is_dry_run() && self.control_endpoint.is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "VIVID_ENDPOINT is not set; run Vivi inside Vivido or use --dry-run \
+                "VIVID_ENDPOINT_CONTROL is not set; run Vivi inside Vivido or use --dry-run \
                  (optionally with --trace-dir)",
-            )
-            .into());
-        }
-
-        if !self.is_dry_run() && self.token.is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "VIVID_TOKEN is not set",
             )
             .into());
         }
@@ -93,9 +85,9 @@ mod tests {
         Config {
             files: vec![PathBuf::from("image.png")],
             zoom: 1.0,
-            endpoint: None,
+            control_endpoint: None,
+            realtime_endpoint: None,
             bulk_endpoint: None,
-            token: None,
             dry_run: true,
             trace_dir: None,
             verbose: false,
@@ -104,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_does_not_require_endpoint_or_token() {
+    fn dry_run_does_not_require_endpoint_or_root_secret() {
         assert!(config().validate().is_ok());
     }
 
@@ -113,5 +105,25 @@ mod tests {
         let mut config = config();
         config.zoom = f32::NAN;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_only_protocol_1_5_discovery_flags() {
+        let parsed = Config::try_parse_from([
+            "vivi",
+            "--dry-run",
+            "--control-endpoint",
+            "unix:/control",
+            "--realtime-endpoint",
+            "unix:/realtime",
+            "--bulk-endpoint",
+            "unix:/bulk",
+            "image.png",
+        ])
+        .unwrap();
+        assert_eq!(parsed.control_endpoint.as_deref(), Some("unix:/control"));
+        assert_eq!(parsed.realtime_endpoint.as_deref(), Some("unix:/realtime"));
+        assert!(Config::try_parse_from(["vivi", "--endpoint", "unix:/old", "image.png"]).is_err());
+        assert!(Config::try_parse_from(["vivi", "--token", "secret", "image.png"]).is_err());
     }
 }

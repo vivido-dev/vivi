@@ -3,17 +3,25 @@ use std::path::Path;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+use vivid_protocol::messages::LaneClass;
+use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
+use vivid_sdk::{
+    CoordinateModel, ImageConfiguration, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED,
+    RasterConfiguration, RequestMetadata, SlotBinding, SurfaceDefinition, SurfaceDescriptor,
+    SurfaceRole, TrackWaitCondition,
+};
 
 use crate::cli::Config;
-use crate::client::{VividClient, WaitSource};
-use crate::protocol::HARD_MAX_RECORD_BODY;
-use crate::protocol::wire::ConnectionKind;
-use crate::terminal_geometry::{TerminalGeometry, cells_for_pixels, reserve_rows};
+use crate::client::VividClient;
+use crate::terminal_geometry::{TerminalGeometry, cells_for_pixels, place_surface, reserve_rows};
 
 const FIT_MARGIN_COLS: u16 = 4;
 const FIT_MARGIN_ROWS: u16 = 2;
-const RASTER_OVERHEAD: usize = 48 + 24;
 const PRESENTATION_TIMEOUT: Duration = Duration::from_secs(30);
+const SLOT_RASTER: u64 = 3;
+const SLOT_POSTER: u64 = 4;
+const IMAGE_PNG: u64 = 1;
+const IMAGE_JPEG: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DisplaySize {
@@ -37,85 +45,72 @@ pub fn view(
         config.zoom,
         TerminalGeometry::settled_presenter(client),
     );
-
-    let source_id = client.allocate_id()?;
+    let surface_id = client.allocate_id()?;
     let node_id = client.allocate_id()?;
-    let anchor_id = client.create_text_anchor()?;
+    let context_id = client.info().root_context_id;
+    let surface = client.create_surface(
+        image_surface(context_id, surface_id, path, width, height),
+        &RequestMetadata::default(),
+    )?;
+    place_surface(client, &surface, node_id, display.columns, display.rows)?;
+    if !config.is_dry_run() {
+        reserve_rows(display.rows)?;
+    }
+
     let encoded_kind = match format {
-        Some(image::ImageFormat::Png) => Some(crate::protocol::messages::IMAGE_PNG),
-        Some(image::ImageFormat::Jpeg) => Some(crate::protocol::messages::IMAGE_JPEG),
+        Some(image::ImageFormat::Png) => Some(IMAGE_PNG),
+        Some(image::ImageFormat::Jpeg) => Some(IMAGE_JPEG),
         _ => None,
     };
-    if let Some(encoding) = encoded_kind
-        .filter(|_| client.supports(crate::protocol::messages::FEATURE_ENCODED_IMAGE_V1))
-    {
-        let hash: [u8; 32] = Sha256::digest(&encoded).into();
-        let image_config = crate::protocol::messages::ImageSourceConfig {
-            source_id,
-            encoding,
-            width,
-            height,
-            encoded_length: u32::try_from(encoded.len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "encoded image exceeds u32")
-            })?,
-            sha256: Some(hash),
-        };
-        let source = if client.supports(crate::protocol::messages::FEATURE_IMAGE_CACHE_V1) {
-            client.create_image_source_with_cache(&image_config)?
+    let track = if let Some(encoding) = encoded_kind {
+        let configuration =
+            encoded_image_track(client, &surface, encoding, width, height, &encoded)?;
+        let probe = probe_configuration(&configuration);
+        if client.probe_track(&probe)?.supported {
+            let track = client.create_track(configuration, &RequestMetadata::default())?;
+            if track.connection_required()? {
+                client.open_track_channel(&track)?.send_image(&encoded)?;
+            } else {
+                client.verbose(format_args!(
+                    "image {}: presenter cache hit; skipped {} encoded bytes",
+                    path.display(),
+                    encoded.len()
+                ));
+            }
+            track
         } else {
-            client.create_image_source(&image_config)?
-        };
-        let cache_hit = source.is_cache_hit();
-        client.place_source(source_id, node_id, anchor_id, display.columns, display.rows)?;
-        if !config.is_dry_run() {
-            reserve_rows(display.rows)?;
-        }
-        if source_requires_media(cache_hit) {
-            let mut sender = client.open_media_sender(source, ConnectionKind::Blob)?;
-            sender.send_image(&encoded)?;
-        } else {
-            client.verbose(format_args!(
-                "image {}: presenter cache hit; skipped {} encoded bytes",
-                path.display(),
-                encoded.len()
-            ));
+            create_raster_track(client, &surface, path, width, height)?
         }
     } else {
-        let image = image::open(path)?;
-        let rgba = image.into_rgba8().into_raw();
-        let maximum_pixels = (HARD_MAX_RECORD_BODY as usize)
-            .saturating_sub(RASTER_OVERHEAD)
-            .saturating_div(4);
-        if rgba.len() / 4 > maximum_pixels {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{} is {width}x{height}; its uncompressed frame exceeds the Vivid 1.0 \
-                     raster record limit",
-                    path.display()
-                ),
-            )
-            .into());
-        }
-        let source = client.create_raster_source(source_id, width, height)?;
-        client.place_source(source_id, node_id, anchor_id, display.columns, display.rows)?;
-        if !config.is_dry_run() {
-            reserve_rows(display.rows)?;
-        }
-        let mut sender = client.open_media_sender(source, ConnectionKind::Raster)?;
-        sender.send_raster(1, 1, width, height, &rgba)?;
-    }
-    if !config.no_wait && client.supports(crate::protocol::messages::FEATURE_OBSERVABILITY_CORE_V1)
-    {
-        client.wait_source(WaitSource {
-            source_id,
-            condition: crate::protocol::messages::WAIT_FIRST_VISIBLE_PRESENTATION,
-            value: None,
-            timeout_us: u64::try_from(PRESENTATION_TIMEOUT.as_micros()).unwrap(),
-        })?;
+        create_raster_track(client, &surface, path, width, height)?
+    };
+
+    client.wait_track(
+        &track,
+        TrackWaitCondition::MilestoneSet,
+        Some(MILESTONE_OUTPUT_READY),
+        timeout_us(PRESENTATION_TIMEOUT),
+    )?;
+    client.activate_tracks(
+        &surface,
+        &[SlotBinding {
+            slot: track.configuration()?.slot,
+            track_id: track.id(),
+            expected_channel_generation: track.channel_generation(),
+            required_milestone: MILESTONE_OUTPUT_READY,
+        }],
+        &RequestMetadata::default(),
+    )?;
+    if !config.no_wait {
+        client.wait_track(
+            &track,
+            TrackWaitCondition::MilestoneSet,
+            Some(MILESTONE_PRESENTED),
+            timeout_us(PRESENTATION_TIMEOUT),
+        )?;
     }
     client.verbose(format_args!(
-        "image {}: {width}x{height} RGBA -> {}x{} cells",
+        "image surface {surface_id}: {} is {width}x{height}, presented at {}x{} cells",
         path.display(),
         display.columns,
         display.rows
@@ -123,8 +118,146 @@ pub fn view(
     Ok(())
 }
 
-fn source_requires_media(cache_hit: bool) -> bool {
-    !cache_hit
+fn image_surface(
+    context_id: u64,
+    surface_id: u64,
+    path: &Path,
+    width: u32,
+    height: u32,
+) -> SurfaceDefinition {
+    SurfaceDefinition {
+        context_id,
+        surface_id,
+        semantic_profile: vivid_sdk::GENERIC_CONTENT.into(),
+        coordinate_model: CoordinateModel::DesktopLogicalPixels,
+        logical_width: u64::from(width),
+        logical_height: u64::from(height),
+        scale_numerator: 1,
+        scale_denominator: 1,
+        rotation: 0,
+        descriptor: SurfaceDescriptor {
+            role: SurfaceRole::Figure,
+            title: bounded_title(path),
+            semantic_content_revision: 1,
+            semantic_availability: 0,
+            locator_hint: String::new(),
+        },
+        policy: 0,
+        profile_parameters: vec![],
+    }
+}
+
+fn encoded_image_track(
+    client: &VividClient,
+    surface: &vivid_sdk::Surface,
+    encoding: u64,
+    width: u32,
+    height: u32,
+    encoded: &[u8],
+) -> io::Result<TrackConfiguration> {
+    let encoded_length = u32::try_from(encoded.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "encoded image exceeds u32"))?;
+    let retained_pixel_charge = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "image pixels overflow"))?;
+    Ok(TrackConfiguration {
+        context_id: surface.context_id(),
+        surface_id: surface.id(),
+        track_id: client.allocate_id()?,
+        slot: SLOT_POSTER,
+        mode: TrackMode::Live,
+        lane: LaneClass::Bulk,
+        maximum_record_body: encoded_length,
+        maximum_rate_millihertz: 1,
+        maximum_encoded_bits_per_second: u64::from(encoded_length).saturating_mul(8).max(1),
+        maximum_records_per_second: 1,
+        maximum_inflight_body_bytes: u64::from(encoded_length),
+        kind: KindConfiguration::EncodedImage(ImageConfiguration {
+            encoding,
+            width,
+            height,
+            encoded_length,
+            sha256: Some(Sha256::digest(encoded).into()),
+            cache_lookup: true,
+        }),
+        target_latency_us: 0,
+        maximum_latency_us: 1_000_000,
+        retained_pixel_charge,
+    })
+}
+
+fn create_raster_track(
+    client: &mut VividClient,
+    surface: &vivid_sdk::Surface,
+    path: &Path,
+    width: u32,
+    height: u32,
+) -> io::Result<vivid_sdk::Track> {
+    let rgba = image::open(path)
+        .map_err(io::Error::other)?
+        .into_rgba8()
+        .into_raw();
+    let maximum_record_body =
+        vivid_protocol::media::rgba8_raw_frame_body_len(width, height).map_err(io::Error::other)?;
+    let retained_pixel_charge = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raster pixels overflow"))?;
+    let configuration = TrackConfiguration {
+        context_id: surface.context_id(),
+        surface_id: surface.id(),
+        track_id: client.allocate_id()?,
+        slot: SLOT_RASTER,
+        mode: TrackMode::Live,
+        lane: LaneClass::Bulk,
+        maximum_record_body,
+        maximum_rate_millihertz: 1,
+        maximum_encoded_bits_per_second: u64::from(maximum_record_body).saturating_mul(8).max(1),
+        maximum_records_per_second: 1,
+        maximum_inflight_body_bytes: u64::from(maximum_record_body),
+        kind: KindConfiguration::Raster(RasterConfiguration {
+            width,
+            height,
+            alpha_mode: 1,
+            delta_enabled: false,
+            maximum_delta_operations: 1,
+            zstd_enabled: false,
+        }),
+        target_latency_us: 0,
+        maximum_latency_us: 1_000_000,
+        retained_pixel_charge,
+    };
+    if !client
+        .probe_track(&probe_configuration(&configuration))?
+        .supported
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "presenter rejected both encoded-image and raster track configurations",
+        ));
+    }
+    let track = client.create_track(configuration, &RequestMetadata::default())?;
+    client
+        .open_track_channel(&track)?
+        .send_raster(1, 1, &rgba, false)?;
+    Ok(track)
+}
+
+fn probe_configuration(configuration: &TrackConfiguration) -> TrackConfiguration {
+    let mut probe = configuration.clone();
+    probe.track_id = 0;
+    probe
+}
+
+fn bounded_title(path: &Path) -> String {
+    let title = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    title.chars().take(256).collect()
+}
+
+fn timeout_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn display_size(width: u32, height: u32, zoom: f32, geometry: TerminalGeometry) -> DisplaySize {
@@ -170,11 +303,5 @@ mod tests {
                 rows: 22
             }
         );
-    }
-
-    #[test]
-    fn cache_hits_skip_the_blob_media_channel() {
-        assert!(!source_requires_media(true));
-        assert!(source_requires_media(false));
     }
 }

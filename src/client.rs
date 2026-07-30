@@ -1,93 +1,91 @@
-use crate::cli::Config;
-use crate::ffmpeg::{AudioInfo, VideoInfo};
-use crate::protocol::messages;
+use std::fmt;
+use std::io;
+use std::ops::{Deref, DerefMut};
 
-use vivid_sdk::{AudioConfig, ProducerConfig, VideoConfig};
-pub use vivid_sdk::{
-    KeyframeRequest, MediaSender, PresenterError, ProducerSession as VividClient, SourceWaitHandle,
-    WaitSource,
+use vivid_sdk::{ProducerAuthentication, ProducerConfig, Session};
+
+use crate::cli::Config;
+use crate::protocol::registry::{
+    CORE_CONTROL, LIVE_MEDIA, OBSERVABILITY, TERMINAL_SURFACE, TIMED_MEDIA,
 };
 
-impl VideoConfig for VideoInfo {
-    fn vivid_video_config(&self, source_id: u64) -> messages::VideoSourceConfig<'_> {
-        messages::VideoSourceConfig {
-            source_id,
-            codec: &self.codec,
-            packetization: &self.packetization,
-            extradata: &self.extradata,
-            width: self.width,
-            height: self.height,
-            profile: self.profile,
-            level: self.level,
-            bitrate: self.bitrate,
-            color_primaries: self.color_primaries,
-            transfer: self.transfer,
-            matrix: self.matrix,
-            range: self.range,
-            sar_num: self.sar_num,
-            sar_den: self.sar_den,
-            max_access_unit_bytes: self.max_access_unit_bytes,
-            codec_string: self.codec_string.as_deref(),
-            decoder_config: self.decoder_config.as_deref(),
+pub struct VividClient {
+    session: Session,
+    verbose: bool,
+    offline: bool,
+}
+
+impl VividClient {
+    pub fn connect(config: &Config) -> io::Result<Self> {
+        let session = Session::connect(producer_config(config))?;
+        if session.info().target_profile != TERMINAL_SURFACE {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "presenter did not select terminal-surface-v1",
+            ));
         }
+        if let Err(error) = crate::terminal_geometry::TerminalGeometry::from_target_descriptor(
+            &session.info().target_descriptor,
+        ) && error.kind() != io::ErrorKind::WouldBlock
+        {
+            return Err(error);
+        }
+        Ok(Self {
+            session,
+            verbose: config.verbose,
+            offline: config.is_dry_run(),
+        })
+    }
+
+    pub fn verbose(&self, message: fmt::Arguments<'_>) {
+        if self.verbose {
+            eprintln!("vivi: {message}");
+        }
+    }
+
+    pub fn close(self) -> io::Result<()> {
+        self.session.close()
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.offline
     }
 }
 
-impl AudioConfig for AudioInfo {
-    fn vivid_audio_config(
-        &self,
-        source_id: u64,
-        linked_video_source_id: Option<u64>,
-    ) -> messages::AudioSourceConfig<'_> {
-        messages::AudioSourceConfig {
-            source_id,
-            linked_video_source_id,
-            codec: &self.codec,
-            packetization: &self.packetization,
-            extradata: &self.extradata,
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            channel_mask: self.channel_mask,
-            bitrate: self.bitrate,
-            max_access_unit_bytes: self.max_access_unit_bytes,
-            codec_string: self.codec_string.as_deref(),
-        }
+impl Deref for VividClient {
+    type Target = Session;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl DerefMut for VividClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
     }
 }
 
 pub fn producer_config(config: &Config) -> ProducerConfig {
     ProducerConfig {
-        endpoint: config.endpoint.clone(),
-        bulk_endpoint: config.bulk_endpoint.clone(),
-        token: config.token.clone(),
+        endpoint_control: config.control_endpoint.clone(),
+        endpoint_realtime: config.realtime_endpoint.clone(),
+        endpoint_bulk: config.bulk_endpoint.clone(),
+        authentication: ProducerAuthentication::RootFromEnvironment,
+        producer_name: "vivi".into(),
+        producer_version: env!("CARGO_PKG_VERSION").into(),
+        target_profile: TERMINAL_SURFACE.into(),
+        required_profiles: vec![
+            LIVE_MEDIA.into(),
+            OBSERVABILITY.into(),
+            TERMINAL_SURFACE.into(),
+            TIMED_MEDIA.into(),
+            CORE_CONTROL.into(),
+        ],
+        optional_profiles: vec![],
         dry_run: config.dry_run,
         trace_dir: config.trace_dir.clone(),
-        verbose: config.verbose,
-        producer: "vivi".into(),
-        producer_version: env!("CARGO_PKG_VERSION").into(),
-        authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
-        allow_version_retry: false,
-        required_features: vec![
-            messages::FEATURE_RASTER_RGBA8,
-            messages::FEATURE_SCENE_TRANSACTIONS,
-            messages::FEATURE_GRID_CELL_NODES,
-            messages::FEATURE_CREDIT_FLOW_CONTROL,
-            messages::FEATURE_TEXT_ANCHORS_V2,
-        ],
-        optional_features: vec![
-            messages::FEATURE_ENCODED_IMAGE_V1,
-            messages::FEATURE_RASTER_ZSTD_V1,
-            messages::FEATURE_RASTER_PREMULTIPLIED_ALPHA,
-            messages::FEATURE_VISIBILITY_EVENTS_V1,
-            messages::FEATURE_VIDEO_ACCESS_UNIT_V1,
-            messages::FEATURE_VIDEO_CONTROL_V1,
-            messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
-            messages::FEATURE_DECODER_DESCRIPTION_V1,
-            messages::FEATURE_OBSERVABILITY_CORE_V1,
-            messages::FEATURE_IMAGE_CACHE_V1,
-            messages::FEATURE_MEDIA_ORDER_BARRIER_V1,
-            messages::FEATURE_CLOCK_SAMPLING_V1,
-        ],
+        ..ProducerConfig::default()
     }
 }
 
@@ -98,19 +96,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn producer_features_form_valid_strictly_increasing_sets() {
+    fn producer_profiles_are_strictly_sorted_and_prerequisite_closed() {
         let config = Config {
             files: vec![PathBuf::from("image.png")],
             zoom: 1.0,
-            endpoint: None,
+            control_endpoint: None,
+            realtime_endpoint: None,
             bulk_endpoint: None,
-            token: None,
             dry_run: true,
             trace_dir: None,
             verbose: false,
             no_wait: false,
         };
-
         producer_config(&config).validate().unwrap();
     }
 }

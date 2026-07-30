@@ -1,65 +1,41 @@
 # Remote Linux Audio Through Vivido
 
-Vivi audio uses the Vivid media connection. It does not require PulseAudio, an ALSA device, or an
-audio server on the SSH host:
+Vivi sends encoded audio over the Vivid 1.5 realtime track connection:
 
 ```text
-remote Linux Vivi encoded audio -> vvssh -> local Vivido -> FFmpeg -> CPAL -> speakers
+remote Vivi -> vvssh -> local Vivido decoder/output -> speakers
 ```
 
-The supported remote arrangement is a Linux SSH destination with Vivido running locally on
-Windows, macOS, or Linux. Vivido selects the current system-default output device. There is no
-remote device selection or volume option.
+The SSH host needs Vivi and FFmpeg libraries, but no PulseAudio server, ALSA device, or remote
+audio configuration.
 
-## Setup
-
-Install Vivi and its FFmpeg build dependencies on the Linux host. For Debian or Ubuntu:
-
-```sh
-sudo apt update
-sudo apt install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswresample-dev
-```
-
-Start `vvssh` from a shell inside the local Vivido window:
+Start the session from a shell inside local Vivido:
 
 ```sh
 vvssh user@linux-host
 ```
 
-The wrapper creates the private Vivid reverse forward, transfers the capability token through its
-protected setup channel, and exports `VIVID_REMOTE=1` in the login shell. No extra `-R` option,
-`PULSE_SERVER`, `.asoundrc`, or PulseAudio daemon is needed.
+`vvssh` forwards `VIVID_ENDPOINT_CONTROL`, optionally forwards `VIVID_ENDPOINT_BULK`, derives the
+realtime fallback, transfers `VIVID_ROOT_SECRET` through its protected setup path, and exports
+`VIVID_REMOTE=1`. The secret is never an SSH or remote-shell argument.
 
-On Windows, `vvssh` also exports `VIVID_ANCHOR_TRANSPORT=conpty`. This selects the marker envelope
-required for images and video to anchor through the Windows pseudoconsole while Vivi itself runs on
-Linux.
+On Windows it also exports `VIVID_ANCHOR_TRANSPORT=conpty`, selecting the bounded marker-v3
+envelope needed across the pseudoconsole.
 
-Inside the remote shell, verify the binding and play media:
+Inside the remote shell:
 
 ```sh
-test -S "${VIVID_ENDPOINT#unix:}" && printf 'Vivid SSH forward is ready\n'
+test -S "${VIVID_ENDPOINT_CONTROL#unix:}" && printf 'Vivid control forward is ready\n'
 test "$VIVID_REMOTE" = 1 && printf 'Remote audio mode is active\n'
 vivi clip.mp4
 vivi song.mp3
-vivi recording.m4a
 ```
 
-Embedded sound and audio-only access units are decoded by local Vivido and heard on its default
-speakers. `--no-wait` remains silent for video and is invalid for audio-only playback.
+If the presenter rejects the audio configuration, remote audio-only playback fails explicitly and
+remote video does not open a device on the SSH host. A local, non-SSH invocation may instead use
+CPAL fallback. Track loss is scoped: failure of the audio track does not delete the video surface
+or its scene node.
 
-## Compatibility and failures
-
-- If an older presenter lacks `audio-access-unit-v1`, remote video continues silently with a
-  warning.
-- Remote audio-only playback fails with a presenter-upgrade error. Vivi never opens an audio device
-  on the SSH host while `VIVID_REMOTE=1` is set.
-- A local, non-SSH Vivi may use its direct CPAL compatibility path if audio negotiation fails.
-- `SOURCE_LOST` for a linked audio source stops sound but does not stop its video source.
-
-If video appears but sound does not, run Vivi with `--verbose` and check its negotiation or
-source-loss message. Also verify that Vivido can open a default local device and that the FFmpeg
-runtime libraries used to build Vivido are discoverable. On Windows, the selected vcpkg triplet's
-`bin` directory must be on `PATH`.
-
-The SSH server must allow stream-local forwarding. See
-[Running Vivi over SSH](../../docs/vivi-over-ssh.md) for server settings and tunnel diagnostics.
+Use `vivi --verbose` to inspect profile, track, channel, and playback diagnostics. Also verify that
+local Vivido can open its default output device and that its FFmpeg runtime libraries are
+discoverable.
