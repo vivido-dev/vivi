@@ -2,10 +2,11 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use vivid_protocol::MAX_TRACK_WAIT_TIMEOUT_US;
 use vivid_protocol::media::{AudioPacket, VideoPacket};
-use vivid_protocol::messages::LaneClass;
+use vivid_protocol::messages::{ERROR_TIMEOUT, LaneClass};
 use vivid_protocol::revision::ChannelGeneration;
 use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
 use vivid_sdk::{
@@ -24,6 +25,7 @@ use crate::terminal_geometry::{TerminalGeometry, cells_for_pixels, place_surface
 const FIT_MARGIN_COLS: u16 = 4;
 const FIT_MARGIN_ROWS: u16 = 2;
 const AUDIO_PREBUFFER_US: u64 = 100_000;
+const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(5);
 const MAXIMUM_LATENCY_US: u64 = 2_000_000;
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(30);
 const PLAYBACK_COMPLETION_GRACE: Duration = Duration::from_secs(30);
@@ -70,7 +72,7 @@ impl AudioProgress {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (state, _) = self
             .changed
-            .wait_timeout_while(state, PLAYBACK_START_TIMEOUT, |state| {
+            .wait_timeout_while(state, AUDIO_START_TIMEOUT, |state| {
                 state.buffered_us < AUDIO_PREBUFFER_US && !state.finished
             })
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -86,13 +88,14 @@ impl AudioProgress {
 }
 
 struct AudioOutcome {
-    channel: TrackChannel,
+    channel: Arc<TrackChannel>,
     packet_id: u64,
     error: Option<io::Error>,
 }
 
 struct PresenterAudio {
     track: Track,
+    channel: Arc<TrackChannel>,
     progress: Arc<AudioProgress>,
     worker: thread::JoinHandle<AudioOutcome>,
 }
@@ -151,7 +154,7 @@ pub fn play(
         .into());
     }
     let video_track = client.create_track(video_configuration, &RequestMetadata::default())?;
-    let mut video_channel = client.open_track_channel(&video_track)?;
+    let mut video_channel = Arc::new(client.open_track_channel(&video_track)?);
 
     let remote = std::env::var_os("VIVID_REMOTE").is_some();
     let mut presenter_audio = create_presenter_audio(client, &surface, path, info.audio.as_ref())?;
@@ -214,29 +217,72 @@ pub fn play(
         packet_id = packet_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("video packet ID space exhausted"))?;
-        if let Err(error) = video_channel.send_video(VideoPacket {
-            epoch,
-            packet_id,
-            pts_us: packet.pts_us,
-            dts_us: packet.dts_us,
-            duration_us: 0,
-            key: packet.key,
-            data: &packet.data,
-        }) {
+        let first_pts_before_send = first_pts;
+        first_pts.get_or_insert(packet.pts_us);
+        let send_result = if started {
+            video_channel.send_video(VideoPacket {
+                epoch,
+                packet_id,
+                pts_us: packet.pts_us,
+                dts_us: packet.dts_us,
+                duration_us: 0,
+                key: packet.key,
+                data: &packet.data,
+            })
+        } else {
+            let channel = video_channel.clone();
+            let data = packet.data.clone();
+            let pts_us = packet.pts_us;
+            let dts_us = packet.dts_us;
+            let key = packet.key;
+            let sender = thread::spawn(move || {
+                channel.send_video(VideoPacket {
+                    epoch,
+                    packet_id,
+                    pts_us,
+                    dts_us,
+                    duration_us: 0,
+                    key,
+                    data: &data,
+                })
+            });
+            let (result, started_while_sending) =
+                finish_send_while_observing_start(sender, || {
+                    let output_ready =
+                        client.query_track(&video_track)?.milestones & MILESTONE_OUTPUT_READY != 0;
+                    if output_ready {
+                        start_video_playback(
+                            config,
+                            client,
+                            &surface,
+                            &video_track,
+                            &mut presenter_audio,
+                            &mut local_audio,
+                            first_pts.unwrap_or(pts_us),
+                        )?;
+                    }
+                    Ok(output_ready)
+                })?;
+            started = started_while_sending;
+            result
+        };
+        if let Err(error) = send_result {
+            if first_pts_before_send.is_none() && !started {
+                first_pts = None;
+            }
             client.verbose(format_args!(
                 "video track {} channel failed: {error}; advancing generation",
                 video_track.id()
             ));
             client.query_track(&video_track)?;
             client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
-            video_channel = client.open_track_channel(&video_track)?;
+            video_channel = Arc::new(client.open_track_channel(&video_track)?);
             epoch = epoch
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
             awaiting_keyframe = true;
             continue;
         }
-        first_pts.get_or_insert(packet.pts_us);
         last_pts = Some(packet.pts_us);
 
         if started
@@ -254,39 +300,15 @@ pub fn play(
         let output_ready =
             !started && client.query_track(&video_track)?.milestones & MILESTONE_OUTPUT_READY != 0;
         if output_ready {
-            let audio_ready = presenter_audio
-                .as_ref()
-                .map(|audio| audio.progress.wait_for_prebuffer())
-                .filter(|state| !state.failed);
-            if presenter_audio.is_some() && audio_ready.is_none() {
-                client.verbose(format_args!(
-                    "presenter audio failed before activation; continuing with video"
-                ));
-                if let Some(failed) = presenter_audio.take() {
-                    let _ = failed.worker.join();
-                }
-            }
-            let audio_active = activate_and_play(
+            start_video_playback(
                 config,
                 client,
                 &surface,
                 &video_track,
-                presenter_audio.as_ref().map(|audio| &audio.track),
+                &mut presenter_audio,
+                &mut local_audio,
                 first_pts.unwrap_or(packet.pts_us),
-                audio_ready.map_or(0, |state| state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)),
             )?;
-            if !audio_active && let Some(failed) = presenter_audio.take() {
-                let _ = failed.worker.join();
-            }
-            if let Some(audio) = local_audio.as_ref()
-                && let Err(error) = audio.start()
-            {
-                client.verbose(format_args!(
-                    "audio disabled for {} after output start failed: {error}",
-                    path.display()
-                ));
-                local_audio = None;
-            }
             started = true;
         }
     }
@@ -294,37 +316,15 @@ pub fn play(
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "video has no keyframes").into());
     }
     if !started {
-        let audio_ready = presenter_audio
-            .as_ref()
-            .map(|audio| audio.progress.wait_for_prebuffer())
-            .filter(|state| !state.failed);
-        if presenter_audio.is_some()
-            && audio_ready.is_none()
-            && let Some(failed) = presenter_audio.take()
-        {
-            let _ = failed.worker.join();
-        }
-        let audio_active = activate_and_play(
+        start_video_playback(
             config,
             client,
             &surface,
             &video_track,
-            presenter_audio.as_ref().map(|audio| &audio.track),
+            &mut presenter_audio,
+            &mut local_audio,
             first_pts.unwrap_or(0),
-            audio_ready.map_or(0, |state| state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)),
         )?;
-        if !audio_active && let Some(failed) = presenter_audio.take() {
-            let _ = failed.worker.join();
-        }
-        if let Some(audio) = local_audio.as_ref()
-            && let Err(error) = audio.start()
-        {
-            client.verbose(format_args!(
-                "audio disabled for {} after output start failed: {error}",
-                path.display()
-            ));
-            local_audio = None;
-        }
     }
 
     let mut audio_to_drain = None;
@@ -369,12 +369,7 @@ pub fn play(
             .zip(first_pts)
             .map_or(0, |(last, first)| last.saturating_sub(first).max(0) as u64);
         let timeout = Duration::from_micros(timeline).saturating_add(PLAYBACK_COMPLETION_GRACE);
-        client.wait_track(
-            &video_track,
-            TrackWaitCondition::PlaybackEnded,
-            None,
-            timeout_us(timeout),
-        )?;
+        wait_for_playback_end(client, &video_track, timeout)?;
         if let Some(audio) = local_audio.as_mut()
             && let Err(error) = audio.wait()
         {
@@ -389,6 +384,45 @@ pub fn play(
         video_track.id()
     ));
     Ok(())
+}
+
+fn wait_for_playback_end(
+    client: &VividClient,
+    track: &Track,
+    overall_timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(overall_timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "playback wait is too long"))?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for Vivid playback to finish",
+            ));
+        }
+        let request_timeout = remaining.min(Duration::from_micros(MAX_TRACK_WAIT_TIMEOUT_US));
+        let request_timeout_us = timeout_us(request_timeout).max(1);
+        match client.wait_track(
+            track,
+            TrackWaitCondition::PlaybackEnded,
+            None,
+            request_timeout_us,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if presenter_code(&error) == Some(ERROR_TIMEOUT) && Instant::now() < deadline => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn presenter_code(error: &io::Error) -> Option<u64> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<vivid_sdk::PresenterError>())
+        .map(|error| error.code)
 }
 
 fn clear_audio_slot(client: &mut VividClient, surface: &vivid_sdk::Surface) -> io::Result<()> {
@@ -429,7 +463,7 @@ fn create_presenter_audio(
         }
     };
     let channel = match client.open_track_channel(&track) {
-        Ok(channel) => channel,
+        Ok(channel) => Arc::new(channel),
         Err(error) => {
             client.verbose(format_args!("presenter audio channel unavailable: {error}"));
             return Ok(None);
@@ -437,18 +471,19 @@ fn create_presenter_audio(
     };
     let progress = Arc::new(AudioProgress::default());
     let worker_progress = progress.clone();
+    let worker_channel = channel.clone();
     let path = path.to_path_buf();
     let worker = thread::spawn(move || {
-        let result = stream_audio(&path, &channel, &worker_progress);
+        let result = stream_audio(&path, &worker_channel, &worker_progress);
         worker_progress.finish(result.is_err());
         match result {
             Ok(packet_id) => AudioOutcome {
-                channel,
+                channel: worker_channel,
                 packet_id,
                 error: None,
             },
             Err(error) => AudioOutcome {
-                channel,
+                channel: worker_channel,
                 packet_id: 0,
                 error: Some(error),
             },
@@ -456,6 +491,7 @@ fn create_presenter_audio(
     });
     Ok(Some(PresenterAudio {
         track,
+        channel,
         progress,
         worker,
     }))
@@ -514,13 +550,13 @@ fn activate_and_play(
             audio,
             TrackWaitCondition::MilestoneSet,
             Some(MILESTONE_OUTPUT_READY),
-            timeout_us(PLAYBACK_START_TIMEOUT),
+            timeout_us(AUDIO_START_TIMEOUT),
         )
     {
         let status = client.query_track(audio)?;
-        if status.lifecycle == 6 {
+        if status.lifecycle == 6 || presenter_code(&wait_error) == Some(ERROR_TIMEOUT) {
             client.verbose(format_args!(
-                "presenter audio track {} was lost before activation ({wait_error}); continuing with video",
+                "presenter audio track {} was not ready before activation ({wait_error}); continuing with video",
                 audio.id()
             ));
             audio_active = false;
@@ -579,6 +615,97 @@ fn activate_and_play(
         )?;
     }
     Ok(audio_active)
+}
+
+fn start_video_playback(
+    config: &Config,
+    client: &mut VividClient,
+    surface: &vivid_sdk::Surface,
+    video: &Track,
+    presenter_audio: &mut Option<PresenterAudio>,
+    local_audio: &mut Option<audio_player::AudioPlayback>,
+    start_pts_us: i64,
+) -> io::Result<()> {
+    let audio_ready = presenter_audio
+        .as_ref()
+        .map(|audio| audio.progress.wait_for_prebuffer())
+        .filter(|state| {
+            !state.failed && (state.buffered_us >= AUDIO_PREBUFFER_US || state.finished)
+        });
+    if presenter_audio.is_some() && audio_ready.is_none() {
+        client.verbose(format_args!(
+            "presenter audio did not prebuffer before activation; continuing with video"
+        ));
+        cancel_presenter_audio(client, presenter_audio);
+    }
+    let audio_active = activate_and_play(
+        config,
+        client,
+        surface,
+        video,
+        presenter_audio.as_ref().map(|audio| &audio.track),
+        start_pts_us,
+        audio_ready.map_or(0, |state| state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)),
+    )?;
+    if !audio_active {
+        cancel_presenter_audio(client, presenter_audio);
+    }
+    if let Some(audio) = local_audio.as_ref()
+        && let Err(error) = audio.start()
+    {
+        client.verbose(format_args!(
+            "local audio disabled after output start failed: {error}"
+        ));
+        *local_audio = None;
+    }
+    Ok(())
+}
+
+fn cancel_presenter_audio(client: &mut VividClient, presenter_audio: &mut Option<PresenterAudio>) {
+    let Some(audio) = presenter_audio.take() else {
+        return;
+    };
+    let _ = audio.channel.close();
+    if let Err(error) = client.destroy_track(&audio.track, &RequestMetadata::default()) {
+        client.verbose(format_args!(
+            "could not destroy unusable presenter audio track {}: {error}",
+            audio.track.id()
+        ));
+    }
+    // Dropping a JoinHandle detaches the worker. The channel and track cancellation above wake
+    // ordinary flow waits; detaching also guarantees a transport write that is already inside the
+    // operating system cannot hold video startup hostage.
+    drop(audio.worker);
+}
+
+fn finish_send_while_observing_start<T, F>(
+    sender: thread::JoinHandle<io::Result<T>>,
+    mut observe_start: F,
+) -> io::Result<(io::Result<T>, bool)>
+where
+    T: Send + 'static,
+    F: FnMut() -> io::Result<bool>,
+{
+    let mut started = false;
+    let deadline = Instant::now()
+        .checked_add(PLAYBACK_START_TIMEOUT)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "startup wait is too long"))?;
+    while !sender.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out while a priming video write was blocked",
+            ));
+        }
+        if !started && observe_start()? {
+            started = true;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let result = sender
+        .join()
+        .map_err(|_| io::Error::other("video sender thread panicked"))?;
+    Ok((result, started))
 }
 
 fn take_video_recovery(channel: &TrackChannel) -> io::Result<Option<VideoRecovery>> {
@@ -740,5 +867,40 @@ mod tests {
         let progress = AudioProgress::default();
         progress.finish(true);
         assert!(progress.wait_for_prebuffer().failed);
+    }
+
+    #[test]
+    fn blocked_priming_send_can_be_released_by_control_plane_start() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let sender_gate = gate.clone();
+        let sender = thread::spawn(move || {
+            let (lock, changed) = &*sender_gate;
+            let started = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _started = changed
+                .wait_while(started, |started| !*started)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Ok(7_u64)
+        });
+        let observer_gate = gate.clone();
+        let (result, started) = finish_send_while_observing_start(sender, move || {
+            let (lock, changed) = &*observer_gate;
+            *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            changed.notify_all();
+            Ok(true)
+        })
+        .unwrap();
+        assert!(started);
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[test]
+    fn playback_completion_wait_requests_are_protocol_bounded() {
+        let long_wait = PLAYBACK_COMPLETION_GRACE.saturating_add(Duration::from_secs(90));
+        assert!(timeout_us(long_wait) > MAX_TRACK_WAIT_TIMEOUT_US);
+        assert_eq!(
+            timeout_us(long_wait.min(Duration::from_micros(MAX_TRACK_WAIT_TIMEOUT_US))),
+            MAX_TRACK_WAIT_TIMEOUT_US
+        );
+        assert_eq!(timeout_us(Duration::from_nanos(1)).max(1), 1);
     }
 }
