@@ -261,7 +261,7 @@ pub fn play(
             let dts_us = packet.dts_us;
             let key = packet.key;
             let sender = thread::spawn(move || {
-                channel.send_video(VideoPacket {
+                let sequence = channel.send_video(VideoPacket {
                     epoch,
                     packet_id,
                     pts_us,
@@ -269,7 +269,13 @@ pub fn play(
                     duration_us: 0,
                     key,
                     data: &data,
-                })
+                })?;
+                // Keep pre-roll to one presenter-processed record. In particular, do not fill the
+                // socket with reordered packets after the first decoded output: the presenter is
+                // allowed to hold the next output for PLAY, and the control-plane observer below
+                // must remain able to see OUTPUT_READY and start that clock.
+                channel.wait_for_reusable_media_capacity()?;
+                Ok(sequence)
             });
             let (result, started_while_sending) =
                 finish_send_while_observing_start(sender, || {
