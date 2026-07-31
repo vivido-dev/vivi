@@ -168,15 +168,16 @@ pub fn place_surface(
     node_id: u64,
     columns: u32,
     rows: u32,
-) -> io::Result<()> {
+) -> io::Result<SceneNode> {
     let width = fixed_cells(columns)?;
     let height = fixed_cells(rows)?;
     let trusted_anchor_path = std::env::var_os("TMUX").is_none()
         && std::env::var_os("STY").is_none()
         && client.info().target_descriptor[7].1.as_u64() == Some(3);
     if !trusted_anchor_path {
-        client.place_terminal_surface(surface, node_id, 0, 0, width, height, 1)?;
-        return Ok(());
+        let node = terminal_surface_node(client, surface, node_id, width, height, None);
+        create_node_with_target_retry(client, &node)?;
+        return Ok(node);
     }
 
     let context_id = client.info().root_context_id;
@@ -195,29 +196,75 @@ pub fn place_surface(
         wait_for_anchor(client, context_id, anchor_id)?;
     }
 
-    let node = SceneNode {
+    let node = terminal_surface_node(
+        client,
+        surface,
+        node_id,
+        width,
+        height,
+        Some((context_id, anchor_id)),
+    );
+    create_node_with_target_retry(client, &node)?;
+    Ok(node)
+}
+
+fn terminal_surface_node(
+    client: &VividClient,
+    surface: &Surface,
+    node_id: u64,
+    width: i64,
+    height: i64,
+    anchor: Option<(u64, u64)>,
+) -> SceneNode {
+    let context_id = client.info().root_context_id;
+    let mut geometry = vec![
+        (0, Value::Unsigned(if anchor.is_some() { 2 } else { 1 })),
+        (1, signed(0)),
+        (2, signed(0)),
+        (3, signed(width)),
+        (4, signed(height)),
+        (5, Value::Unsigned(1)),
+    ];
+    if let Some((anchor_context, anchor_id)) = anchor {
+        geometry.push((6, Value::Unsigned(anchor_context)));
+        geometry.push((7, Value::Unsigned(anchor_id)));
+    }
+    SceneNode {
         owning_context_id: context_id,
         node_id,
         surface_context_id: surface.context_id(),
         surface_id: surface.id(),
-        geometry: vec![
-            (0, Value::Unsigned(2)),
-            (1, signed(0)),
-            (2, signed(0)),
-            (3, signed(width)),
-            (4, signed(height)),
-            (5, Value::Unsigned(1)),
-            (6, Value::Unsigned(context_id)),
-            (7, Value::Unsigned(anchor_id)),
-        ],
+        geometry,
         fit: Fit::Contain,
         linear_sampling: true,
         z_index: 0,
         visible: true,
         opacity: u16::MAX,
         clip: None,
-    };
-    create_node_with_target_retry(client, &node)
+    }
+}
+
+pub fn resize_placed_surface(
+    client: &mut VividClient,
+    node: &mut SceneNode,
+    columns: u32,
+    rows: u32,
+) -> io::Result<()> {
+    set_node_cell_size(node, columns, rows)?;
+    update_node_with_target_retry(client, node)
+}
+
+fn set_node_cell_size(node: &mut SceneNode, columns: u32, rows: u32) -> io::Result<()> {
+    let width = fixed_cells(columns)?;
+    let height = fixed_cells(rows)?;
+    for (key, value) in &mut node.geometry {
+        match *key {
+            3 => *value = signed(width),
+            4 => *value = signed(height),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn create_node_with_target_retry(client: &mut VividClient, node: &SceneNode) -> io::Result<()> {
@@ -236,6 +283,28 @@ fn create_node_with_target_retry(client: &mut VividClient, node: &SceneNode) -> 
             }
             client
                 .create_node(node, &RequestMetadata::default())
+                .map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn update_node_with_target_retry(client: &mut VividClient, node: &SceneNode) -> io::Result<()> {
+    match client.update_node(node, &RequestMetadata::default()) {
+        Ok(_) => Ok(()),
+        Err(error) if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) => {
+            let mut applied = false;
+            while let Some(event) = client.take_event()? {
+                if let SessionEvent::TargetChanged(payload) = event {
+                    client.apply_target_changed(&payload)?;
+                    applied = true;
+                }
+            }
+            if !applied {
+                return Err(error);
+            }
+            client
+                .update_node(node, &RequestMetadata::default())
                 .map(|_| ())
         }
         Err(error) => Err(error),
@@ -486,5 +555,34 @@ mod tests {
             TerminalGeometry::from_target_descriptor(&descriptor).unwrap(),
             TerminalGeometry::with_cell_size(90, 30, 10, 20)
         );
+    }
+
+    #[test]
+    fn target_change_replaces_existing_node_cell_extents() {
+        let mut node = SceneNode {
+            owning_context_id: 1,
+            node_id: 2,
+            surface_context_id: 1,
+            surface_id: 3,
+            geometry: vec![
+                (0, Value::Unsigned(1)),
+                (1, signed(0)),
+                (2, signed(0)),
+                (3, signed(40_i64 << 32)),
+                (4, signed(20_i64 << 32)),
+                (5, Value::Unsigned(1)),
+            ],
+            fit: Fit::Contain,
+            linear_sampling: true,
+            z_index: 0,
+            visible: true,
+            opacity: u16::MAX,
+            clip: None,
+        };
+
+        set_node_cell_size(&mut node, 64, 24).unwrap();
+
+        assert_eq!(node.geometry[3].1.as_u64(), Some(64_u64 << 32));
+        assert_eq!(node.geometry[4].1.as_u64(), Some(24_u64 << 32));
     }
 }

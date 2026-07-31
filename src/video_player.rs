@@ -20,7 +20,9 @@ use crate::audio_streamer::audio_track;
 use crate::cli::Config;
 use crate::client::VividClient;
 use crate::ffmpeg::{AudioDemuxer, EncodedMediaPacket, VideoDemuxer, VideoInfo};
-use crate::terminal_geometry::{TerminalGeometry, cells_for_pixels, place_surface, reserve_rows};
+use crate::terminal_geometry::{
+    TerminalGeometry, cells_for_pixels, place_surface, reserve_rows, resize_placed_surface,
+};
 
 const FIT_MARGIN_COLS: u16 = 4;
 const FIT_MARGIN_ROWS: u16 = 2;
@@ -123,7 +125,7 @@ pub fn play(
         ));
     }
     let geometry = TerminalGeometry::settled_presenter(client);
-    let (columns, rows) = display_size(
+    let (mut columns, mut rows) = display_size(
         info.width,
         info.height,
         info.sar_num,
@@ -138,7 +140,7 @@ pub fn play(
         video_surface(context_id, surface_id, path, info.width, info.height),
         &RequestMetadata::default(),
     )?;
-    place_surface(client, &surface, node_id, columns, rows)?;
+    let mut placed_node = place_surface(client, &surface, node_id, columns, rows)?;
     if !config.is_dry_run() {
         reserve_rows(rows)?;
     }
@@ -192,12 +194,28 @@ pub fn play(
     let mut started = false;
     let mut first_pts = None;
     let mut last_pts = None;
+    let mut recovery_rebase_pending = false;
     while let Some(media) = demuxer.next_media_packet()? {
         let EncodedMediaPacket::Video(packet) = media else {
             continue;
         };
+        if let Some(geometry) = take_target_geometry(client, video_track.id())? {
+            let size = display_size(
+                info.width,
+                info.height,
+                info.sar_num,
+                info.sar_den,
+                config.zoom,
+                geometry,
+            );
+            if size != (columns, rows) {
+                resize_placed_surface(client, &mut placed_node, size.0, size.1)?;
+                (columns, rows) = size;
+            }
+        }
         if let Some(recovery) = take_video_recovery(&video_channel)? {
             awaiting_keyframe = true;
+            recovery_rebase_pending = started;
             if recovery.advance_epoch {
                 epoch = epoch
                     .checked_add(1)
@@ -213,6 +231,13 @@ pub fn play(
         }
         if awaiting_keyframe {
             awaiting_keyframe = false;
+        }
+        if recovery_rebase_pending {
+            // A replacement decoder starts at this random-access unit, while linked audio keeps
+            // its original timestamp domain. Publish the new authoritative clock before the
+            // keyframe so a nested presenter cannot hold that frame forever behind PLAY(0).
+            client.play(&video_track, packet.pts_us, 1, MAXIMUM_LATENCY_US)?;
+            recovery_rebase_pending = false;
         }
         packet_id = packet_id
             .checked_add(1)
@@ -281,6 +306,7 @@ pub fn play(
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
             awaiting_keyframe = true;
+            recovery_rebase_pending = started;
             continue;
         }
         last_pts = Some(packet.pts_us);
@@ -739,6 +765,39 @@ fn take_video_recovery(channel: &TrackChannel) -> io::Result<Option<VideoRecover
         }
     }
     Ok(recovery)
+}
+
+fn take_target_geometry(
+    client: &mut VividClient,
+    video_track_id: u64,
+) -> io::Result<Option<TerminalGeometry>> {
+    let mut changed = false;
+    while let Some(event) = client.take_event()? {
+        match event {
+            vivid_sdk::SessionEvent::TargetChanged(payload) => {
+                client.apply_target_changed(&payload)?;
+                changed = true;
+            }
+            vivid_sdk::SessionEvent::TrackLost { object_id, .. } if object_id == video_track_id => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "presenter reported the video track lost",
+                ));
+            }
+            vivid_sdk::SessionEvent::ConnectionClosed { diagnostic } => {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, diagnostic));
+            }
+            _ => {}
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    match TerminalGeometry::from_target_descriptor(&client.info().target_descriptor) {
+        Ok(geometry) => Ok(Some(geometry)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn video_surface(
