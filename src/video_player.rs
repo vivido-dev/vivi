@@ -89,6 +89,56 @@ impl AudioProgress {
     }
 }
 
+/// Latest media PTS linked audio must reach before resuming after video recovery.
+///
+/// The video and audio demuxers intentionally run on independent threads. A replacement decoder
+/// can skip undecodable video interframes in memory, but without this handoff the audio worker
+/// still submits every sample covering that skipped interval. Its normal rate limiter then turns
+/// a multi-second GOP into a multi-second blank surface while the outer presenter waits to
+/// activate both tracks. Coalescing to the greatest requested PTS keeps repeated recovery
+/// requests monotonic and lets the audio demuxer discard that interval locally instead.
+#[derive(Default)]
+struct AudioRecoveryTarget {
+    pts_us: Mutex<Option<i64>>,
+}
+
+impl AudioRecoveryTarget {
+    fn request(&self, pts_us: i64) {
+        if pts_us == i64::MIN {
+            return;
+        }
+        let mut target = self
+            .pts_us
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *target = Some(target.map_or(pts_us, |current| current.max(pts_us)));
+    }
+
+    fn take(&self) -> Option<i64> {
+        self.pts_us
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+fn merge_recovery_target(target: &mut Option<i64>, requested: Option<i64>) {
+    if let Some(requested) = requested {
+        *target = Some(target.map_or(requested, |current| current.max(requested)));
+    }
+}
+
+fn audio_packet_reaches_recovery_target(target: &mut Option<i64>, pts_us: i64) -> bool {
+    match *target {
+        Some(target_pts) if pts_us == i64::MIN || pts_us < target_pts => false,
+        Some(_) => {
+            *target = None;
+            true
+        }
+        None => true,
+    }
+}
+
 struct AudioOutcome {
     channel: Arc<TrackChannel>,
     packet_id: u64,
@@ -159,7 +209,14 @@ pub fn play(
     let mut video_channel = Arc::new(client.open_track_channel(&video_track)?);
 
     let remote = std::env::var_os("VIVID_REMOTE").is_some();
-    let mut presenter_audio = create_presenter_audio(client, &surface, path, info.audio.as_ref())?;
+    let audio_recovery = Arc::new(AudioRecoveryTarget::default());
+    let mut presenter_audio = create_presenter_audio(
+        client,
+        &surface,
+        path,
+        info.audio.as_ref(),
+        audio_recovery.clone(),
+    )?;
     let mut local_audio: Option<audio_player::AudioPlayback> = if info.has_audio
         && presenter_audio.is_none()
         && !config.no_wait
@@ -234,8 +291,10 @@ pub fn play(
         }
         if recovery_rebase_pending {
             // A replacement decoder starts at this random-access unit, while linked audio keeps
-            // its original timestamp domain. Publish the new authoritative clock before the
-            // keyframe so a nested presenter cannot hold that frame forever behind PLAY(0).
+            // its original timestamp domain. Fast-forward that audio worker to the same point and
+            // publish the new authoritative clock before the keyframe, so a nested presenter does
+            // not wait in real time for skipped audio or hold the frame forever behind PLAY(0).
+            audio_recovery.request(packet.pts_us);
             client.play(&video_track, packet.pts_us, 1, MAXIMUM_LATENCY_US)?;
             recovery_rebase_pending = false;
         }
@@ -477,6 +536,7 @@ fn create_presenter_audio(
     surface: &vivid_sdk::Surface,
     path: &Path,
     info: Option<&crate::ffmpeg::AudioInfo>,
+    recovery: Arc<AudioRecoveryTarget>,
 ) -> io::Result<Option<PresenterAudio>> {
     let Some(info) = info else {
         return Ok(None);
@@ -506,7 +566,7 @@ fn create_presenter_audio(
     let worker_channel = channel.clone();
     let path = path.to_path_buf();
     let worker = thread::spawn(move || {
-        let result = stream_audio(&path, &worker_channel, &worker_progress);
+        let result = stream_audio(&path, &worker_channel, &worker_progress, &recovery);
         worker_progress.finish(result.is_err());
         match result {
             Ok(packet_id) => AudioOutcome {
@@ -529,10 +589,20 @@ fn create_presenter_audio(
     }))
 }
 
-fn stream_audio(path: &Path, channel: &TrackChannel, progress: &AudioProgress) -> io::Result<u64> {
+fn stream_audio(
+    path: &Path,
+    channel: &TrackChannel,
+    progress: &AudioProgress,
+    recovery: &AudioRecoveryTarget,
+) -> io::Result<u64> {
     let mut demuxer = AudioDemuxer::open(path)?;
     let mut packet_id = 0_u64;
+    let mut recovery_target = None;
     while let Some(packet) = demuxer.next_packet()? {
+        merge_recovery_target(&mut recovery_target, recovery.take());
+        if !audio_packet_reaches_recovery_target(&mut recovery_target, packet.pts_us) {
+            continue;
+        }
         if packet.data.is_empty() {
             continue;
         }
@@ -919,6 +989,26 @@ fn timeout_us(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_audio_recovery_coalesces_and_skips_directly_to_the_video_pts() {
+        let recovery = AudioRecoveryTarget::default();
+        recovery.request(8_000_000);
+        recovery.request(7_000_000);
+        recovery.request(8_400_000);
+
+        let mut target = None;
+        merge_recovery_target(&mut target, recovery.take());
+        assert_eq!(target, Some(8_400_000));
+        assert!(!audio_packet_reaches_recovery_target(&mut target, i64::MIN));
+        assert!(!audio_packet_reaches_recovery_target(
+            &mut target,
+            8_399_999
+        ));
+        assert!(audio_packet_reaches_recovery_target(&mut target, 8_400_000));
+        assert_eq!(target, None);
+        assert!(audio_packet_reaches_recovery_target(&mut target, 8_420_000));
+    }
 
     #[test]
     fn display_size_accounts_for_sample_aspect_ratio() {
