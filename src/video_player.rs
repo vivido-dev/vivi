@@ -158,6 +158,21 @@ struct VideoRecovery {
     advance_epoch: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryControl {
+    Pause,
+    Flush,
+}
+
+fn recovery_control_order(started: bool) -> impl Iterator<Item = RecoveryControl> {
+    [
+        started.then_some(RecoveryControl::Pause),
+        Some(RecoveryControl::Flush),
+    ]
+    .into_iter()
+    .flatten()
+}
+
 pub fn play(
     config: &Config,
     client: &mut VividClient,
@@ -278,7 +293,16 @@ pub fn play(
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("video epoch exhausted"))?
                     .max(recovery.minimum_epoch);
-                client.flush(&video_track, epoch)?;
+                // Freeze the linked playback group explicitly before replacing decoder state.
+                // FLUSH also leaves it paused, but keeping PAUSE as its own ordered request makes
+                // recovery observable and prevents either clock from advancing between the
+                // recovery decision and the new epoch.
+                for control in recovery_control_order(started) {
+                    match control {
+                        RecoveryControl::Pause => client.pause(&video_track)?,
+                        RecoveryControl::Flush => client.flush(&video_track, epoch)?,
+                    }
+                }
             } else {
                 epoch = epoch.max(recovery.minimum_epoch);
             }
@@ -1008,6 +1032,18 @@ mod tests {
         assert!(audio_packet_reaches_recovery_target(&mut target, 8_400_000));
         assert_eq!(target, None);
         assert!(audio_packet_reaches_recovery_target(&mut target, 8_420_000));
+    }
+
+    #[test]
+    fn decoder_recovery_pauses_before_flush_once_playback_started() {
+        assert_eq!(
+            recovery_control_order(true).collect::<Vec<_>>(),
+            vec![RecoveryControl::Pause, RecoveryControl::Flush]
+        );
+        assert_eq!(
+            recovery_control_order(false).collect::<Vec<_>>(),
+            vec![RecoveryControl::Flush]
+        );
     }
 
     #[test]
