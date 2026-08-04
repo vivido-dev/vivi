@@ -2,8 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "build/windows.rs"]
+mod windows;
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build/windows.rs");
     println!("cargo:rustc-check-cfg=cfg(ffmpeg_old_channel_layout)");
     println!("cargo:rustc-check-cfg=cfg(ffmpeg_codecpar_has_framerate)");
 
@@ -63,7 +67,10 @@ fn main() {
         return;
     }
 
-    if emit_pkg_config_libs(audio_output) {
+    if let Some(link_paths) = emit_pkg_config_libs(audio_output) {
+        if windows {
+            windows::stage_pkg_config_ffmpeg_runtime(&link_paths);
+        }
         return;
     }
 
@@ -107,6 +114,11 @@ fn link_vcpkg_ffmpeg(audio_output: bool) {
     for library in libraries {
         println!("cargo:rustc-link-lib=dylib={library}");
     }
+    let runtime_directory = library_directory
+        .parent()
+        .expect("vcpkg library directory has no installed triplet parent")
+        .join("bin");
+    windows::stage_ffmpeg_runtime(&runtime_directory);
 }
 
 fn vcpkg_layout() -> Option<(PathBuf, PathBuf)> {
@@ -140,7 +152,7 @@ fn header_major(path: &Path, name: &str) -> Option<u32> {
     })
 }
 
-fn emit_pkg_config_libs(audio_output: bool) -> bool {
+fn emit_pkg_config_libs(audio_output: bool) -> Option<Vec<PathBuf>> {
     let mut libraries = vec!["--libs", "libavformat", "libavcodec", "libavutil"];
     if audio_output {
         libraries.push("libswresample");
@@ -148,18 +160,20 @@ fn emit_pkg_config_libs(audio_output: bool) -> bool {
     let output = Command::new("pkg-config").args(libraries).output();
     let output = match output {
         Ok(output) if output.status.success() => output,
-        _ => return false,
+        _ => return None,
     };
 
+    let mut link_paths = Vec::new();
     for argument in String::from_utf8_lossy(&output.stdout).split_whitespace() {
         if let Some(path) = argument.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={path}");
+            link_paths.push(PathBuf::from(path));
         } else if let Some(name) = argument.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={name}");
         }
     }
 
-    true
+    Some(link_paths)
 }
 
 fn pkg_config_major(library: &str) -> Option<u32> {

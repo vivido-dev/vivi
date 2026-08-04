@@ -56,8 +56,9 @@ sudo apt install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswre
 brew install ffmpeg pkg-config
 ```
 
-On Windows, use the MSVC Rust toolchain and an FFmpeg vcpkg triplet. Keep the triplet's `bin`
-directory on `PATH` at runtime.
+On Windows, use the MSVC Rust toolchain and an FFmpeg vcpkg triplet. The build stages the required
+FFmpeg DLLs beside Cargo's `vivi.exe`, so a successful build runs without a developer-specific
+`PATH`.
 
 ## Usage
 
