@@ -4,6 +4,7 @@ mod cli;
 mod client;
 mod ffmpeg;
 mod image_viewer;
+mod playback_ui;
 mod terminal_geometry;
 mod video_player;
 
@@ -105,7 +106,7 @@ fn play_audio(
         )
         .into());
     }
-    audio_player::play(path)?;
+    audio_player::play(config, path)?;
     Ok(())
 }
 

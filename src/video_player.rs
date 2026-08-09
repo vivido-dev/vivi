@@ -20,8 +20,10 @@ use crate::audio_streamer::audio_track;
 use crate::cli::Config;
 use crate::client::VividClient;
 use crate::ffmpeg::{AudioDemuxer, EncodedMediaPacket, VideoDemuxer, VideoInfo};
+use crate::playback_ui::{Command, PlaybackUi};
 use crate::terminal_geometry::{
-    TerminalGeometry, cells_for_pixels, place_surface, reserve_rows, resize_placed_surface,
+    TerminalGeometry, cells_for_pixels, place_full_window_surface, place_surface, reserve_rows,
+    resize_placed_surface, update_full_window_surface,
 };
 
 const FIT_MARGIN_COLS: u16 = 4;
@@ -179,6 +181,13 @@ pub fn play(
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = VideoDemuxer::inspect(path)?;
+    let ui = PlaybackUi::enter(
+        config,
+        path,
+        info.duration_us,
+        info.has_audio && client.supports(vivid_protocol::registry::AUDIO_GAIN),
+        false,
+    )?;
     if info.colorimetry_inferred {
         client.verbose(format_args!(
             "video {}: inferred colorimetry as primaries={}, transfer={}, matrix={}, range={}",
@@ -190,13 +199,14 @@ pub fn play(
         ));
     }
     let geometry = TerminalGeometry::settled_presenter(client);
+    let layout_geometry = media_geometry(geometry, ui.is_some());
     let (mut columns, mut rows) = display_size(
         info.width,
         info.height,
         info.sar_num,
         info.sar_den,
         config.zoom,
-        geometry,
+        layout_geometry,
     );
     let surface_id = client.allocate_id()?;
     let node_id = client.allocate_id()?;
@@ -205,8 +215,13 @@ pub fn play(
         video_surface(context_id, surface_id, path, info.width, info.height),
         &RequestMetadata::default(),
     )?;
-    let mut placed_node = place_surface(client, &surface, node_id, columns, rows)?;
-    if !config.is_dry_run() {
+    let (mut column, mut row) = centered_origin(layout_geometry, columns, rows);
+    let mut placed_node = if ui.is_some() {
+        place_full_window_surface(client, &surface, node_id, column, row, columns, rows)?
+    } else {
+        place_surface(client, &surface, node_id, columns, rows)?
+    };
+    if !config.is_dry_run() && ui.is_none() {
         reserve_rows(rows)?;
     }
 
@@ -231,6 +246,7 @@ pub fn play(
         path,
         info.audio.as_ref(),
         audio_recovery.clone(),
+        None,
     )?;
     let mut local_audio: Option<audio_player::AudioPlayback> = if info.has_audio
         && presenter_audio.is_none()
@@ -267,154 +283,342 @@ pub fn play(
     let mut first_pts = None;
     let mut last_pts = None;
     let mut recovery_rebase_pending = false;
-    while let Some(media) = demuxer.next_media_packet()? {
-        let EncodedMediaPacket::Video(packet) = media else {
-            continue;
-        };
-        if let Some(geometry) = take_target_geometry(client, video_track.id())? {
-            let size = display_size(
-                info.width,
-                info.height,
-                info.sar_num,
-                info.sar_den,
-                config.zoom,
-                geometry,
-            );
-            if size != (columns, rows) {
-                resize_placed_surface(client, &mut placed_node, size.0, size.1)?;
-                (columns, rows) = size;
+    let timeline_origin_us = info.first_pts_us.unwrap_or(0);
+    let mut playback_base_us = 0_u64;
+    let mut playback_started_at: Option<Instant> = None;
+    let mut play_start_override = None;
+    let mut volume_percent = 100_u32;
+    'playback: loop {
+        let packets_before_generation = packet_id;
+        while let Some(media) = demuxer.next_media_packet()? {
+            let EncodedMediaPacket::Video(packet) = media else {
+                continue;
+            };
+            if let Some(geometry) = take_target_geometry(client, video_track.id())? {
+                let layout_geometry = media_geometry(geometry, ui.is_some());
+                let size = display_size(
+                    info.width,
+                    info.height,
+                    info.sar_num,
+                    info.sar_den,
+                    config.zoom,
+                    layout_geometry,
+                );
+                if size != (columns, rows) {
+                    if ui.is_some() {
+                        (column, row) = centered_origin(layout_geometry, size.0, size.1);
+                        update_full_window_surface(
+                            client,
+                            &mut placed_node,
+                            column,
+                            row,
+                            size.0,
+                            size.1,
+                        )?;
+                    } else {
+                        resize_placed_surface(client, &mut placed_node, size.0, size.1)?;
+                    }
+                    (columns, rows) = size;
+                }
             }
-        }
-        if let Some(recovery) = take_video_recovery(&video_channel)? {
-            awaiting_keyframe = true;
-            recovery_rebase_pending = started;
-            if recovery.advance_epoch {
-                epoch = epoch
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("video epoch exhausted"))?
-                    .max(recovery.minimum_epoch);
-                // Freeze the linked playback group explicitly before replacing decoder state.
-                // FLUSH also leaves it paused, but keeping PAUSE as its own ordered request makes
-                // recovery observable and prevents either clock from advancing between the
-                // recovery decision and the new epoch.
-                for control in recovery_control_order(started) {
-                    match control {
-                        RecoveryControl::Pause => client.pause(&video_track)?,
-                        RecoveryControl::Flush => client.flush(&video_track, epoch)?,
+            if let Some(ui) = ui.as_ref() {
+                let current_us = playback_base_us.saturating_add(
+                    playback_started_at
+                        .map(|started| {
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+                        })
+                        .unwrap_or(0),
+                );
+                ui.set_position_us(current_us.min(info.duration_us.unwrap_or(u64::MAX)));
+                let mut seek_target = None;
+                while let Some(command) = ui.try_command() {
+                    match command {
+                        Command::Quit => {
+                            let _ = video_channel.close();
+                            cancel_presenter_audio(client, &mut presenter_audio);
+                            cleanup_full_window(
+                                client,
+                                &surface,
+                                &video_track,
+                                placed_node.node_id,
+                            );
+                            return Ok(());
+                        }
+                        Command::Resize(geometry) => {
+                            let layout_geometry = media_geometry(geometry, true);
+                            let size = display_size(
+                                info.width,
+                                info.height,
+                                info.sar_num,
+                                info.sar_den,
+                                config.zoom,
+                                layout_geometry,
+                            );
+                            (column, row) = centered_origin(layout_geometry, size.0, size.1);
+                            update_full_window_surface(
+                                client,
+                                &mut placed_node,
+                                column,
+                                row,
+                                size.0,
+                                size.1,
+                            )?;
+                            (columns, rows) = size;
+                            ui.redraw()?;
+                        }
+                        Command::VolumeBy(delta) => {
+                            let next = (volume_percent as i32 + delta).clamp(0, 200) as u32;
+                            if let Some(audio) = presenter_audio.as_ref()
+                                && client.supports(vivid_protocol::registry::AUDIO_GAIN)
+                            {
+                                client.set_audio_gain(
+                                    &audio.track,
+                                    vivid_sdk::AudioGain::from_percent(next)
+                                        .expect("clamped volume is valid"),
+                                )?;
+                                volume_percent = next;
+                                ui.set_volume_percent(Some(next));
+                                ui.set_message(format!("Volume {next}%"));
+                            } else if let Some(audio) = local_audio.as_ref() {
+                                audio.set_volume_percent(next);
+                                volume_percent = next;
+                                ui.set_volume_percent(Some(next));
+                                ui.set_message(format!("Volume {next}%"));
+                            } else {
+                                ui.set_volume_percent(None);
+                                ui.set_message("Volume unavailable");
+                            }
+                            ui.redraw()?;
+                        }
+                        Command::SeekBy(delta) => {
+                            seek_target = Some(if delta < 0 {
+                                current_us.saturating_sub(delta.unsigned_abs())
+                            } else {
+                                current_us.saturating_add(delta as u64)
+                            });
+                        }
+                        Command::SeekTo(target) => seek_target = Some(target),
                     }
                 }
-            } else {
-                epoch = epoch.max(recovery.minimum_epoch);
-            }
-        }
-        if packet.data.is_empty() || (awaiting_keyframe && !packet.key) {
-            continue;
-        }
-        if awaiting_keyframe {
-            awaiting_keyframe = false;
-        }
-        if recovery_rebase_pending {
-            // A replacement decoder starts at this random-access unit, while linked audio keeps
-            // its original timestamp domain. Fast-forward that audio worker to the same point and
-            // publish the new authoritative clock before the keyframe, so a nested presenter does
-            // not wait in real time for skipped audio or hold the frame forever behind PLAY(0).
-            audio_recovery.request(packet.pts_us);
-            client.play(&video_track, packet.pts_us, 1, MAXIMUM_LATENCY_US)?;
-            recovery_rebase_pending = false;
-        }
-        packet_id = packet_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("video packet ID space exhausted"))?;
-        let first_pts_before_send = first_pts;
-        first_pts.get_or_insert(packet.pts_us);
-        let send_result = if started {
-            video_channel.send_video(VideoPacket {
-                epoch,
-                packet_id,
-                pts_us: packet.pts_us,
-                dts_us: packet.dts_us,
-                duration_us: 0,
-                key: packet.key,
-                data: &packet.data,
-            })
-        } else {
-            let channel = video_channel.clone();
-            let data = packet.data.clone();
-            let pts_us = packet.pts_us;
-            let dts_us = packet.dts_us;
-            let key = packet.key;
-            let sender = thread::spawn(move || {
-                let sequence = channel.send_video(VideoPacket {
-                    epoch,
-                    packet_id,
-                    pts_us,
-                    dts_us,
-                    duration_us: 0,
-                    key,
-                    data: &data,
-                })?;
-                // Keep pre-roll to one presenter-processed record. In particular, do not fill the
-                // socket with reordered packets after the first decoded output: the presenter is
-                // allowed to hold the next output for PLAY, and the control-plane observer below
-                // must remain able to see OUTPUT_READY and start that clock.
-                channel.wait_for_reusable_media_capacity()?;
-                Ok(sequence)
-            });
-            let (result, started_while_sending) =
-                finish_send_while_observing_start(sender, || {
-                    let output_ready =
-                        client.query_track(&video_track)?.milestones & MILESTONE_OUTPUT_READY != 0;
-                    if output_ready {
-                        start_video_playback(
-                            config,
-                            client,
-                            &surface,
-                            &video_track,
-                            &mut presenter_audio,
-                            &mut local_audio,
-                            first_pts.unwrap_or(pts_us),
+                if let Some(target) = seek_target {
+                    let target = target.min(info.duration_us.unwrap_or(u64::MAX));
+                    let target_pts = timeline_origin_us
+                        .saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
+                    video_channel.close()?;
+                    if started {
+                        client.pause(&video_track)?;
+                    }
+                    epoch = epoch
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
+                    client.flush(&video_track, epoch)?;
+                    client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
+                    video_channel = Arc::new(client.open_track_channel(&video_track)?);
+                    demuxer.seek_to_us(target_pts)?;
+                    if presenter_audio.is_some() {
+                        // Retire the slot while the old track is still live. Destroying an active
+                        // track also vacates its slot, but that presenter-side revision change is
+                        // not reflected in the SDK surface handle and makes the replacement
+                        // activation look stale.
+                        clear_audio_slot(client, &surface)?;
+                    }
+                    if let Some(audio) = presenter_audio.take() {
+                        let old_track = audio.track.clone();
+                        let _ = audio.channel.close();
+                        drop(audio.worker);
+                        let _ = client.destroy_track(&old_track, &RequestMetadata::default());
+                    }
+                    let _ = audio_recovery.take();
+                    presenter_audio = create_presenter_audio(
+                        client,
+                        &surface,
+                        path,
+                        info.audio.as_ref(),
+                        audio_recovery.clone(),
+                        Some(target_pts),
+                    )?;
+                    if let Some(audio) = presenter_audio.as_ref()
+                        && client.supports(vivid_protocol::registry::AUDIO_GAIN)
+                    {
+                        client.set_audio_gain(
+                            &audio.track,
+                            vivid_sdk::AudioGain::from_percent(volume_percent)
+                                .expect("clamped volume is valid"),
                         )?;
                     }
-                    Ok(output_ready)
-                })?;
-            started = started_while_sending;
-            result
-        };
-        if let Err(error) = send_result {
-            if first_pts_before_send.is_none() && !started {
-                first_pts = None;
+                    local_audio = None;
+                    awaiting_keyframe = true;
+                    recovery_rebase_pending = false;
+                    started = false;
+                    first_pts = None;
+                    last_pts = None;
+                    play_start_override = Some(target_pts);
+                    playback_base_us = target;
+                    playback_started_at = None;
+                    ui.set_position_us(target);
+                    ui.set_message(format!("Seek {}", target / 1_000_000));
+                    ui.redraw()?;
+                    continue;
+                }
             }
-            client.verbose(format_args!(
-                "video track {} channel failed: {error}; advancing generation",
-                video_track.id()
-            ));
-            client.query_track(&video_track)?;
-            client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
-            video_channel = Arc::new(client.open_track_channel(&video_track)?);
-            epoch = epoch
+            if let Some(recovery) = take_video_recovery(&video_channel)? {
+                awaiting_keyframe = true;
+                recovery_rebase_pending = started;
+                if recovery.advance_epoch {
+                    epoch = epoch
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("video epoch exhausted"))?
+                        .max(recovery.minimum_epoch);
+                    // Freeze the linked playback group explicitly before replacing decoder state.
+                    // FLUSH also leaves it paused, but keeping PAUSE as its own ordered request makes
+                    // recovery observable and prevents either clock from advancing between the
+                    // recovery decision and the new epoch.
+                    for control in recovery_control_order(started) {
+                        match control {
+                            RecoveryControl::Pause => client.pause(&video_track)?,
+                            RecoveryControl::Flush => client.flush(&video_track, epoch)?,
+                        }
+                    }
+                } else {
+                    epoch = epoch.max(recovery.minimum_epoch);
+                }
+            }
+            if packet.data.is_empty() || (awaiting_keyframe && !packet.key) {
+                continue;
+            }
+            if awaiting_keyframe {
+                awaiting_keyframe = false;
+            }
+            if recovery_rebase_pending {
+                // A replacement decoder starts at this random-access unit, while linked audio keeps
+                // its original timestamp domain. Fast-forward that audio worker to the same point and
+                // publish the new authoritative clock before the keyframe, so a nested presenter does
+                // not wait in real time for skipped audio or hold the frame forever behind PLAY(0).
+                audio_recovery.request(packet.pts_us);
+                client.play(&video_track, packet.pts_us, 1, MAXIMUM_LATENCY_US)?;
+                recovery_rebase_pending = false;
+            }
+            packet_id = packet_id
                 .checked_add(1)
-                .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
-            awaiting_keyframe = true;
-            recovery_rebase_pending = started;
-            continue;
-        }
-        last_pts = Some(packet.pts_us);
+                .ok_or_else(|| io::Error::other("video packet ID space exhausted"))?;
+            let first_pts_before_send = first_pts;
+            first_pts.get_or_insert(packet.pts_us);
+            let send_result = if started {
+                video_channel.send_video(VideoPacket {
+                    epoch,
+                    packet_id,
+                    pts_us: packet.pts_us,
+                    dts_us: packet.dts_us,
+                    duration_us: packet.duration_us,
+                    key: packet.key,
+                    data: &packet.data,
+                })
+            } else {
+                let channel = video_channel.clone();
+                let data = packet.data.clone();
+                let pts_us = packet.pts_us;
+                let dts_us = packet.dts_us;
+                let key = packet.key;
+                let duration_us = packet.duration_us;
+                let sender = thread::spawn(move || {
+                    let sequence = channel.send_video(VideoPacket {
+                        epoch,
+                        packet_id,
+                        pts_us,
+                        dts_us,
+                        duration_us,
+                        key,
+                        data: &data,
+                    })?;
+                    // Keep pre-roll to one presenter-processed record. In particular, do not fill the
+                    // socket with reordered packets after the first decoded output: the presenter is
+                    // allowed to hold the next output for PLAY, and the control-plane observer below
+                    // must remain able to see OUTPUT_READY and start that clock.
+                    channel.wait_for_reusable_media_capacity()?;
+                    Ok(sequence)
+                });
+                let (result, started_while_sending) =
+                    finish_send_while_observing_start(sender, || {
+                        let output_ready = client.query_track(&video_track)?.milestones
+                            & MILESTONE_OUTPUT_READY
+                            != 0;
+                        if output_ready {
+                            start_video_playback(
+                                config,
+                                client,
+                                &surface,
+                                &video_track,
+                                &mut presenter_audio,
+                                &mut local_audio,
+                                play_start_override.unwrap_or_else(|| first_pts.unwrap_or(pts_us)),
+                            )?;
+                        }
+                        Ok(output_ready)
+                    })?;
+                started = started_while_sending;
+                if started {
+                    playback_started_at.get_or_insert_with(Instant::now);
+                }
+                result
+            };
+            if let Err(error) = send_result {
+                if first_pts_before_send.is_none() && !started {
+                    first_pts = None;
+                }
+                client.verbose(format_args!(
+                    "video track {} channel failed: {error}; advancing generation",
+                    video_track.id()
+                ));
+                client.query_track(&video_track)?;
+                client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
+                video_channel = Arc::new(client.open_track_channel(&video_track)?);
+                epoch = epoch
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
+                awaiting_keyframe = true;
+                recovery_rebase_pending = started;
+                continue;
+            }
+            last_pts = Some(packet.pts_us);
 
-        if started
-            && presenter_audio
-                .as_ref()
-                .is_some_and(|audio| audio.progress.snapshot().failed)
-        {
-            let failed = presenter_audio.take().expect("failed audio track exists");
-            let _ = failed.worker.join();
-            if let Err(error) = clear_audio_slot(client, &surface) {
-                client.verbose(format_args!("could not clear failed audio slot: {error}"));
+            if started
+                && presenter_audio
+                    .as_ref()
+                    .is_some_and(|audio| audio.progress.snapshot().failed)
+            {
+                let failed = presenter_audio.take().expect("failed audio track exists");
+                let _ = failed.worker.join();
+                if let Err(error) = clear_audio_slot(client, &surface) {
+                    client.verbose(format_args!("could not clear failed audio slot: {error}"));
+                }
+            }
+
+            let output_ready = !started
+                && client.query_track(&video_track)?.milestones & MILESTONE_OUTPUT_READY != 0;
+            if output_ready {
+                start_video_playback(
+                    config,
+                    client,
+                    &surface,
+                    &video_track,
+                    &mut presenter_audio,
+                    &mut local_audio,
+                    play_start_override.unwrap_or_else(|| first_pts.unwrap_or(packet.pts_us)),
+                )?;
+                started = true;
+                playback_started_at.get_or_insert_with(Instant::now);
             }
         }
-
-        let output_ready =
-            !started && client.query_track(&video_track)?.milestones & MILESTONE_OUTPUT_READY != 0;
-        if output_ready {
+        if packet_id == 0 {
+            return Err(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "video has no keyframes").into(),
+            );
+        }
+        if packet_id == packets_before_generation && play_start_override.is_some() {
+            cancel_presenter_audio(client, &mut presenter_audio);
+            break 'playback;
+        }
+        if !started {
             start_video_playback(
                 config,
                 client,
@@ -422,94 +626,251 @@ pub fn play(
                 &video_track,
                 &mut presenter_audio,
                 &mut local_audio,
-                first_pts.unwrap_or(packet.pts_us),
+                play_start_override.unwrap_or_else(|| first_pts.unwrap_or(0)),
             )?;
-            started = true;
+            playback_started_at.get_or_insert_with(Instant::now);
         }
-    }
-    if packet_id == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "video has no keyframes").into());
-    }
-    if !started {
-        start_video_playback(
-            config,
-            client,
-            &surface,
-            &video_track,
-            &mut presenter_audio,
-            &mut local_audio,
-            first_pts.unwrap_or(0),
-        )?;
-    }
 
-    let mut audio_to_drain = None;
-    let mut presenter_audio_failed = false;
-    if let Some(audio) = presenter_audio.take() {
-        match audio.worker.join() {
-            Ok(outcome) if outcome.error.is_none() => {
-                outcome.channel.eos()?;
-                audio_to_drain = Some(audio.track);
-                client.verbose(format_args!(
-                    "audio track completed after {} packets",
-                    outcome.packet_id
-                ));
-            }
-            Ok(outcome) => {
-                presenter_audio_failed = true;
-                client.verbose(format_args!(
-                    "audio track stopped after {} packets: {}",
-                    outcome.packet_id,
-                    outcome
-                        .error
-                        .map_or_else(|| "channel stopped".into(), |error| error.to_string())
-                ));
-            }
-            Err(_) => {
-                presenter_audio_failed = true;
-                client.verbose(format_args!("audio track worker panicked"));
+        let mut audio_to_drain = None;
+        let mut presenter_audio_failed = false;
+        if let Some(audio) = presenter_audio.take() {
+            match audio.worker.join() {
+                Ok(outcome) if outcome.error.is_none() => {
+                    outcome.channel.eos()?;
+                    audio_to_drain = Some(audio.track);
+                    client.verbose(format_args!(
+                        "audio track completed after {} packets",
+                        outcome.packet_id
+                    ));
+                }
+                Ok(outcome) => {
+                    presenter_audio_failed = true;
+                    client.verbose(format_args!(
+                        "audio track stopped after {} packets: {}",
+                        outcome.packet_id,
+                        outcome
+                            .error
+                            .map_or_else(|| "channel stopped".into(), |error| error.to_string())
+                    ));
+                }
+                Err(_) => {
+                    presenter_audio_failed = true;
+                    client.verbose(format_args!("audio track worker panicked"));
+                }
             }
         }
-    }
-    if presenter_audio_failed && let Err(error) = clear_audio_slot(client, &surface) {
-        client.verbose(format_args!("could not clear failed audio slot: {error}"));
-    }
-    video_channel.eos()?;
-    if let Some(audio_track) = audio_to_drain.as_ref()
-        && let Err(error) = client.drain(audio_track)
-    {
-        client.verbose(format_args!("presenter audio drain failed: {error}"));
-    }
-    if !config.no_wait {
+        if presenter_audio_failed && let Err(error) = clear_audio_slot(client, &surface) {
+            client.verbose(format_args!("could not clear failed audio slot: {error}"));
+        }
+        video_channel.eos()?;
+        if ui.is_none()
+            && let Some(audio_track) = audio_to_drain.as_ref()
+            && let Err(error) = client.drain(audio_track)
+        {
+            client.verbose(format_args!("presenter audio drain failed: {error}"));
+        }
+        if config.no_wait {
+            break 'playback;
+        }
         let timeline = last_pts
             .zip(first_pts)
             .map_or(0, |(last, first)| last.saturating_sub(first).max(0) as u64);
         let timeout = Duration::from_micros(timeline).saturating_add(PLAYBACK_COMPLETION_GRACE);
-        wait_for_playback_end(client, &video_track, timeout)?;
-        if let Some(audio) = local_audio.as_mut()
-            && let Err(error) = audio.wait()
-        {
-            client.verbose(format_args!(
-                "local audio completion failed for {}: {error}",
-                path.display()
-            ));
+        let outcome = wait_for_playback_end(
+            client,
+            &video_track,
+            audio_to_drain.as_ref(),
+            ui.as_ref(),
+            &mut volume_percent,
+            playback_base_us,
+            playback_started_at,
+            info.duration_us,
+            &info,
+            config.zoom,
+            &mut placed_node,
+            &mut column,
+            &mut row,
+            &mut columns,
+            &mut rows,
+            timeout,
+        )?;
+        match outcome {
+            WaitOutcome::Ended => {
+                if let Some(audio_track) = audio_to_drain.as_ref()
+                    && ui.is_some()
+                    && let Err(error) = client.drain(audio_track)
+                {
+                    client.verbose(format_args!("presenter audio drain failed: {error}"));
+                }
+                if let Some(audio) = local_audio.as_mut()
+                    && let Err(error) = audio.wait()
+                {
+                    client.verbose(format_args!(
+                        "local audio completion failed for {}: {error}",
+                        path.display()
+                    ));
+                }
+                break 'playback;
+            }
+            WaitOutcome::Quit => {
+                break 'playback;
+            }
+            WaitOutcome::Seek(target) => {
+                if let Some(audio_track) = audio_to_drain.as_ref() {
+                    // Keep the producer's surface revision synchronized before removing the
+                    // currently bound track. This is also required when seeking from the
+                    // buffered-completion wait after demuxer EOS.
+                    clear_audio_slot(client, &surface)?;
+                    let _ = client.destroy_track(audio_track, &RequestMetadata::default());
+                }
+                let target = target.min(info.duration_us.unwrap_or(u64::MAX));
+                let target_pts =
+                    timeline_origin_us.saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
+                epoch = epoch
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
+                client.pause(&video_track)?;
+                client.flush(&video_track, epoch)?;
+                client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
+                video_channel = Arc::new(client.open_track_channel(&video_track)?);
+                demuxer.seek_to_us(target_pts)?;
+                let _ = audio_recovery.take();
+                presenter_audio = create_presenter_audio(
+                    client,
+                    &surface,
+                    path,
+                    info.audio.as_ref(),
+                    audio_recovery.clone(),
+                    Some(target_pts),
+                )?;
+                if let Some(audio) = presenter_audio.as_ref()
+                    && client.supports(vivid_protocol::registry::AUDIO_GAIN)
+                {
+                    client.set_audio_gain(
+                        &audio.track,
+                        vivid_sdk::AudioGain::from_percent(volume_percent)
+                            .expect("clamped volume is valid"),
+                    )?;
+                }
+                local_audio = None;
+                awaiting_keyframe = true;
+                recovery_rebase_pending = false;
+                started = false;
+                first_pts = None;
+                last_pts = None;
+                play_start_override = Some(target_pts);
+                playback_base_us = target;
+                playback_started_at = None;
+                if let Some(ui) = ui.as_ref() {
+                    ui.set_position_us(target);
+                    ui.set_message(format!("Seek {}", target / 1_000_000));
+                    ui.redraw()?;
+                }
+                continue 'playback;
+            }
         }
     }
     client.verbose(format_args!(
         "video surface {surface_id}, track {}: {packet_id} packets presented at {columns}x{rows} cells",
         video_track.id()
     ));
+    if ui.is_some() {
+        cleanup_full_window(client, &surface, &video_track, placed_node.node_id);
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_for_playback_end(
-    client: &VividClient,
+    client: &mut VividClient,
     track: &Track,
+    audio: Option<&Track>,
+    ui: Option<&PlaybackUi>,
+    volume_percent: &mut u32,
+    playback_base_us: u64,
+    playback_started_at: Option<Instant>,
+    duration_us: Option<u64>,
+    info: &VideoInfo,
+    zoom: f32,
+    placed_node: &mut vivid_sdk::SceneNode,
+    column: &mut u32,
+    row: &mut u32,
+    columns: &mut u32,
+    rows: &mut u32,
     overall_timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<WaitOutcome> {
     let deadline = Instant::now()
         .checked_add(overall_timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "playback wait is too long"))?;
     loop {
+        if let Some(ui) = ui {
+            let current = playback_base_us.saturating_add(
+                playback_started_at
+                    .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+            );
+            ui.set_position_us(current.min(duration_us.unwrap_or(u64::MAX)));
+            while let Some(command) = ui.try_command() {
+                match command {
+                    Command::Quit => return Ok(WaitOutcome::Quit),
+                    Command::VolumeBy(delta) => {
+                        let next = (*volume_percent as i32 + delta).clamp(0, 200) as u32;
+                        if let Some(audio) = audio
+                            && client.supports(vivid_protocol::registry::AUDIO_GAIN)
+                        {
+                            client.set_audio_gain(
+                                audio,
+                                vivid_sdk::AudioGain::from_percent(next)
+                                    .expect("clamped volume is valid"),
+                            )?;
+                            *volume_percent = next;
+                            ui.set_volume_percent(Some(next));
+                            ui.set_message(format!("Volume {next}%"));
+                        } else {
+                            ui.set_volume_percent(None);
+                            ui.set_message("Volume unavailable");
+                        }
+                    }
+                    Command::SeekBy(delta) => {
+                        let target = if delta < 0 {
+                            current.saturating_sub(delta.unsigned_abs())
+                        } else {
+                            current.saturating_add(delta as u64)
+                        };
+                        return Ok(WaitOutcome::Seek(
+                            target.min(duration_us.unwrap_or(u64::MAX)),
+                        ));
+                    }
+                    Command::SeekTo(target) => {
+                        return Ok(WaitOutcome::Seek(
+                            target.min(duration_us.unwrap_or(u64::MAX)),
+                        ));
+                    }
+                    Command::Resize(geometry) => {
+                        let layout_geometry = media_geometry(geometry, true);
+                        let size = display_size(
+                            info.width,
+                            info.height,
+                            info.sar_num,
+                            info.sar_den,
+                            zoom,
+                            layout_geometry,
+                        );
+                        (*column, *row) = centered_origin(layout_geometry, size.0, size.1);
+                        update_full_window_surface(
+                            client,
+                            placed_node,
+                            *column,
+                            *row,
+                            size.0,
+                            size.1,
+                        )?;
+                        (*columns, *rows) = size;
+                    }
+                }
+            }
+            ui.redraw()?;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
@@ -517,7 +878,13 @@ fn wait_for_playback_end(
                 "timed out waiting for Vivid playback to finish",
             ));
         }
-        let request_timeout = remaining.min(Duration::from_micros(MAX_TRACK_WAIT_TIMEOUT_US));
+        let request_timeout = remaining
+            .min(Duration::from_micros(MAX_TRACK_WAIT_TIMEOUT_US))
+            .min(if ui.is_some() {
+                Duration::from_millis(50)
+            } else {
+                Duration::MAX
+            });
         let request_timeout_us = timeout_us(request_timeout).max(1);
         match client.wait_track(
             track,
@@ -525,12 +892,31 @@ fn wait_for_playback_end(
             None,
             request_timeout_us,
         ) {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(WaitOutcome::Ended),
             Err(error)
                 if presenter_code(&error) == Some(ERROR_TIMEOUT) && Instant::now() < deadline => {}
             Err(error) => return Err(error),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    Ended,
+    Seek(u64),
+    Quit,
+}
+
+fn cleanup_full_window(
+    client: &mut VividClient,
+    surface: &vivid_sdk::Surface,
+    video_track: &Track,
+    node_id: u64,
+) {
+    let context_id = client.info().root_context_id;
+    let _ = client.delete_node(context_id, node_id, &RequestMetadata::default());
+    let _ = client.destroy_track(video_track, &RequestMetadata::default());
+    let _ = client.destroy_surface(surface, &RequestMetadata::default());
 }
 
 fn presenter_code(error: &io::Error) -> Option<u64> {
@@ -561,6 +947,7 @@ fn create_presenter_audio(
     path: &Path,
     info: Option<&crate::ffmpeg::AudioInfo>,
     recovery: Arc<AudioRecoveryTarget>,
+    start_pts_us: Option<i64>,
 ) -> io::Result<Option<PresenterAudio>> {
     let Some(info) = info else {
         return Ok(None);
@@ -590,7 +977,13 @@ fn create_presenter_audio(
     let worker_channel = channel.clone();
     let path = path.to_path_buf();
     let worker = thread::spawn(move || {
-        let result = stream_audio(&path, &worker_channel, &worker_progress, &recovery);
+        let result = stream_audio(
+            &path,
+            &worker_channel,
+            &worker_progress,
+            &recovery,
+            start_pts_us,
+        );
         worker_progress.finish(result.is_err());
         match result {
             Ok(packet_id) => AudioOutcome {
@@ -618,11 +1011,23 @@ fn stream_audio(
     channel: &TrackChannel,
     progress: &AudioProgress,
     recovery: &AudioRecoveryTarget,
+    start_pts_us: Option<i64>,
 ) -> io::Result<u64> {
     let mut demuxer = AudioDemuxer::open(path)?;
+    if let Some(start_pts_us) = start_pts_us {
+        demuxer.seek_to_us(start_pts_us)?;
+    }
     let mut packet_id = 0_u64;
     let mut recovery_target = None;
     while let Some(packet) = demuxer.next_packet()? {
+        if start_pts_us.is_some_and(|start| {
+            packet
+                .pts_us
+                .saturating_add(i64::try_from(packet.duration_us).unwrap_or(i64::MAX))
+                <= start
+        }) {
+            continue;
+        }
         merge_recovery_target(&mut recovery_target, recovery.take());
         if !audio_packet_reaches_recovery_target(&mut recovery_target, packet.pts_us) {
             continue;
@@ -1006,6 +1411,20 @@ fn display_size(
     )
 }
 
+fn media_geometry(mut geometry: TerminalGeometry, full_window: bool) -> TerminalGeometry {
+    if full_window && geometry.rows >= 2 {
+        geometry.rows -= 1;
+    }
+    geometry
+}
+
+fn centered_origin(geometry: TerminalGeometry, columns: u32, rows: u32) -> (u32, u32) {
+    (
+        u32::from(geometry.cols).saturating_sub(columns) / 2,
+        u32::from(geometry.rows).saturating_sub(rows) / 2,
+    )
+}
+
 fn timeout_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -1051,6 +1470,15 @@ mod tests {
         let geometry = TerminalGeometry::with_cell_size(100, 40, 10, 20);
         assert_eq!(display_size(640, 360, 1, 1, 1.0, geometry), (64, 18));
         assert_eq!(display_size(320, 360, 2, 1, 1.0, geometry), (64, 18));
+    }
+
+    #[test]
+    fn full_window_layout_reserves_status_row_and_centers_video() {
+        let geometry = TerminalGeometry::with_cell_size(100, 40, 10, 20);
+        let media = media_geometry(geometry, true);
+        assert_eq!(media.rows, 39);
+        assert_eq!(centered_origin(media, 64, 18), (18, 10));
+        assert_eq!(media_geometry(geometry, false), geometry);
     }
 
     #[test]

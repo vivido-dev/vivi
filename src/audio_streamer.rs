@@ -1,9 +1,9 @@
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vivid_protocol::media::AudioPacket;
-use vivid_protocol::messages::LaneClass;
+use vivid_protocol::messages::{ERROR_TIMEOUT, LaneClass};
 use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
 use vivid_sdk::{
     AudioConfiguration, CoordinateModel, MILESTONE_OUTPUT_READY, RequestMetadata, SlotBinding,
@@ -13,11 +13,13 @@ use vivid_sdk::{
 use crate::cli::Config;
 use crate::client::VividClient;
 use crate::ffmpeg::{AudioDemuxer, AudioInfo};
+use crate::playback_ui::{Command, PlaybackUi};
 
 const INITIAL_BUFFER_US: u64 = 100_000;
 const MAXIMUM_LATENCY_US: u64 = 2_000_000;
 const PLAYBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SLOT_AUDIO: u64 = 2;
+const UI_POLL_TIMEOUT_US: u64 = 50_000;
 
 pub fn play(
     config: &Config,
@@ -25,7 +27,8 @@ pub fn play(
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = AudioDemuxer::inspect(path)?;
-    let mut demuxer = AudioDemuxer::open(path)?;
+    let gain_available = client.supports(vivid_protocol::registry::AUDIO_GAIN);
+    let ui = PlaybackUi::enter(config, path, info.duration_us, gain_available, true)?;
     let surface_id = client.allocate_id()?;
     let context_id = client.info().root_context_id;
     let surface = client.create_surface(
@@ -43,68 +46,236 @@ pub fn play(
         .into());
     }
     let track = client.create_track(configuration, &RequestMetadata::default())?;
-    let channel = client.open_track_channel(&track)?;
+    let result = stream_with_controls(config, client, path, &info, &surface, &track, ui.as_ref());
+    let track_cleanup = client.destroy_track(&track, &RequestMetadata::default());
+    let surface_cleanup = client.destroy_surface(&surface, &RequestMetadata::default());
+    result?;
+    track_cleanup?;
+    surface_cleanup?;
+    Ok(())
+}
+
+fn stream_with_controls(
+    config: &Config,
+    client: &mut VividClient,
+    path: &Path,
+    info: &AudioInfo,
+    surface: &vivid_sdk::Surface,
+    track: &Track,
+    ui: Option<&PlaybackUi>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let origin_us = info.first_pts_us.unwrap_or(0);
+    let mut elapsed_us = 0_u64;
+    let mut epoch = 1_u32;
     let mut packet_id = 0_u64;
-    let mut started = false;
-    let mut buffered_us = 0_u64;
-    while let Some(packet) = demuxer.next_packet()? {
-        if packet.data.is_empty() {
-            continue;
+    let mut volume_percent = 100_u32;
+    let mut generation = 0_u64;
+
+    'generation: loop {
+        if generation != 0 {
+            epoch = epoch
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("audio epoch exhausted"))?;
+            client.pause(track)?;
+            client.flush(track, epoch)?;
+            client.advance_channel(track, 1, &RequestMetadata::default())?;
         }
-        packet_id = packet_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("audio packet ID space exhausted"))?;
-        channel.send_audio(AudioPacket {
-            epoch: 1,
-            packet_id,
-            pts_us: packet.pts_us,
-            dts_us: packet.dts_us,
-            duration_us: packet.duration_us,
-            trim_start_samples: packet.trim_start_samples,
-            trim_end_samples: packet.trim_end_samples,
-            data: &packet.data,
-        })?;
-        buffered_us = buffered_us.saturating_add(packet.duration_us);
-        if !started && buffered_us >= INITIAL_BUFFER_US {
-            start_playback(
+        generation = generation.saturating_add(1);
+        let channel = client.open_track_channel(track)?;
+        let target_pts_us = origin_us.saturating_add(i64::try_from(elapsed_us).unwrap_or(i64::MAX));
+        let mut demuxer = AudioDemuxer::open(path)?;
+        if elapsed_us != 0 {
+            demuxer.seek_to_us(target_pts_us)?;
+        }
+        let mut started = false;
+        let mut buffered_us = 0_u64;
+        let mut started_at = None;
+        let mut packets_this_generation = 0_u64;
+
+        while let Some(packet) = demuxer.next_packet()? {
+            if let Some(action) = handle_commands(
                 client,
-                &surface,
-                &track,
-                info.first_pts_us.unwrap_or(0),
-                INITIAL_BUFFER_US,
-            )?;
-            started = true;
+                track,
+                ui,
+                &mut volume_percent,
+                current_elapsed(elapsed_us, started_at),
+                info.duration_us,
+            )? {
+                channel.close()?;
+                match action {
+                    ControlAction::Seek(target) => {
+                        elapsed_us = target;
+                        continue 'generation;
+                    }
+                    ControlAction::Quit => return Ok(()),
+                }
+            }
+            if packet.data.is_empty()
+                || packet
+                    .pts_us
+                    .saturating_add(i64::try_from(packet.duration_us).unwrap_or(i64::MAX))
+                    <= target_pts_us
+            {
+                continue;
+            }
+            packet_id = packet_id
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("audio packet ID space exhausted"))?;
+            packets_this_generation += 1;
+            channel.send_audio(AudioPacket {
+                epoch,
+                packet_id,
+                pts_us: packet.pts_us,
+                dts_us: packet.dts_us,
+                duration_us: packet.duration_us,
+                trim_start_samples: packet.trim_start_samples,
+                trim_end_samples: packet.trim_end_samples,
+                data: &packet.data,
+            })?;
+            buffered_us = buffered_us.saturating_add(packet.duration_us);
+            if !started && buffered_us >= INITIAL_BUFFER_US {
+                start_playback(client, surface, track, target_pts_us, INITIAL_BUFFER_US)?;
+                started = true;
+                started_at = Some(Instant::now());
+            }
+            if let Some(ui) = ui {
+                ui.set_position_us(current_elapsed(elapsed_us, started_at));
+                ui.redraw()?;
+            }
         }
-    }
-    if packet_id == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "audio has no packets").into());
-    }
-    if !started {
-        start_playback(
-            client,
-            &surface,
-            &track,
-            info.first_pts_us.unwrap_or(0),
-            buffered_us.max(1),
-        )?;
-    }
-    channel.eos()?;
-    if !config.no_wait {
-        client.drain(&track)?;
-        client.wait_track(
-            &track,
-            TrackWaitCondition::PlaybackEnded,
-            None,
-            timeout_us(PLAYBACK_TIMEOUT),
-        )?;
+        if packets_this_generation == 0 {
+            if generation == 1 {
+                return Err(
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "audio has no packets").into(),
+                );
+            }
+            return Ok(());
+        }
+        if !started {
+            start_playback(client, surface, track, target_pts_us, buffered_us.max(1))?;
+            started_at = Some(Instant::now());
+        }
+        channel.eos()?;
+        if config.no_wait {
+            break;
+        }
+        if ui.is_none() {
+            client.drain(track)?;
+        }
+        loop {
+            let current = current_elapsed(elapsed_us, started_at);
+            if let Some(ui) = ui {
+                ui.set_position_us(current.min(info.duration_us.unwrap_or(u64::MAX)));
+                ui.redraw()?;
+            }
+            if let Some(action) = handle_commands(
+                client,
+                track,
+                ui,
+                &mut volume_percent,
+                current,
+                info.duration_us,
+            )? {
+                match action {
+                    ControlAction::Seek(target) => {
+                        elapsed_us = target;
+                        continue 'generation;
+                    }
+                    ControlAction::Quit => return Ok(()),
+                }
+            }
+            match client.wait_track(
+                track,
+                TrackWaitCondition::PlaybackEnded,
+                None,
+                UI_POLL_TIMEOUT_US,
+            ) {
+                Ok(_) => {
+                    if ui.is_some() {
+                        client.drain(track)?;
+                    }
+                    break 'generation;
+                }
+                Err(error) if presenter_code(&error) == Some(ERROR_TIMEOUT) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     client.verbose(format_args!(
-        "audio track {} on surface {surface_id}: EOS after {packet_id} packets",
+        "audio track {}: EOS after {packet_id} packets",
         track.id()
     ));
-    client.destroy_track(&track, &RequestMetadata::default())?;
-    client.destroy_surface(&surface, &RequestMetadata::default())?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ControlAction {
+    Seek(u64),
+    Quit,
+}
+
+fn handle_commands(
+    client: &mut VividClient,
+    track: &Track,
+    ui: Option<&PlaybackUi>,
+    volume_percent: &mut u32,
+    current_us: u64,
+    duration_us: Option<u64>,
+) -> io::Result<Option<ControlAction>> {
+    let Some(ui) = ui else { return Ok(None) };
+    while let Some(command) = ui.try_command() {
+        match command {
+            Command::SeekBy(delta) => {
+                let target = if delta < 0 {
+                    current_us.saturating_sub(delta.unsigned_abs())
+                } else {
+                    current_us.saturating_add(delta as u64)
+                };
+                return Ok(Some(ControlAction::Seek(
+                    target.min(duration_us.unwrap_or(u64::MAX)),
+                )));
+            }
+            Command::SeekTo(target) => {
+                return Ok(Some(ControlAction::Seek(
+                    target.min(duration_us.unwrap_or(u64::MAX)),
+                )));
+            }
+            Command::VolumeBy(delta) => {
+                let next = (*volume_percent as i32 + delta).clamp(0, 200) as u32;
+                if client.supports(vivid_protocol::registry::AUDIO_GAIN) {
+                    let gain = vivid_sdk::AudioGain::from_percent(next).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid volume")
+                    })?;
+                    client.set_audio_gain(track, gain)?;
+                    *volume_percent = next;
+                    ui.set_volume_percent(Some(next));
+                    ui.set_message(format!("Volume {next}%"));
+                } else {
+                    ui.set_volume_percent(None);
+                    ui.set_message("Volume unavailable on this presenter");
+                }
+                ui.redraw()?;
+            }
+            Command::Resize(_) => ui.redraw()?,
+            Command::Quit => return Ok(Some(ControlAction::Quit)),
+        }
+    }
+    Ok(None)
+}
+
+fn current_elapsed(base_us: u64, started_at: Option<Instant>) -> u64 {
+    base_us.saturating_add(
+        started_at
+            .map(|instant| u64::try_from(instant.elapsed().as_micros()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+    )
+}
+
+fn presenter_code(error: &io::Error) -> Option<u64> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<vivid_sdk::PresenterError>())
+        .map(|error| error.code)
 }
 
 fn start_playback(

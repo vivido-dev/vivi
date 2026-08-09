@@ -208,6 +208,29 @@ pub fn place_surface(
     Ok(node)
 }
 
+/// Place a surface against the terminal grid without an inline cursor anchor.
+pub fn place_full_window_surface(
+    client: &mut VividClient,
+    surface: &Surface,
+    node_id: u64,
+    column: u32,
+    row: u32,
+    columns: u32,
+    rows: u32,
+) -> io::Result<SceneNode> {
+    let mut node = terminal_surface_node(
+        client,
+        surface,
+        node_id,
+        fixed_cells(columns)?,
+        fixed_cells(rows)?,
+        None,
+    );
+    set_node_cell_rect(&mut node, column, row, columns, rows)?;
+    create_node_with_target_retry(client, &node)?;
+    Ok(node)
+}
+
 fn terminal_surface_node(
     client: &VividClient,
     surface: &Surface,
@@ -252,6 +275,41 @@ pub fn resize_placed_surface(
 ) -> io::Result<()> {
     set_node_cell_size(node, columns, rows)?;
     update_node_with_target_retry(client, node)
+}
+
+pub fn update_full_window_surface(
+    client: &mut VividClient,
+    node: &mut SceneNode,
+    column: u32,
+    row: u32,
+    columns: u32,
+    rows: u32,
+) -> io::Result<()> {
+    set_node_cell_rect(node, column, row, columns, rows)?;
+    update_node_with_target_retry(client, node)
+}
+
+fn set_node_cell_rect(
+    node: &mut SceneNode,
+    column: u32,
+    row: u32,
+    columns: u32,
+    rows: u32,
+) -> io::Result<()> {
+    let x = fixed_cells(column)?;
+    let y = fixed_cells(row)?;
+    let width = fixed_cells(columns)?;
+    let height = fixed_cells(rows)?;
+    for (key, value) in &mut node.geometry {
+        match *key {
+            1 => *value = signed(x),
+            2 => *value = signed(y),
+            3 => *value = signed(width),
+            4 => *value = signed(height),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn set_node_cell_size(node: &mut SceneNode, columns: u32, rows: u32) -> io::Result<()> {
@@ -584,5 +642,34 @@ mod tests {
 
         assert_eq!(node.geometry[3].1.as_u64(), Some(64_u64 << 32));
         assert_eq!(node.geometry[4].1.as_u64(), Some(24_u64 << 32));
+    }
+
+    #[test]
+    fn full_window_rect_updates_origin_and_extent() {
+        let mut node = SceneNode {
+            owning_context_id: 1,
+            node_id: 2,
+            surface_context_id: 1,
+            surface_id: 3,
+            geometry: vec![
+                (0, Value::Unsigned(1)),
+                (1, signed(0)),
+                (2, signed(0)),
+                (3, signed(1_i64 << 32)),
+                (4, signed(1_i64 << 32)),
+                (5, Value::Unsigned(1)),
+            ],
+            fit: Fit::Contain,
+            linear_sampling: true,
+            z_index: 0,
+            visible: true,
+            opacity: u16::MAX,
+            clip: None,
+        };
+        set_node_cell_rect(&mut node, 8, 3, 64, 18).unwrap();
+        assert_eq!(node.geometry[1].1.as_u64(), Some(8_u64 << 32));
+        assert_eq!(node.geometry[2].1.as_u64(), Some(3_u64 << 32));
+        assert_eq!(node.geometry[3].1.as_u64(), Some(64_u64 << 32));
+        assert_eq!(node.geometry[4].1.as_u64(), Some(18_u64 << 32));
     }
 }

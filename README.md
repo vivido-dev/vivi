@@ -69,8 +69,14 @@ vivi photo.png
 vivi clip.mkv
 vivi song.mp3
 vivi -z 1.5 photo.webp clip.mp4
+vivi -i clip.mkv
 vivi --bulk-endpoint unix:/private/media.sock clip.mkv
 ```
+
+Video and audio use the full terminal window by default. `-i`/`--inline` preserves the previous
+inline placement and non-interactive playback behavior. Full-window playback uses the same keys as
+Kitim: `f`/`b` seek 10 seconds, Left/Right seek 5 seconds, Up/Down change volume by 5%, `g` opens a
+timestamp prompt, and `q` or Ctrl-C stops the current file. Images always remain inline.
 
 For remote use, run `vvssh`; see [Remote Linux audio](docs/ssh-linux-audio.md). A separate media
 transport may provide `VIVID_ENDPOINT_BULK`; realtime audio inherits the protocol fallback chain.

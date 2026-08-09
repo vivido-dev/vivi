@@ -16,6 +16,7 @@ const AV_SAMPLE_FMT_FLT: c_int = 3;
 const AV_LOG_QUIET: c_int = -8;
 const AV_NOPTS_VALUE: i64 = i64::MIN;
 const AV_PKT_DATA_SKIP_SAMPLES: c_int = 11;
+const AVSEEK_FLAG_BACKWARD: c_int = 1;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 const AVERROR_EOF: c_int = -541_478_725;
 const AVCOL_RANGE_UNSPECIFIED: c_int = 0;
@@ -198,6 +199,13 @@ unsafe extern "C" {
     -> c_int;
     fn avformat_close_input(context: *mut *mut AVFormatContext);
     fn av_read_frame(context: *mut AVFormatContext, packet: *mut AVPacket) -> c_int;
+    fn av_seek_frame(
+        context: *mut AVFormatContext,
+        stream_index: c_int,
+        timestamp: i64,
+        flags: c_int,
+    ) -> c_int;
+    fn avformat_flush(context: *mut AVFormatContext);
     fn av_packet_alloc() -> *mut AVPacket;
     fn av_packet_unref(packet: *mut AVPacket);
     fn av_packet_get_side_data(
@@ -291,6 +299,7 @@ pub struct VideoInfo {
     pub maximum_encoded_bits_per_second: u64,
     pub maximum_records_per_second: u64,
     pub first_pts_us: Option<i64>,
+    pub duration_us: Option<u64>,
     pub has_audio: bool,
     pub audio: Option<AudioInfo>,
     /// RFC 6381 codec string derived from the container decoder configuration
@@ -315,6 +324,7 @@ pub struct AudioInfo {
     pub maximum_encoded_bits_per_second: u64,
     pub maximum_records_per_second: u64,
     pub first_pts_us: Option<i64>,
+    pub duration_us: Option<u64>,
     /// RFC 6381 codec string (`decoder-description-v1`).
     pub codec_string: Option<String>,
 }
@@ -435,6 +445,7 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     pub pts_us: i64,
     pub dts_us: i64,
+    pub duration_us: u64,
     pub key: bool,
 }
 
@@ -561,6 +572,8 @@ impl VideoDemuxer {
         let mut audio_maximum = 0_usize;
         let mut video_rate = RateClaims::default();
         let mut audio_rate = RateClaims::default();
+        let mut video_end_pts = None;
+        let mut audio_end_pts = None;
         while let Some(packet) = demuxer.next_media_packet()? {
             match packet {
                 EncodedMediaPacket::Video(packet) => {
@@ -580,6 +593,10 @@ impl VideoDemuxer {
                     )?;
                     if packet.pts_us != AV_NOPTS_VALUE {
                         demuxer.info.first_pts_us.get_or_insert(packet.pts_us);
+                        video_end_pts = Some(video_end_pts.map_or(
+                            packet_end_pts(packet.pts_us, packet.duration_us),
+                            |end: i64| end.max(packet_end_pts(packet.pts_us, packet.duration_us)),
+                        ));
                     }
                 }
                 EncodedMediaPacket::Audio(packet) => {
@@ -601,6 +618,10 @@ impl VideoDemuxer {
                         && let Some(info) = demuxer.info.audio.as_mut()
                     {
                         info.first_pts_us.get_or_insert(packet.pts_us);
+                        audio_end_pts = Some(audio_end_pts.map_or(
+                            packet_end_pts(packet.pts_us, packet.duration_us),
+                            |end: i64| end.max(packet_end_pts(packet.pts_us, packet.duration_us)),
+                        ));
                     }
                 }
             }
@@ -614,6 +635,7 @@ impl VideoDemuxer {
         demuxer.info.max_access_unit_bytes = u32::try_from(maximum)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "access unit exceeds u32"))?;
         video_rate.apply_video(&mut demuxer.info);
+        demuxer.info.duration_us = duration_between(demuxer.info.first_pts_us, video_end_pts);
         if let Some(audio) = demuxer.info.audio.as_mut() {
             audio.max_access_unit_bytes = u32::try_from(audio_maximum).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "audio access unit exceeds u32")
@@ -622,6 +644,7 @@ impl VideoDemuxer {
                 demuxer.info.audio = None;
             } else {
                 audio_rate.apply_audio(audio);
+                audio.duration_us = duration_between(audio.first_pts_us, audio_end_pts);
             }
         }
         Ok(demuxer.info.clone())
@@ -662,6 +685,7 @@ impl VideoDemuxer {
                     data,
                     pts_us: timestamp_us(packet.pts, self.time_base),
                     dts_us: timestamp_us(packet.dts, self.time_base),
+                    duration_us: timestamp_duration_us(packet.duration, self.time_base),
                 })));
             }
             let time_base = self.audio_time_base.ok_or_else(|| {
@@ -687,6 +711,16 @@ impl VideoDemuxer {
                 trim_end_samples,
             })));
         }
+    }
+
+    pub fn seek_to_us(&mut self, target_pts_us: i64) -> io::Result<()> {
+        seek_context(
+            self.context,
+            self.packet,
+            self.stream_index,
+            self.time_base,
+            target_pts_us,
+        )
     }
 }
 
@@ -770,6 +804,7 @@ impl AudioDemuxer {
         let mut demuxer = Self::open(path)?;
         let mut maximum = 0_usize;
         let mut rate = RateClaims::default();
+        let mut end_pts = None;
         while let Some(packet) = demuxer.next_packet()? {
             maximum = maximum.max(packet.data.len());
             let body_length =
@@ -783,6 +818,10 @@ impl AudioDemuxer {
             )?;
             if packet.pts_us != AV_NOPTS_VALUE {
                 demuxer.info.first_pts_us.get_or_insert(packet.pts_us);
+                end_pts = Some(end_pts.map_or(
+                    packet_end_pts(packet.pts_us, packet.duration_us),
+                    |end: i64| end.max(packet_end_pts(packet.pts_us, packet.duration_us)),
+                ));
             }
         }
         if maximum == 0 {
@@ -795,7 +834,18 @@ impl AudioDemuxer {
             io::Error::new(io::ErrorKind::InvalidData, "audio access unit exceeds u32")
         })?;
         rate.apply_audio(&mut demuxer.info);
+        demuxer.info.duration_us = duration_between(demuxer.info.first_pts_us, end_pts);
         Ok(demuxer.info.clone())
+    }
+
+    pub fn seek_to_us(&mut self, target_pts_us: i64) -> io::Result<()> {
+        seek_context(
+            self.context,
+            self.packet,
+            self.stream_index,
+            self.time_base,
+            target_pts_us,
+        )
     }
 
     pub fn next_packet(&mut self) -> io::Result<Option<EncodedAudioPacket>> {
@@ -1357,6 +1407,7 @@ unsafe fn video_info(parameters: *mut AVCodecParameters) -> io::Result<(VideoInf
             maximum_encoded_bits_per_second: 0,
             maximum_records_per_second: 0,
             first_pts_us: None,
+            duration_us: None,
             has_audio: false,
             audio: None,
             codec_string,
@@ -1566,6 +1617,7 @@ unsafe fn audio_info(
         maximum_encoded_bits_per_second: 0,
         maximum_records_per_second: 0,
         first_pts_us,
+        duration_us: stream_duration_us(stream),
         codec_string,
     })
 }
@@ -1889,6 +1941,41 @@ fn timestamp_duration_us(timestamp: i64, time_base: AVRational) -> u64 {
         return 0;
     }
     u64::try_from(timestamp_us(timestamp, time_base)).unwrap_or(u64::MAX)
+}
+
+fn stream_duration_us(stream: &AVStream) -> Option<u64> {
+    (stream.duration > 0).then(|| timestamp_duration_us(stream.duration, stream.time_base))
+}
+
+fn duration_between(first: Option<i64>, end: Option<i64>) -> Option<u64> {
+    first
+        .zip(end)
+        .and_then(|(first, end)| u64::try_from(end.saturating_sub(first)).ok())
+}
+
+fn packet_end_pts(pts_us: i64, duration_us: u64) -> i64 {
+    pts_us.saturating_add(i64::try_from(duration_us).unwrap_or(i64::MAX))
+}
+
+fn seek_context(
+    context: *mut AVFormatContext,
+    packet: *mut AVPacket,
+    stream_index: c_int,
+    time_base: AVRational,
+    target_pts_us: i64,
+) -> io::Result<()> {
+    let timestamp = i128::from(target_pts_us).saturating_mul(i128::from(time_base.den))
+        / i128::from(time_base.num).saturating_mul(1_000_000);
+    let timestamp = timestamp.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    let result = unsafe { av_seek_frame(context, stream_index, timestamp, AVSEEK_FLAG_BACKWARD) };
+    if result < 0 {
+        return Err(ffmpeg_error("could not seek media", result));
+    }
+    unsafe {
+        av_packet_unref(packet);
+        avformat_flush(context);
+    }
+    Ok(())
 }
 
 fn packet_trim(packet: &AVPacket) -> (u32, u32) {

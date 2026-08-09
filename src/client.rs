@@ -6,7 +6,7 @@ use vivid_sdk::{ProducerAuthentication, ProducerConfig, Session};
 
 use crate::cli::Config;
 use crate::protocol::registry::{
-    CORE_CONTROL, LIVE_MEDIA, OBSERVABILITY, TERMINAL_SURFACE, TIMED_MEDIA,
+    AUDIO_GAIN, CORE_CONTROL, LIVE_MEDIA, OBSERVABILITY, TERMINAL_SURFACE, TIMED_MEDIA,
 };
 
 pub struct VividClient {
@@ -82,7 +82,7 @@ pub fn producer_config(config: &Config) -> ProducerConfig {
             TIMED_MEDIA.into(),
             CORE_CONTROL.into(),
         ],
-        optional_profiles: vec![],
+        optional_profiles: vec![AUDIO_GAIN.into()],
         dry_run: config.dry_run,
         trace_dir: config.trace_dir.clone(),
         ..ProducerConfig::default()
@@ -100,6 +100,7 @@ mod tests {
         let config = Config {
             files: vec![PathBuf::from("image.png")],
             zoom: 1.0,
+            inline: false,
             control_endpoint: None,
             realtime_endpoint: None,
             bulk_endpoint: None,

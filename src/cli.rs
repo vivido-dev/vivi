@@ -20,6 +20,10 @@ pub struct Config {
     #[arg(short = 'z', long, default_value_t = 1.0)]
     pub zoom: f32,
 
+    /// Keep video and audio playback inline instead of using the full terminal window.
+    #[arg(short = 'i', long)]
+    pub inline: bool,
+
     /// Vivid control endpoint, normally inherited as VIVID_ENDPOINT_CONTROL.
     #[arg(long, env = "VIVID_ENDPOINT_CONTROL")]
     pub control_endpoint: Option<String>,
@@ -85,6 +89,7 @@ mod tests {
         Config {
             files: vec![PathBuf::from("image.png")],
             zoom: 1.0,
+            inline: false,
             control_endpoint: None,
             realtime_endpoint: None,
             bulk_endpoint: None,
@@ -125,5 +130,11 @@ mod tests {
         assert_eq!(parsed.realtime_endpoint.as_deref(), Some("unix:/realtime"));
         assert!(Config::try_parse_from(["vivi", "--endpoint", "unix:/old", "image.png"]).is_err());
         assert!(Config::try_parse_from(["vivi", "--token", "secret", "image.png"]).is_err());
+    }
+
+    #[test]
+    fn inline_short_option_preserves_the_legacy_mode() {
+        let parsed = Config::try_parse_from(["vivi", "--dry-run", "-i", "clip.mp4"]).unwrap();
+        assert!(parsed.inline);
     }
 }

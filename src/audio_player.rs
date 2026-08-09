@@ -4,7 +4,7 @@ use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod platform {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -27,6 +27,7 @@ mod platform {
         decode_done: AtomicBool,
         queued_samples: AtomicU64,
         played_samples: AtomicU64,
+        gain_bits: AtomicU32,
         error: Mutex<Option<String>>,
     }
 
@@ -38,6 +39,7 @@ mod platform {
                 decode_done: AtomicBool::new(false),
                 queued_samples: AtomicU64::new(0),
                 played_samples: AtomicU64::new(0),
+                gain_bits: AtomicU32::new(1.0_f32.to_bits()),
                 error: Mutex::new(None),
             }
         }
@@ -130,6 +132,11 @@ mod platform {
             Ok(())
         }
 
+        pub fn set_volume_percent(&self, percent: u32) {
+            let gain = (percent.min(200) as f32 / 100.0).to_bits();
+            self.shared.gain_bits.store(gain, Ordering::SeqCst);
+        }
+
         pub fn wait(&mut self) -> io::Result<()> {
             if let Some(worker) = self.worker.take()
                 && worker.join().is_err()
@@ -140,6 +147,10 @@ mod platform {
                 return Err(io::Error::other(error));
             }
             Ok(())
+        }
+
+        pub fn is_finished(&self) -> bool {
+            self.worker.as_ref().is_none_or(JoinHandle::is_finished)
         }
 
         fn stop(&mut self) {
@@ -159,12 +170,6 @@ mod platform {
 
     pub fn prepare_video(path: &Path, video_origin_us: Option<i64>) -> io::Result<AudioPlayback> {
         AudioPlayback::open(path, video_origin_us)
-    }
-
-    pub fn play(path: &Path) -> io::Result<()> {
-        let mut playback = AudioPlayback::open(path, None)?;
-        playback.start()?;
-        playback.wait()
     }
 
     fn run_worker(
@@ -322,9 +327,10 @@ mod platform {
                         return;
                     }
                     let mut played = 0_u64;
+                    let gain = f32::from_bits(shared.gain_bits.load(Ordering::SeqCst));
                     for sample in output {
                         if let Some(value) = consumer.try_pop() {
-                            *sample = T::from_sample(value);
+                            *sample = T::from_sample((value * gain).clamp(-1.0, 1.0));
                             played += 1;
                         } else {
                             *sample = T::from_sample(0.0);
@@ -396,7 +402,7 @@ mod platform {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-pub use platform::{AudioPlayback, play, prepare_video};
+pub use platform::{AudioPlayback, prepare_video};
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod platform_stub {
@@ -412,19 +418,72 @@ mod platform_stub {
         pub fn wait(&mut self) -> io::Result<()> {
             Ok(())
         }
+
+        pub fn is_finished(&self) -> bool {
+            true
+        }
+
+        pub fn set_volume_percent(&self, _percent: u32) {}
     }
 
     pub fn prepare_video(_path: &Path, _video_origin_us: Option<i64>) -> io::Result<AudioPlayback> {
         Ok(AudioPlayback)
     }
-
-    pub fn play(_path: &Path) -> io::Result<()> {
-        Err(super::unsupported_platform_error())
-    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-pub use platform_stub::{AudioPlayback, play, prepare_video};
+pub use platform_stub::{AudioPlayback, prepare_video};
+
+pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (config, path);
+        return Err(unsupported_platform_error());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    {
+        use std::thread;
+        use std::time::Duration;
+
+        use crate::ffmpeg::AudioDemuxer;
+        use crate::playback_ui::{Command, PlaybackUi};
+
+        let info = AudioDemuxer::inspect(path)?;
+        let ui = PlaybackUi::enter(config, path, info.duration_us, true, true)?;
+        let mut playback = AudioPlayback::open(path, None)?;
+        playback.start()?;
+        let started = std::time::Instant::now();
+        let mut volume_percent = 100_u32;
+        while !playback.is_finished() {
+            if let Some(ui) = ui.as_ref() {
+                ui.set_position_us(
+                    u64::try_from(started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX)
+                        .min(info.duration_us.unwrap_or(u64::MAX)),
+                );
+                while let Some(command) = ui.try_command() {
+                    match command {
+                        Command::Quit => return Ok(()),
+                        Command::VolumeBy(delta) => {
+                            volume_percent = (volume_percent as i32 + delta).clamp(0, 200) as u32;
+                            playback.set_volume_percent(volume_percent);
+                            ui.set_volume_percent(Some(volume_percent));
+                            ui.set_message(format!("Volume {volume_percent}%"));
+                        }
+                        Command::SeekBy(_) | Command::SeekTo(_) => {
+                            ui.set_message("Seek requires presenter audio");
+                        }
+                        Command::Resize(_) => {}
+                    }
+                }
+                ui.redraw()?;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        playback.wait()
+    }
+}
 
 #[cfg(any(not(any(target_os = "macos", target_os = "linux", windows)), test))]
 fn unsupported_platform_error() -> io::Error {
