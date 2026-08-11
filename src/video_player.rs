@@ -39,6 +39,7 @@ const SLOT_AUDIO: u64 = 2;
 #[derive(Clone, Copy, Debug, Default)]
 struct AudioProgressState {
     buffered_us: u64,
+    last_submitted_end_pts_us: Option<i64>,
     finished: bool,
     failed: bool,
 }
@@ -50,12 +51,20 @@ struct AudioProgress {
 }
 
 impl AudioProgress {
-    fn observe(&self, duration_us: u64) {
+    fn observe(&self, pts_us: i64, duration_us: u64) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.buffered_us = state.buffered_us.saturating_add(duration_us);
+        if pts_us != i64::MIN {
+            let end_pts_us = pts_us.saturating_add(i64::try_from(duration_us).unwrap_or(i64::MAX));
+            state.last_submitted_end_pts_us = Some(
+                state
+                    .last_submitted_end_pts_us
+                    .map_or(end_pts_us, |current| current.max(end_pts_us)),
+            );
+        }
         self.changed.notify_all();
     }
 
@@ -158,6 +167,12 @@ struct PresenterAudio {
 struct VideoRecovery {
     minimum_epoch: u32,
     advance_epoch: bool,
+}
+
+enum AudioWaitEvent {
+    Recovery(VideoRecovery),
+    Quit,
+    Seek(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +298,7 @@ pub fn play(
     let mut first_pts = None;
     let mut last_pts = None;
     let mut recovery_rebase_pending = false;
+    let mut recovery_start_pts_us = None;
     let timeline_origin_us = info.first_pts_us.unwrap_or(0);
     let mut playback_base_us = 0_u64;
     let mut playback_started_at: Option<Instant> = None;
@@ -449,6 +465,7 @@ pub fn play(
                     local_audio = None;
                     awaiting_keyframe = true;
                     recovery_rebase_pending = false;
+                    recovery_start_pts_us = None;
                     started = false;
                     first_pts = None;
                     last_pts = None;
@@ -464,24 +481,7 @@ pub fn play(
             if let Some(recovery) = take_video_recovery(&video_channel)? {
                 awaiting_keyframe = true;
                 recovery_rebase_pending = started;
-                if recovery.advance_epoch {
-                    epoch = epoch
-                        .checked_add(1)
-                        .ok_or_else(|| io::Error::other("video epoch exhausted"))?
-                        .max(recovery.minimum_epoch);
-                    // Freeze the linked playback group explicitly before replacing decoder state.
-                    // FLUSH also leaves it paused, but keeping PAUSE as its own ordered request makes
-                    // recovery observable and prevents either clock from advancing between the
-                    // recovery decision and the new epoch.
-                    for control in recovery_control_order(started) {
-                        match control {
-                            RecoveryControl::Pause => client.pause(&video_track)?,
-                            RecoveryControl::Flush => client.flush(&video_track, epoch)?,
-                        }
-                    }
-                } else {
-                    epoch = epoch.max(recovery.minimum_epoch);
-                }
+                apply_video_recovery(client, &video_track, recovery, &mut epoch, started)?;
             }
             if packet.data.is_empty() || (awaiting_keyframe && !packet.key) {
                 continue;
@@ -494,8 +494,9 @@ pub fn play(
                 // its original timestamp domain. Fast-forward that audio worker to the same point and
                 // publish the new authoritative clock before the keyframe, so a nested presenter does
                 // not wait in real time for skipped audio or hold the frame forever behind PLAY(0).
-                audio_recovery.request(packet.pts_us);
-                client.play(&video_track, packet.pts_us, 1, MAXIMUM_LATENCY_US)?;
+                let start_pts_us = recovery_start_pts_us.take().unwrap_or(packet.pts_us);
+                audio_recovery.request(start_pts_us);
+                client.play(&video_track, start_pts_us, 1, MAXIMUM_LATENCY_US)?;
                 recovery_rebase_pending = false;
             }
             packet_id = packet_id
@@ -628,7 +629,169 @@ pub fn play(
                 &mut local_audio,
                 play_start_override.unwrap_or_else(|| first_pts.unwrap_or(0)),
             )?;
+            started = true;
             playback_started_at.get_or_insert_with(Instant::now);
+        }
+
+        let audio_wait_event = if let Some(audio) = presenter_audio.as_ref() {
+            let audio_track = audio.track.clone();
+            wait_for_worker_or_event(&audio.worker, || {
+                if let Some(recovery) = take_video_recovery(&video_channel)? {
+                    return Ok(Some(AudioWaitEvent::Recovery(recovery)));
+                }
+                let Some(ui) = ui.as_ref() else {
+                    return Ok(None);
+                };
+                let current_us = playback_base_us.saturating_add(
+                    playback_started_at
+                        .map(|started| {
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+                        })
+                        .unwrap_or(0),
+                );
+                ui.set_position_us(current_us.min(info.duration_us.unwrap_or(u64::MAX)));
+                while let Some(command) = ui.try_command() {
+                    match command {
+                        Command::Quit => return Ok(Some(AudioWaitEvent::Quit)),
+                        Command::SeekBy(delta) => {
+                            let target = if delta < 0 {
+                                current_us.saturating_sub(delta.unsigned_abs())
+                            } else {
+                                current_us.saturating_add(delta as u64)
+                            };
+                            return Ok(Some(AudioWaitEvent::Seek(target)));
+                        }
+                        Command::SeekTo(target) => {
+                            return Ok(Some(AudioWaitEvent::Seek(target)));
+                        }
+                        Command::Resize(geometry) => {
+                            let layout_geometry = media_geometry(geometry, true);
+                            let size = display_size(
+                                info.width,
+                                info.height,
+                                info.sar_num,
+                                info.sar_den,
+                                config.zoom,
+                                layout_geometry,
+                            );
+                            (column, row) = centered_origin(layout_geometry, size.0, size.1);
+                            update_full_window_surface(
+                                client,
+                                &mut placed_node,
+                                column,
+                                row,
+                                size.0,
+                                size.1,
+                            )?;
+                            (columns, rows) = size;
+                            ui.redraw()?;
+                        }
+                        Command::VolumeBy(delta) => {
+                            let next = (volume_percent as i32 + delta).clamp(0, 200) as u32;
+                            if client.supports(vivid_protocol::registry::AUDIO_GAIN) {
+                                client.set_audio_gain(
+                                    &audio_track,
+                                    vivid_sdk::AudioGain::from_percent(next)
+                                        .expect("clamped volume is valid"),
+                                )?;
+                                volume_percent = next;
+                                ui.set_volume_percent(Some(next));
+                                ui.set_message(format!("Volume {next}%"));
+                            } else {
+                                ui.set_volume_percent(None);
+                                ui.set_message("Volume unavailable");
+                            }
+                            ui.redraw()?;
+                        }
+                    }
+                }
+                Ok(None)
+            })?
+        } else {
+            take_video_recovery(&video_channel)?.map(AudioWaitEvent::Recovery)
+        };
+        match audio_wait_event {
+            Some(AudioWaitEvent::Recovery(recovery)) => {
+                // The video demuxer can reach EOF while linked audio is still flow-controlled. A
+                // tab projection change may then require a replacement decoder keyframe. Never
+                // join the audio worker while that request is pending: the linked audio path is
+                // intentionally gated until the keyframe arrives, so joining here would deadlock
+                // both tracks and the playback UI. Seek to the last audio boundary already
+                // accepted by the presenter and use the preceding random-access unit as pre-roll.
+                let resume_pts_us = presenter_audio
+                    .as_ref()
+                    .and_then(|audio| audio.progress.snapshot().last_submitted_end_pts_us)
+                    .or(first_pts)
+                    .unwrap_or(timeline_origin_us);
+                apply_video_recovery(client, &video_track, recovery, &mut epoch, started)?;
+                demuxer.seek_to_us(resume_pts_us)?;
+                awaiting_keyframe = true;
+                recovery_rebase_pending = started;
+                recovery_start_pts_us = Some(resume_pts_us);
+                continue 'playback;
+            }
+            Some(AudioWaitEvent::Quit) => {
+                let _ = video_channel.close();
+                cancel_presenter_audio(client, &mut presenter_audio);
+                cleanup_full_window(client, &surface, &video_track, placed_node.node_id);
+                return Ok(());
+            }
+            Some(AudioWaitEvent::Seek(target)) => {
+                let target = target.min(info.duration_us.unwrap_or(u64::MAX));
+                let target_pts =
+                    timeline_origin_us.saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
+                video_channel.close()?;
+                client.pause(&video_track)?;
+                epoch = epoch
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
+                client.flush(&video_track, epoch)?;
+                client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
+                video_channel = Arc::new(client.open_track_channel(&video_track)?);
+                demuxer.seek_to_us(target_pts)?;
+                clear_audio_slot(client, &surface)?;
+                if let Some(audio) = presenter_audio.take() {
+                    let old_track = audio.track.clone();
+                    let _ = audio.channel.close();
+                    drop(audio.worker);
+                    let _ = client.destroy_track(&old_track, &RequestMetadata::default());
+                }
+                let _ = audio_recovery.take();
+                presenter_audio = create_presenter_audio(
+                    client,
+                    &surface,
+                    path,
+                    info.audio.as_ref(),
+                    audio_recovery.clone(),
+                    Some(target_pts),
+                )?;
+                if let Some(audio) = presenter_audio.as_ref()
+                    && client.supports(vivid_protocol::registry::AUDIO_GAIN)
+                {
+                    client.set_audio_gain(
+                        &audio.track,
+                        vivid_sdk::AudioGain::from_percent(volume_percent)
+                            .expect("clamped volume is valid"),
+                    )?;
+                }
+                local_audio = None;
+                awaiting_keyframe = true;
+                recovery_rebase_pending = false;
+                recovery_start_pts_us = None;
+                started = false;
+                first_pts = None;
+                last_pts = None;
+                play_start_override = Some(target_pts);
+                playback_base_us = target;
+                playback_started_at = None;
+                if let Some(ui) = ui.as_ref() {
+                    ui.set_position_us(target);
+                    ui.set_message(format!("Seek {}", target / 1_000_000));
+                    ui.redraw()?;
+                }
+                continue 'playback;
+            }
+            None => {}
         }
 
         let mut audio_to_drain = None;
@@ -755,6 +918,7 @@ pub fn play(
                 local_audio = None;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = false;
+                recovery_start_pts_us = None;
                 started = false;
                 first_pts = None;
                 last_pts = None;
@@ -1048,7 +1212,7 @@ fn stream_audio(
             trim_end_samples: packet.trim_end_samples,
             data: &packet.data,
         })?;
-        progress.observe(packet.duration_us);
+        progress.observe(packet.pts_us, packet.duration_us);
     }
     Ok(packet_id)
 }
@@ -1237,6 +1401,54 @@ where
         .join()
         .map_err(|_| io::Error::other("video sender thread panicked"))?;
     Ok((result, started))
+}
+
+fn wait_for_worker_or_event<T, E, F>(
+    worker: &thread::JoinHandle<T>,
+    mut take_event: F,
+) -> io::Result<Option<E>>
+where
+    F: FnMut() -> io::Result<Option<E>>,
+{
+    loop {
+        // Prefer an already queued recovery or UI command over completion. This keeps the last
+        // accepted video packet and CHANNEL_EOS ordered around a projection change instead of
+        // racing the worker, and leaves the playback UI responsive throughout the drain.
+        if let Some(event) = take_event()? {
+            return Ok(Some(event));
+        }
+        if worker.is_finished() {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn apply_video_recovery(
+    client: &mut VividClient,
+    video_track: &Track,
+    recovery: VideoRecovery,
+    epoch: &mut u32,
+    started: bool,
+) -> io::Result<()> {
+    if recovery.advance_epoch {
+        *epoch = epoch
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("video epoch exhausted"))?
+            .max(recovery.minimum_epoch);
+        // Freeze the linked playback group explicitly before replacing decoder state. FLUSH also
+        // leaves it paused, but keeping PAUSE as its own ordered request prevents either clock
+        // from advancing between the recovery decision and the new epoch.
+        for control in recovery_control_order(started) {
+            match control {
+                RecoveryControl::Pause => client.pause(video_track)?,
+                RecoveryControl::Flush => client.flush(video_track, *epoch)?,
+            }
+        }
+    } else {
+        *epoch = (*epoch).max(recovery.minimum_epoch);
+    }
+    Ok(())
 }
 
 fn take_video_recovery(channel: &TrackChannel) -> io::Result<Option<VideoRecovery>> {
@@ -1486,6 +1698,43 @@ mod tests {
         let progress = AudioProgress::default();
         progress.finish(true);
         assert!(progress.wait_for_prebuffer().failed);
+    }
+
+    #[test]
+    fn audio_progress_records_the_absolute_recovery_boundary() {
+        let progress = AudioProgress::default();
+        progress.observe(4_000_000, 20_000);
+        progress.observe(4_020_000, 20_000);
+
+        let state = progress.snapshot();
+        assert_eq!(state.buffered_us, 40_000);
+        assert_eq!(state.last_submitted_end_pts_us, Some(4_040_000));
+    }
+
+    #[test]
+    fn audio_completion_wait_keeps_servicing_recovery_and_ui_events() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let worker = thread::spawn(move || {
+            let (lock, changed) = &*worker_gate;
+            let released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _released = changed
+                .wait_while(released, |released| !*released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        });
+        let mut polls = 0;
+        let event = wait_for_worker_or_event(&worker, || {
+            polls += 1;
+            Ok((polls == 2).then_some(7_u64))
+        })
+        .unwrap();
+        assert_eq!(event, Some(7));
+        assert!(!worker.is_finished());
+
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_all();
+        worker.join().unwrap();
     }
 
     #[test]
