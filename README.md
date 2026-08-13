@@ -22,7 +22,9 @@ and, when safe, one bounded authenticated anchor-v3 marker.
 - Every visual input owns a stable `generic-content-v1` surface and terminal scene node.
 - PNG and JPEG normally use a live encoded-image poster track with exact dimensions, length, and
   SHA-256. A presenter cache hit needs no track connection. Unsupported encoded-image
-  configurations fall back to a complete RGBA8 raster track.
+  configurations fall back to a complete RGBA8 raster track. SVG and SVGZ inputs are rendered
+  locally with resvg and use the same RGBA8 path; relative image assets are confined to the SVG's
+  directory tree.
 - Video uses a timed primary-video track on the bulk lane. Vivi performs a complete inspection pass
   before allocation to establish canonical codec metadata, maximum access-unit size, and finite
   rate/bitrate claims.
@@ -66,6 +68,7 @@ Inside Vivido:
 
 ```bash
 vivi photo.png
+vivi drawing.svg
 vivi clip.mkv
 vivi song.mp3
 vivi -z 1.5 photo.webp clip.mp4

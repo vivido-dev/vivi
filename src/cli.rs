@@ -12,7 +12,7 @@ use clap::Parser;
                   deterministic wire fixtures without a presenter."
 )]
 pub struct Config {
-    /// Image, video, MP3, M4A, or WAV files to display or play.
+    /// Image (including SVG), video, MP3, M4A, or WAV files to display or play.
     #[arg(required = true)]
     pub files: Vec<PathBuf>,
 
