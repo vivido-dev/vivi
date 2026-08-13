@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "crossterm",
  "getrandom 0.4.3",
