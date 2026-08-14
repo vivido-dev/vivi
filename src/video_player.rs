@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -159,8 +160,22 @@ struct AudioOutcome {
 struct PresenterAudio {
     track: Track,
     channel: Arc<TrackChannel>,
+    packet_ids: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
     progress: Arc<AudioProgress>,
     worker: thread::JoinHandle<AudioOutcome>,
+}
+
+struct DrainedPresenterAudio {
+    track: Track,
+    packet_ids: Arc<AtomicU64>,
+}
+
+struct AudioStreamState<'a> {
+    packet_ids: &'a AtomicU64,
+    stop: &'a AtomicBool,
+    progress: &'a AudioProgress,
+    recovery: &'a AudioRecoveryTarget,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,13 +193,17 @@ enum AudioWaitEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryControl {
     Pause,
+    Advance,
     Flush,
+    Open,
 }
 
 fn recovery_control_order(started: bool) -> impl Iterator<Item = RecoveryControl> {
     [
         started.then_some(RecoveryControl::Pause),
+        Some(RecoveryControl::Advance),
         Some(RecoveryControl::Flush),
+        Some(RecoveryControl::Open),
     ]
     .into_iter()
     .flatten()
@@ -255,6 +274,7 @@ pub fn play(
 
     let remote = std::env::var_os("VIVID_REMOTE").is_some();
     let audio_recovery = Arc::new(AudioRecoveryTarget::default());
+    let mut volume_percent = 100_u32;
     let mut presenter_audio = create_presenter_audio(
         client,
         &surface,
@@ -303,7 +323,6 @@ pub fn play(
     let mut playback_base_us = 0_u64;
     let mut playback_started_at: Option<Instant> = None;
     let mut play_start_override = None;
-    let mut volume_percent = 100_u32;
     'playback: loop {
         let packets_before_generation = packet_id;
         while let Some(media) = demuxer.next_media_packet()? {
@@ -420,47 +439,35 @@ pub fn play(
                     let target = target.min(info.duration_us.unwrap_or(u64::MAX));
                     let target_pts = timeline_origin_us
                         .saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
-                    video_channel.close()?;
                     if started {
                         client.pause(&video_track)?;
                     }
                     epoch = epoch
                         .checked_add(1)
                         .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
-                    client.flush(&video_track, epoch)?;
-                    client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
-                    video_channel = Arc::new(client.open_track_channel(&video_track)?);
+                    replace_video_channel(
+                        client,
+                        &video_track,
+                        &mut video_channel,
+                        epoch,
+                        false,
+                        1,
+                    )?;
                     demuxer.seek_to_us(target_pts)?;
                     if presenter_audio.is_some() {
-                        // Retire the slot while the old track is still live. Destroying an active
-                        // track also vacates its slot, but that presenter-side revision change is
-                        // not reflected in the SDK surface handle and makes the replacement
-                        // activation look stale.
+                        // Retire the slot before advancing the retained audio track generation.
                         clear_audio_slot(client, &surface)?;
                     }
-                    if let Some(audio) = presenter_audio.take() {
-                        let old_track = audio.track.clone();
-                        let _ = audio.channel.close();
-                        drop(audio.worker);
-                        let _ = client.destroy_track(&old_track, &RequestMetadata::default());
-                    }
                     let _ = audio_recovery.take();
-                    presenter_audio = create_presenter_audio(
-                        client,
-                        &surface,
-                        path,
-                        info.audio.as_ref(),
-                        audio_recovery.clone(),
-                        Some(target_pts),
-                    )?;
-                    if let Some(audio) = presenter_audio.as_ref()
-                        && client.supports(vivid_protocol::registry::AUDIO_GAIN)
-                    {
-                        client.set_audio_gain(
-                            &audio.track,
-                            vivid_sdk::AudioGain::from_percent(volume_percent)
-                                .expect("clamped volume is valid"),
-                        )?;
+                    if let Some(audio) = presenter_audio.take() {
+                        presenter_audio = restart_presenter_audio(
+                            client,
+                            path,
+                            audio_recovery.clone(),
+                            audio,
+                            target_pts,
+                            epoch,
+                        );
                     }
                     local_audio = None;
                     awaiting_keyframe = true;
@@ -481,7 +488,14 @@ pub fn play(
             if let Some(recovery) = take_video_recovery(&video_channel)? {
                 awaiting_keyframe = true;
                 recovery_rebase_pending = started;
-                apply_video_recovery(client, &video_track, recovery, &mut epoch, started)?;
+                apply_video_recovery(
+                    client,
+                    &video_track,
+                    &mut video_channel,
+                    recovery,
+                    &mut epoch,
+                    started,
+                )?;
             }
             if packet.data.is_empty() || (awaiting_keyframe && !packet.key) {
                 continue;
@@ -571,11 +585,10 @@ pub fn play(
                     video_track.id()
                 ));
                 client.query_track(&video_track)?;
-                client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
-                video_channel = Arc::new(client.open_track_channel(&video_track)?);
                 epoch = epoch
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
+                replace_video_channel(client, &video_track, &mut video_channel, epoch, started, 3)?;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = started;
                 continue;
@@ -723,7 +736,14 @@ pub fn play(
                     .and_then(|audio| audio.progress.snapshot().last_submitted_end_pts_us)
                     .or(first_pts)
                     .unwrap_or(timeline_origin_us);
-                apply_video_recovery(client, &video_track, recovery, &mut epoch, started)?;
+                apply_video_recovery(
+                    client,
+                    &video_track,
+                    &mut video_channel,
+                    recovery,
+                    &mut epoch,
+                    started,
+                )?;
                 demuxer.seek_to_us(resume_pts_us)?;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = started;
@@ -740,39 +760,23 @@ pub fn play(
                 let target = target.min(info.duration_us.unwrap_or(u64::MAX));
                 let target_pts =
                     timeline_origin_us.saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
-                video_channel.close()?;
                 client.pause(&video_track)?;
                 epoch = epoch
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
-                client.flush(&video_track, epoch)?;
-                client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
-                video_channel = Arc::new(client.open_track_channel(&video_track)?);
+                replace_video_channel(client, &video_track, &mut video_channel, epoch, false, 1)?;
                 demuxer.seek_to_us(target_pts)?;
                 clear_audio_slot(client, &surface)?;
-                if let Some(audio) = presenter_audio.take() {
-                    let old_track = audio.track.clone();
-                    let _ = audio.channel.close();
-                    drop(audio.worker);
-                    let _ = client.destroy_track(&old_track, &RequestMetadata::default());
-                }
                 let _ = audio_recovery.take();
-                presenter_audio = create_presenter_audio(
-                    client,
-                    &surface,
-                    path,
-                    info.audio.as_ref(),
-                    audio_recovery.clone(),
-                    Some(target_pts),
-                )?;
-                if let Some(audio) = presenter_audio.as_ref()
-                    && client.supports(vivid_protocol::registry::AUDIO_GAIN)
-                {
-                    client.set_audio_gain(
-                        &audio.track,
-                        vivid_sdk::AudioGain::from_percent(volume_percent)
-                            .expect("clamped volume is valid"),
-                    )?;
+                if let Some(audio) = presenter_audio.take() {
+                    presenter_audio = restart_presenter_audio(
+                        client,
+                        path,
+                        audio_recovery.clone(),
+                        audio,
+                        target_pts,
+                        epoch,
+                    );
                 }
                 local_audio = None;
                 awaiting_keyframe = true;
@@ -800,7 +804,10 @@ pub fn play(
             match audio.worker.join() {
                 Ok(outcome) if outcome.error.is_none() => {
                     outcome.channel.eos()?;
-                    audio_to_drain = Some(audio.track);
+                    audio_to_drain = Some(DrainedPresenterAudio {
+                        track: audio.track,
+                        packet_ids: audio.packet_ids,
+                    });
                     client.verbose(format_args!(
                         "audio track completed after {} packets",
                         outcome.packet_id
@@ -827,8 +834,8 @@ pub fn play(
         }
         video_channel.eos()?;
         if ui.is_none()
-            && let Some(audio_track) = audio_to_drain.as_ref()
-            && let Err(error) = client.drain(audio_track)
+            && let Some(audio) = audio_to_drain.as_ref()
+            && let Err(error) = client.drain(&audio.track)
         {
             client.verbose(format_args!("presenter audio drain failed: {error}"));
         }
@@ -842,7 +849,7 @@ pub fn play(
         let outcome = wait_for_playback_end(
             client,
             &video_track,
-            audio_to_drain.as_ref(),
+            audio_to_drain.as_ref().map(|audio| &audio.track),
             ui.as_ref(),
             &mut volume_percent,
             playback_base_us,
@@ -859,9 +866,9 @@ pub fn play(
         )?;
         match outcome {
             WaitOutcome::Ended => {
-                if let Some(audio_track) = audio_to_drain.as_ref()
+                if let Some(audio) = audio_to_drain.as_ref()
                     && ui.is_some()
-                    && let Err(error) = client.drain(audio_track)
+                    && let Err(error) = client.drain(&audio.track)
                 {
                     client.verbose(format_args!("presenter audio drain failed: {error}"));
                 }
@@ -879,13 +886,12 @@ pub fn play(
                 break 'playback;
             }
             WaitOutcome::Seek(target) => {
-                if let Some(audio_track) = audio_to_drain.as_ref() {
-                    // Keep the producer's surface revision synchronized before removing the
-                    // currently bound track. This is also required when seeking from the
-                    // buffered-completion wait after demuxer EOS.
+                let retained_audio_track = if audio_to_drain.is_some() {
                     clear_audio_slot(client, &surface)?;
-                    let _ = client.destroy_track(audio_track, &RequestMetadata::default());
-                }
+                    audio_to_drain.take()
+                } else {
+                    None
+                };
                 let target = target.min(info.duration_us.unwrap_or(u64::MAX));
                 let target_pts =
                     timeline_origin_us.saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
@@ -893,28 +899,29 @@ pub fn play(
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
                 client.pause(&video_track)?;
-                client.flush(&video_track, epoch)?;
-                client.advance_channel(&video_track, 1, &RequestMetadata::default())?;
-                video_channel = Arc::new(client.open_track_channel(&video_track)?);
+                replace_video_channel(client, &video_track, &mut video_channel, epoch, false, 1)?;
                 demuxer.seek_to_us(target_pts)?;
                 let _ = audio_recovery.take();
-                presenter_audio = create_presenter_audio(
-                    client,
-                    &surface,
-                    path,
-                    info.audio.as_ref(),
-                    audio_recovery.clone(),
-                    Some(target_pts),
-                )?;
-                if let Some(audio) = presenter_audio.as_ref()
-                    && client.supports(vivid_protocol::registry::AUDIO_GAIN)
-                {
-                    client.set_audio_gain(
-                        &audio.track,
-                        vivid_sdk::AudioGain::from_percent(volume_percent)
-                            .expect("clamped volume is valid"),
-                    )?;
-                }
+                presenter_audio = retained_audio_track.and_then(|audio| {
+                    match restart_presenter_audio_track(
+                        client,
+                        path,
+                        audio_recovery.clone(),
+                        audio.track.clone(),
+                        audio.packet_ids.clone(),
+                        target_pts,
+                        epoch,
+                    ) {
+                        Ok(audio) => Some(audio),
+                        Err(error) => {
+                            client.verbose(format_args!(
+                                "presenter audio track {} could not advance for seek ({error}); continuing with video",
+                                audio.track.id()
+                            ));
+                            None
+                        }
+                    }
+                });
                 local_audio = None;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = false;
@@ -1136,17 +1143,45 @@ fn create_presenter_audio(
             return Ok(None);
         }
     };
+    Ok(Some(spawn_presenter_audio(
+        track,
+        channel,
+        Arc::new(AtomicU64::new(0)),
+        path,
+        recovery,
+        start_pts_us,
+        1,
+    )))
+}
+
+fn spawn_presenter_audio(
+    track: Track,
+    channel: Arc<TrackChannel>,
+    packet_ids: Arc<AtomicU64>,
+    path: &Path,
+    recovery: Arc<AudioRecoveryTarget>,
+    start_pts_us: Option<i64>,
+    epoch: u32,
+) -> PresenterAudio {
     let progress = Arc::new(AudioProgress::default());
+    let stop = Arc::new(AtomicBool::new(false));
     let worker_progress = progress.clone();
     let worker_channel = channel.clone();
+    let worker_packet_ids = packet_ids.clone();
+    let worker_stop = stop.clone();
     let path = path.to_path_buf();
     let worker = thread::spawn(move || {
         let result = stream_audio(
             &path,
             &worker_channel,
-            &worker_progress,
-            &recovery,
+            AudioStreamState {
+                packet_ids: &worker_packet_ids,
+                stop: &worker_stop,
+                progress: &worker_progress,
+                recovery: &recovery,
+            },
             start_pts_us,
+            epoch,
         );
         worker_progress.finish(result.is_err());
         match result {
@@ -1157,33 +1192,135 @@ fn create_presenter_audio(
             },
             Err(error) => AudioOutcome {
                 channel: worker_channel,
-                packet_id: 0,
+                packet_id: worker_packet_ids.load(Ordering::Relaxed),
                 error: Some(error),
             },
         }
     });
-    Ok(Some(PresenterAudio {
+    PresenterAudio {
         track,
         channel,
+        packet_ids,
+        stop,
         progress,
         worker,
-    }))
+    }
+}
+
+fn restart_presenter_audio(
+    client: &mut VividClient,
+    path: &Path,
+    recovery: Arc<AudioRecoveryTarget>,
+    audio: PresenterAudio,
+    start_pts_us: i64,
+    epoch: u32,
+) -> Option<PresenterAudio> {
+    let PresenterAudio {
+        track,
+        channel,
+        packet_ids,
+        stop,
+        progress: _,
+        worker,
+    } = audio;
+
+    // There must be exactly one audio producer at a time. Merely dropping the old JoinHandle
+    // detached it, so rapid seeks accumulated workers that raced records from retired channel
+    // generations against the replacement. Advance while the old transport is still owned, which
+    // makes any in-flight record stale without losing the track, then wake and join that worker
+    // before FLUSH/OPEN starts the next generation.
+    stop.store(true, Ordering::Release);
+    let advanced = client.advance_channel(&track, 1, &RequestMetadata::default());
+    let _ = channel.close();
+    let worker_result = worker.join();
+    drop(channel);
+
+    if worker_result.is_err() {
+        client.verbose(format_args!(
+            "presenter audio track {} worker panicked while retiring for seek",
+            track.id()
+        ));
+    }
+    let result = advanced.and_then(|_| {
+        open_advanced_presenter_audio_channel(client, &track, epoch).map(|channel| {
+            spawn_presenter_audio(
+                track.clone(),
+                channel,
+                packet_ids,
+                path,
+                recovery,
+                Some(start_pts_us),
+                epoch,
+            )
+        })
+    });
+    match result {
+        Ok(audio) => Some(audio),
+        Err(error) => {
+            client.verbose(format_args!(
+                "presenter audio track {} could not advance for seek ({error}); continuing with video",
+                track.id()
+            ));
+            None
+        }
+    }
+}
+
+fn restart_presenter_audio_track(
+    client: &mut VividClient,
+    path: &Path,
+    recovery: Arc<AudioRecoveryTarget>,
+    track: Track,
+    packet_ids: Arc<AtomicU64>,
+    start_pts_us: i64,
+    epoch: u32,
+) -> io::Result<PresenterAudio> {
+    let channel = advance_presenter_audio_channel(client, &track, epoch)?;
+    Ok(spawn_presenter_audio(
+        track,
+        channel,
+        packet_ids,
+        path,
+        recovery,
+        Some(start_pts_us),
+        epoch,
+    ))
+}
+
+fn advance_presenter_audio_channel(
+    client: &mut vivid_sdk::Session,
+    track: &Track,
+    epoch: u32,
+) -> io::Result<Arc<TrackChannel>> {
+    client.advance_channel(track, 1, &RequestMetadata::default())?;
+    open_advanced_presenter_audio_channel(client, track, epoch)
+}
+
+fn open_advanced_presenter_audio_channel(
+    client: &mut vivid_sdk::Session,
+    track: &Track,
+    epoch: u32,
+) -> io::Result<Arc<TrackChannel>> {
+    client.flush(track, epoch)?;
+    client.open_track_channel(track).map(Arc::new)
 }
 
 fn stream_audio(
     path: &Path,
     channel: &TrackChannel,
-    progress: &AudioProgress,
-    recovery: &AudioRecoveryTarget,
+    state: AudioStreamState<'_>,
     start_pts_us: Option<i64>,
+    epoch: u32,
 ) -> io::Result<u64> {
     let mut demuxer = AudioDemuxer::open(path)?;
     if let Some(start_pts_us) = start_pts_us {
         demuxer.seek_to_us(start_pts_us)?;
     }
-    let mut packet_id = 0_u64;
     let mut recovery_target = None;
-    while let Some(packet) = demuxer.next_packet()? {
+    while !state.stop.load(Ordering::Acquire) {
+        let Some(packet) = demuxer.next_packet()? else {
+            break;
+        };
         if start_pts_us.is_some_and(|start| {
             packet
                 .pts_us
@@ -1192,18 +1329,19 @@ fn stream_audio(
         }) {
             continue;
         }
-        merge_recovery_target(&mut recovery_target, recovery.take());
+        merge_recovery_target(&mut recovery_target, state.recovery.take());
         if !audio_packet_reaches_recovery_target(&mut recovery_target, packet.pts_us) {
             continue;
         }
         if packet.data.is_empty() {
             continue;
         }
-        packet_id = packet_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("audio packet ID space exhausted"))?;
+        if state.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let packet_id = next_audio_packet_id(state.packet_ids)?;
         channel.send_audio(AudioPacket {
-            epoch: 1,
+            epoch,
             packet_id,
             pts_us: packet.pts_us,
             dts_us: packet.dts_us,
@@ -1212,12 +1350,28 @@ fn stream_audio(
             trim_end_samples: packet.trim_end_samples,
             data: &packet.data,
         })?;
-        progress.observe(packet.pts_us, packet.duration_us);
+        state.progress.observe(packet.pts_us, packet.duration_us);
     }
-    Ok(packet_id)
+    Ok(state.packet_ids.load(Ordering::Relaxed))
 }
 
-#[allow(clippy::too_many_arguments)]
+fn next_audio_packet_id(packet_ids: &AtomicU64) -> io::Result<u64> {
+    packet_ids
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            last.checked_add(1)
+        })
+        .map(|last| last + 1)
+        .map_err(|_| io::Error::other("audio packet ID space exhausted"))
+}
+
+fn destroyed_audio_track(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+}
+
+fn unavailable_audio_lifecycle(lifecycle: u64) -> bool {
+    matches!(lifecycle, 6 | 7)
+}
+
 fn activate_and_play(
     config: &Config,
     client: &mut VividClient,
@@ -1248,8 +1402,11 @@ fn activate_and_play(
             timeout_us(AUDIO_START_TIMEOUT),
         )
     {
-        let status = client.query_track(audio)?;
-        if status.lifecycle == 6 || presenter_code(&wait_error) == Some(ERROR_TIMEOUT) {
+        let audio_lost = destroyed_audio_track(&wait_error)
+            || client
+                .query_track(audio)
+                .is_ok_and(|status| unavailable_audio_lifecycle(status.lifecycle));
+        if audio_lost || presenter_code(&wait_error) == Some(ERROR_TIMEOUT) {
             client.verbose(format_args!(
                 "presenter audio track {} was not ready before activation ({wait_error}); continuing with video",
                 audio.id()
@@ -1272,10 +1429,11 @@ fn activate_and_play(
         client.activate_tracks(surface, &bindings, &RequestMetadata::default())
     {
         let video_status = client.query_track(video)?;
-        let audio_lost = if let Some(audio) = audio {
-            client
-                .query_track(audio)
-                .is_ok_and(|status| status.lifecycle == 6)
+        let audio_lost = if audio_active && let Some(audio) = audio {
+            destroyed_audio_track(&activation_error)
+                || client
+                    .query_track(audio)
+                    .is_ok_and(|status| unavailable_audio_lifecycle(status.lifecycle))
         } else {
             false
         };
@@ -1300,10 +1458,37 @@ fn activate_and_play(
     } else {
         video
     };
-    client.play(clock, start_pts_us, minimum_buffer_us, MAXIMUM_LATENCY_US)?;
+    if let Err(play_error) = client.play(clock, start_pts_us, minimum_buffer_us, MAXIMUM_LATENCY_US)
+    {
+        let audio_lost = audio_active
+            && audio.is_some_and(|audio| {
+                destroyed_audio_track(&play_error)
+                    || client
+                        .query_track(audio)
+                        .is_ok_and(|status| unavailable_audio_lifecycle(status.lifecycle))
+            });
+        if !audio_lost {
+            return Err(play_error);
+        }
+        let audio = audio.expect("lost presenter audio track exists");
+        client.verbose(format_args!(
+            "presenter audio track {} was lost before PLAY ({play_error}); retrying video alone",
+            audio.id()
+        ));
+        audio_active = false;
+        bindings.truncate(1);
+        bindings.push(SlotBinding {
+            slot: SLOT_AUDIO,
+            track_id: 0,
+            expected_channel_generation: ChannelGeneration::ZERO,
+            required_milestone: 0,
+        });
+        client.activate_tracks(surface, &bindings, &RequestMetadata::default())?;
+        client.play(video, start_pts_us, minimum_buffer_us, MAXIMUM_LATENCY_US)?;
+    }
     if !config.no_wait {
         client.wait_track(
-            clock,
+            video,
             TrackWaitCondition::PlaybackStarted,
             None,
             timeout_us(PLAYBACK_START_TIMEOUT),
@@ -1360,17 +1545,20 @@ fn cancel_presenter_audio(client: &mut VividClient, presenter_audio: &mut Option
     let Some(audio) = presenter_audio.take() else {
         return;
     };
+    audio.stop.store(true, Ordering::Release);
     let _ = audio.channel.close();
+    if audio.worker.join().is_err() {
+        client.verbose(format_args!(
+            "presenter audio track {} worker panicked while stopping",
+            audio.track.id()
+        ));
+    }
     if let Err(error) = client.destroy_track(&audio.track, &RequestMetadata::default()) {
         client.verbose(format_args!(
             "could not destroy unusable presenter audio track {}: {error}",
             audio.track.id()
         ));
     }
-    // Dropping a JoinHandle detaches the worker. The channel and track cancellation above wake
-    // ordinary flow waits; detaching also guarantees a transport write that is already inside the
-    // operating system cannot hold video startup hostage.
-    drop(audio.worker);
 }
 
 fn finish_send_while_observing_start<T, F>(
@@ -1425,8 +1613,9 @@ where
 }
 
 fn apply_video_recovery(
-    client: &mut VividClient,
+    client: &mut vivid_sdk::Session,
     video_track: &Track,
+    video_channel: &mut Arc<TrackChannel>,
     recovery: VideoRecovery,
     epoch: &mut u32,
     started: bool,
@@ -1436,18 +1625,42 @@ fn apply_video_recovery(
             .checked_add(1)
             .ok_or_else(|| io::Error::other("video epoch exhausted"))?
             .max(recovery.minimum_epoch);
-        // Freeze the linked playback group explicitly before replacing decoder state. FLUSH also
-        // leaves it paused, but keeping PAUSE as its own ordered request prevents either clock
-        // from advancing between the recovery decision and the new epoch.
-        for control in recovery_control_order(started) {
-            match control {
-                RecoveryControl::Pause => client.pause(video_track)?,
-                RecoveryControl::Flush => client.flush(video_track, *epoch)?,
-            }
-        }
+        replace_video_channel(client, video_track, video_channel, *epoch, started, 3)?;
     } else {
         *epoch = (*epoch).max(recovery.minimum_epoch);
     }
+    Ok(())
+}
+
+fn replace_video_channel(
+    client: &mut vivid_sdk::Session,
+    video_track: &Track,
+    video_channel: &mut Arc<TrackChannel>,
+    epoch: u32,
+    started: bool,
+    reason: u64,
+) -> io::Result<()> {
+    let mut replacement = None;
+    for control in recovery_control_order(started) {
+        match control {
+            // Control and media use independent transports. Advancing first scopes every queued
+            // old-epoch record to the retired generation; flushing the current generation first
+            // lets such a record close that current channel and lose the whole track.
+            RecoveryControl::Pause => client.pause(video_track)?,
+            RecoveryControl::Advance => {
+                client.advance_channel(video_track, reason, &RequestMetadata::default())?;
+                let _ = video_channel.close();
+            }
+            RecoveryControl::Flush => client.flush(video_track, epoch)?,
+            RecoveryControl::Open => {
+                replacement = Some(Arc::new(client.open_track_channel(video_track)?));
+            }
+        }
+    }
+    let replacement = replacement
+        .ok_or_else(|| io::Error::other("video recovery did not open a replacement channel"))?;
+    let retired = std::mem::replace(video_channel, replacement);
+    drop(retired);
     Ok(())
 }
 
@@ -1666,14 +1879,23 @@ mod tests {
     }
 
     #[test]
-    fn decoder_recovery_pauses_before_flush_once_playback_started() {
+    fn decoder_recovery_advances_before_flushing_and_opening() {
         assert_eq!(
             recovery_control_order(true).collect::<Vec<_>>(),
-            vec![RecoveryControl::Pause, RecoveryControl::Flush]
+            vec![
+                RecoveryControl::Pause,
+                RecoveryControl::Advance,
+                RecoveryControl::Flush,
+                RecoveryControl::Open,
+            ]
         );
         assert_eq!(
             recovery_control_order(false).collect::<Vec<_>>(),
-            vec![RecoveryControl::Flush]
+            vec![
+                RecoveryControl::Advance,
+                RecoveryControl::Flush,
+                RecoveryControl::Open,
+            ]
         );
     }
 
@@ -1709,6 +1931,219 @@ mod tests {
         let state = progress.snapshot();
         assert_eq!(state.buffered_us, 40_000);
         assert_eq!(state.last_submitted_end_pts_us, Some(4_040_000));
+    }
+
+    #[test]
+    fn repeated_seeks_preserve_audio_gain_and_advance_before_flush() {
+        use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
+
+        let presenter = TestPresenter::start(80, 24).unwrap();
+        let mut producer = vivid_sdk::ProducerConfig {
+            endpoint_control: Some(presenter.endpoint().to_owned()),
+            endpoint_realtime: Some(presenter.endpoint().to_owned()),
+            endpoint_bulk: Some(presenter.endpoint().to_owned()),
+            authentication: vivid_sdk::ProducerAuthentication::root_hex(ROOT_SECRET_HEX).unwrap(),
+            ..Default::default()
+        };
+        producer
+            .optional_profiles
+            .push(vivid_protocol::registry::AUDIO_GAIN.into());
+        producer.optional_profiles.sort();
+        let mut session = vivid_sdk::Session::connect(producer).unwrap();
+        let surface = session
+            .create_surface(
+                video_surface(
+                    session.info().root_context_id,
+                    41,
+                    Path::new("seek-test.webm"),
+                    1,
+                    1,
+                ),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut opus_head = b"OpusHead".to_vec();
+        opus_head.extend_from_slice(&[1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]);
+        let maximum_record_body = vivid_protocol::media::audio_body_len(4_096).unwrap();
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id: surface.context_id(),
+                    surface_id: surface.id(),
+                    track_id: 42,
+                    slot: SLOT_AUDIO,
+                    mode: TrackMode::Timed,
+                    lane: LaneClass::Realtime,
+                    maximum_record_body,
+                    maximum_rate_millihertz: 50_000,
+                    maximum_encoded_bits_per_second: 512_000,
+                    maximum_records_per_second: 50,
+                    maximum_inflight_body_bytes: u64::from(maximum_record_body) * 4,
+                    kind: KindConfiguration::Audio(vivid_sdk::AudioConfiguration {
+                        codec: "opus".into(),
+                        packetization: vivid_protocol::media::AUDIO_PACKETIZATION_OPUS.into(),
+                        extradata: opus_head,
+                        sample_rate: 48_000,
+                        channels: 2,
+                        channel_mask: 3,
+                        maximum_access_unit_bytes: 4_096,
+                        codec_string: Some("opus".into()),
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: MAXIMUM_LATENCY_US,
+                    retained_pixel_charge: 0,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut channel = Arc::new(session.open_track_channel(&track).unwrap());
+        let packet_ids = AtomicU64::new(0);
+        session
+            .set_audio_gain(&track, vivid_sdk::AudioGain::from_percent(35).unwrap())
+            .unwrap();
+        channel
+            .send_audio(AudioPacket {
+                epoch: 1,
+                packet_id: next_audio_packet_id(&packet_ids).unwrap(),
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 20_000,
+                trim_start_samples: 0,
+                trim_end_samples: 0,
+                data: &[0],
+            })
+            .unwrap();
+
+        for epoch in 2..=7 {
+            let replacement = advance_presenter_audio_channel(&mut session, &track, epoch).unwrap();
+            let retired = std::mem::replace(&mut channel, replacement);
+            retired.close().unwrap();
+            drop(retired);
+            channel
+                .send_audio(AudioPacket {
+                    epoch,
+                    packet_id: next_audio_packet_id(&packet_ids).unwrap(),
+                    pts_us: i64::from(epoch) * 20_000,
+                    dts_us: i64::from(epoch) * 20_000,
+                    duration_us: 20_000,
+                    trim_start_samples: 0,
+                    trim_end_samples: 0,
+                    data: &[0],
+                })
+                .unwrap();
+        }
+
+        assert_eq!(track.id(), 42);
+        assert_eq!(track.channel_generation(), ChannelGeneration::new(7));
+        assert_eq!(packet_ids.load(Ordering::Relaxed), 7);
+
+        let maximum_video_body = vivid_protocol::media::video_body_len(16).unwrap();
+        let video = session
+            .create_track(
+                TrackConfiguration {
+                    context_id: surface.context_id(),
+                    surface_id: surface.id(),
+                    track_id: 43,
+                    slot: SLOT_VIDEO,
+                    mode: TrackMode::Timed,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: maximum_video_body,
+                    maximum_rate_millihertz: 30_000,
+                    maximum_encoded_bits_per_second: 1_000_000,
+                    maximum_records_per_second: 30,
+                    maximum_inflight_body_bytes: u64::from(maximum_video_body) * 2,
+                    kind: KindConfiguration::Video(VideoConfiguration {
+                        codec: "av1".into(),
+                        packetization: "av1-low-overhead-tu-v1".into(),
+                        extradata: vec![],
+                        coded_width: 1,
+                        coded_height: 1,
+                        profile: 0,
+                        level: 0,
+                        maximum_reorder_depth: 1,
+                        color_primaries: 1,
+                        transfer: 1,
+                        matrix: 0,
+                        signal_range: 1,
+                        aspect_numerator: 1,
+                        aspect_denominator: 1,
+                        maximum_access_unit_bytes: 16,
+                        codec_string: None,
+                        decoder_configuration: None,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: MAXIMUM_LATENCY_US,
+                    retained_pixel_charge: 1,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut video_channel = Arc::new(session.open_track_channel(&video).unwrap());
+        replace_video_channel(&mut session, &video, &mut video_channel, 2, false, 1).unwrap();
+
+        let observed = presenter.observed();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|request| {
+                    request.object_id == track.id()
+                        && request.record_type == vivid_protocol::messages::CREATE_TRACK
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|request| {
+                    request.object_id == track.id()
+                        && request.record_type == vivid_protocol::messages::ADVANCE_CHANNEL
+                })
+                .count(),
+            6
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|request| {
+                    request.object_id == track.id()
+                        && request.record_type == vivid_protocol::messages::SET_AUDIO_GAIN
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|request| {
+                    request.object_id == video.id()
+                        && matches!(
+                            request.record_type,
+                            vivid_protocol::messages::ADVANCE_CHANNEL
+                                | vivid_protocol::messages::FLUSH
+                        )
+                })
+                .map(|request| request.record_type)
+                .collect::<Vec<_>>(),
+            vec![
+                vivid_protocol::messages::ADVANCE_CHANNEL,
+                vivid_protocol::messages::FLUSH,
+            ]
+        );
+        assert!(presenter.destroys().is_empty());
+        drop(video_channel);
+        drop(channel);
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn destroyed_replacement_audio_is_treated_as_optional_track_loss() {
+        let destroyed = io::Error::new(io::ErrorKind::NotFound, "track is destroyed");
+        assert!(destroyed_audio_track(&destroyed));
+        assert!(!destroyed_audio_track(&io::Error::other("control failed")));
+        assert!(unavailable_audio_lifecycle(6));
+        assert!(unavailable_audio_lifecycle(7));
+        assert!(!unavailable_audio_lifecycle(1));
     }
 
     #[test]

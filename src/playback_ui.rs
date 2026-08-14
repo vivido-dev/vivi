@@ -184,6 +184,7 @@ fn input_loop(
     title: Option<String>,
 ) {
     let mut input = InputState::default();
+    let mut drawn_position_second = 0;
     while running.load(Ordering::SeqCst) {
         match event::poll(EVENT_POLL_INTERVAL) {
             Ok(true) => match event::read() {
@@ -223,7 +224,23 @@ fn input_loop(
             Ok(false) => {}
             Err(_) => break,
         }
+        let current_us = status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current_us;
+        if displayed_second_changed(current_us, &mut drawn_position_second) {
+            let _ = draw(&status, title.as_deref());
+        }
     }
+}
+
+fn displayed_second_changed(current_us: u64, drawn_second: &mut u64) -> bool {
+    let current_second = current_us / 1_000_000;
+    if current_second == *drawn_second {
+        return false;
+    }
+    *drawn_second = current_second;
+    true
 }
 
 fn handle_key(key: KeyEvent, state: &mut InputState) -> (Option<Command>, Option<String>, bool) {
@@ -423,6 +440,15 @@ mod tests {
         assert_eq!(parse_timestamp_us("1:30"), Some(90_000_000));
         assert_eq!(parse_timestamp_us("1:01:30"), Some(3_690_000_000));
         assert_eq!(parse_timestamp_us("1:90"), None);
+    }
+
+    #[test]
+    fn position_redraws_once_per_displayed_second_in_either_direction() {
+        let mut drawn_second = 0;
+        assert!(!displayed_second_changed(999_999, &mut drawn_second));
+        assert!(displayed_second_changed(1_000_000, &mut drawn_second));
+        assert!(!displayed_second_changed(1_999_999, &mut drawn_second));
+        assert!(displayed_second_changed(500_000, &mut drawn_second));
     }
 
     #[test]

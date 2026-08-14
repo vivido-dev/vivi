@@ -20,6 +20,9 @@ sha2 = "0.11"
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 
+[dev-dependencies]
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["testing"] }
+
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 cpal = "0.18"
 ringbuf = "0.5"
