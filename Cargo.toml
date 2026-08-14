@@ -19,6 +19,7 @@ resvg = "0.48"
 sha2 = "0.11"
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vvreceive = { version = "0.1", path = "../vvreceive" }
 
 [dev-dependencies]
 vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["testing"] }

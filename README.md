@@ -84,6 +84,11 @@ timestamp prompt, and `q` or Ctrl-C stops the current file. Images always remain
 For remote use, run `vvssh`; see [Remote Linux audio](docs/ssh-linux-audio.md). A separate media
 transport may provide `VIVID_ENDPOINT_BULK`; realtime audio inherits the protocol fallback chain.
 
+Installing Vivi also installs the small Linux `vvreceive` companion. A current `vvssh` starts it
+quietly before the login shell so a confirmed local file drop can be copied into that shell's
+current directory. Older remote installations keep the existing filename-paste behavior; pass
+`vvssh --no-receive-drops` to suppress helper startup explicitly.
+
 Generate protocol fixtures without a presenter:
 
 ```bash
