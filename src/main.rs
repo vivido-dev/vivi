@@ -42,7 +42,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = VividClient::connect(&config)?;
     for file in &config.files {
         let result = match media_hint(file) {
-            MediaHint::Video => video_player::play(&config, &mut client, file),
+            MediaHint::Video => {
+                match video_player::play(&config, &mut client, file) {
+                    Ok(()) => Ok(()),
+                    Err(error) if is_no_video_stream(error.as_ref()) => {
+                        client.verbose(format_args!(
+                            "{} has no video stream; playing audio only",
+                            file.display()
+                        ));
+                        play_audio(&config, &mut client, file)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             MediaHint::Audio => play_audio(&config, &mut client, file),
             MediaHint::Unknown => match image_viewer::view(&config, &mut client, file) {
                 Ok(()) => Ok(()),
@@ -132,6 +144,16 @@ fn looks_like_audio(path: &Path) -> bool {
     )
 }
 
+/// Whether `error` is the typed no-video-stream sentinel from `VideoDemuxer`, meaning the file
+/// may still be playable as audio-only.
+fn is_no_video_stream(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(|io_error| io_error.get_ref())
+        .and_then(|cause| cause.downcast_ref::<crate::ffmpeg::NoVideoStream>())
+        .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +178,25 @@ mod tests {
         assert_eq!(media_hint(Path::new("clip.mp4")), MediaHint::Video);
         assert_eq!(media_hint(Path::new("song.m4a")), MediaHint::Audio);
         assert_eq!(media_hint(Path::new("extensionless")), MediaHint::Unknown);
+    }
+
+    #[test]
+    fn no_video_stream_sentinel_is_detected_through_boxed_errors() {
+        let boxed: Box<dyn std::error::Error> = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            crate::ffmpeg::NoVideoStream,
+        )
+        .into();
+        assert!(is_no_video_stream(boxed.as_ref()));
+
+        let ordinary: Box<dyn std::error::Error> = std::io::Error::other("decoder failure").into();
+        assert!(!is_no_video_stream(ordinary.as_ref()));
+
+        let wrapped: Box<dyn std::error::Error> = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            std::io::Error::other("media has no video stream"),
+        )
+        .into();
+        assert!(!is_no_video_stream(wrapped.as_ref()));
     }
 }

@@ -214,28 +214,18 @@ fn encoded_image_track(
     })
 }
 
-fn create_raster_track(
-    client: &mut VividClient,
+/// The immutable configuration for a full-frame RGBA raster track on `surface`.
+pub(crate) fn raster_track_configuration(
+    session: &vivid_sdk::Session,
     surface: &vivid_sdk::Surface,
     width: u32,
     height: u32,
-    rgba: &[u8],
-) -> io::Result<vivid_sdk::Track> {
+) -> io::Result<TrackConfiguration> {
     let (maximum_record_body, retained_pixel_charge) = raster_limits(width, height)?;
-    let expected_length = usize::try_from(retained_pixel_charge)
-        .ok()
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raster size overflow"))?;
-    if rgba.len() != expected_length {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "RGBA data length does not match raster dimensions",
-        ));
-    }
-    let configuration = TrackConfiguration {
+    Ok(TrackConfiguration {
         context_id: surface.context_id(),
         surface_id: surface.id(),
-        track_id: client.allocate_id()?,
+        track_id: session.allocate_id()?,
         slot: SLOT_RASTER,
         mode: TrackMode::Live,
         lane: LaneClass::Bulk,
@@ -255,7 +245,39 @@ fn create_raster_track(
         target_latency_us: 0,
         maximum_latency_us: 1_000_000,
         retained_pixel_charge,
-    };
+    })
+}
+
+/// Sends one full RGBA frame as the raster track's first (and typically only) record.
+pub(crate) fn send_full_raster_frame(
+    session: &mut vivid_sdk::Session,
+    track: &vivid_sdk::Track,
+    rgba: &[u8],
+) -> io::Result<()> {
+    session
+        .open_track_channel(track)?
+        .send_raster(1, 1, rgba, false)?;
+    Ok(())
+}
+
+fn create_raster_track(
+    client: &mut VividClient,
+    surface: &vivid_sdk::Surface,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> io::Result<vivid_sdk::Track> {
+    let expected_length = usize::try_from(u64::from(width) * u64::from(height))
+        .ok()
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raster size overflow"))?;
+    if rgba.len() != expected_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RGBA data length does not match raster dimensions",
+        ));
+    }
+    let configuration = raster_track_configuration(client, surface, width, height)?;
     if !client
         .probe_track(&probe_configuration(&configuration))?
         .supported
@@ -266,9 +288,7 @@ fn create_raster_track(
         ));
     }
     let track = client.create_track(configuration, &RequestMetadata::default())?;
-    client
-        .open_track_channel(&track)?
-        .send_raster(1, 1, rgba, false)?;
+    send_full_raster_frame(client, &track, rgba)?;
     Ok(track)
 }
 

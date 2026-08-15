@@ -1954,7 +1954,7 @@ fn video_track(
     })
 }
 
-fn display_size(
+pub(crate) fn display_size(
     width: u32,
     height: u32,
     sar_num: u32,
@@ -1978,14 +1978,17 @@ fn display_size(
     )
 }
 
-fn media_geometry(mut geometry: TerminalGeometry, full_window: bool) -> TerminalGeometry {
+pub(crate) fn media_geometry(
+    mut geometry: TerminalGeometry,
+    full_window: bool,
+) -> TerminalGeometry {
     if full_window && geometry.rows >= 2 {
         geometry.rows -= 1;
     }
     geometry
 }
 
-fn centered_origin(geometry: TerminalGeometry, columns: u32, rows: u32) -> (u32, u32) {
+pub(crate) fn centered_origin(geometry: TerminalGeometry, columns: u32, rows: u32) -> (u32, u32) {
     (
         u32::from(geometry.cols).saturating_sub(columns) / 2,
         u32::from(geometry.rows).saturating_sub(rows) / 2,

@@ -509,6 +509,37 @@ fn alignment_samples(
     samples.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
+/// Synthesizes a small in-memory PCM WAV byte vector for tests. Pure byte assembly — no
+/// platform dependency, no audio device.
+#[cfg(test)]
+pub(crate) fn pcm_wav() -> Vec<u8> {
+    let sample_rate = 8_000_u32;
+    let sample_count = 80_u32;
+    let data_bytes = sample_count * 2;
+    let mut wav = Vec::with_capacity((44 + data_bytes) as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for index in 0..sample_count {
+        let sample = if index % 2 == 0 {
+            1_000_i16
+        } else {
+            -1_000_i16
+        };
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,34 +595,5 @@ mod tests {
         })();
         let _ = fs::remove_file(&path);
         assert!(result.unwrap() > 0);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn pcm_wav() -> Vec<u8> {
-        let sample_rate = 8_000_u32;
-        let sample_count = 80_u32;
-        let data_bytes = sample_count * 2;
-        let mut wav = Vec::with_capacity((44 + data_bytes) as usize);
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
-        wav.extend_from_slice(b"WAVEfmt ");
-        wav.extend_from_slice(&16_u32.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-        wav.extend_from_slice(&2_u16.to_le_bytes());
-        wav.extend_from_slice(&16_u16.to_le_bytes());
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_bytes.to_le_bytes());
-        for index in 0..sample_count {
-            let sample = if index % 2 == 0 {
-                1_000_i16
-            } else {
-                -1_000_i16
-            };
-            wav.extend_from_slice(&sample.to_le_bytes());
-        }
-        wav
     }
 }

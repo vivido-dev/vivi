@@ -465,6 +465,19 @@ pub enum EncodedMediaPacket {
     Audio(EncodedAudioPacket),
 }
 
+/// Sentinel cause carried by `VideoDemuxer` errors for containers with no video stream, so
+/// callers can fall back to audio-only handling without matching error text.
+#[derive(Debug)]
+pub struct NoVideoStream;
+
+impl std::fmt::Display for NoVideoStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("media has no video stream")
+    }
+}
+
+impl std::error::Error for NoVideoStream {}
+
 pub struct VideoDemuxer {
     context: *mut AVFormatContext,
     packet: *mut AVPacket,
@@ -513,10 +526,7 @@ impl VideoDemuxer {
             Some(selected) => selected,
             None => {
                 unsafe { avformat_close_input(&mut context) };
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "media has no video stream",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, NoVideoStream));
             }
         };
 
@@ -2112,5 +2122,32 @@ mod tests {
         claims.observe(1_100_000, 7).unwrap();
         assert_eq!(claims.maximum_records, 2);
         assert_eq!(claims.maximum_bytes, 30);
+    }
+
+    #[test]
+    fn video_demuxer_reports_typed_no_video_stream_for_audio_only_media() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::audio_player::pcm_wav;
+
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "vivi-no-video-{}-{sequence}.wav",
+            std::process::id()
+        ));
+        fs::write(&path, pcm_wav()).unwrap();
+        let video = VideoDemuxer::inspect(&path);
+        let audio = AudioDemuxer::inspect(&path);
+        let _ = fs::remove_file(&path);
+
+        let error = video.expect_err("video inspection must fail without a video stream");
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.downcast_ref::<NoVideoStream>().is_some())
+        );
+        assert!(audio.is_ok(), "audio inspection must succeed: {audio:?}");
     }
 }
