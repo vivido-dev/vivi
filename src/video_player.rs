@@ -469,6 +469,11 @@ pub fn play(
                             epoch,
                         );
                     }
+                    // Publish the exact seek target before decoder pre-roll. The audio slot is
+                    // deliberately unbound here, so this clocks only video while the presenter
+                    // decodes references and discards every output before the target. Once both
+                    // tracks are ready, activation below issues the same PLAY to the pair.
+                    prime_video_seek(client, &video_track, target_pts)?;
                     local_audio = None;
                     awaiting_keyframe = true;
                     recovery_rebase_pending = false;
@@ -565,7 +570,11 @@ pub fn play(
                                 &video_track,
                                 &mut presenter_audio,
                                 &mut local_audio,
-                                play_start_override.unwrap_or_else(|| first_pts.unwrap_or(pts_us)),
+                                PlaybackStart {
+                                    pts_us: play_start_override
+                                        .unwrap_or_else(|| first_pts.unwrap_or(pts_us)),
+                                    prebuffer_audio: play_start_override.is_none(),
+                                },
                             )?;
                         }
                         Ok(output_ready)
@@ -617,7 +626,11 @@ pub fn play(
                     &video_track,
                     &mut presenter_audio,
                     &mut local_audio,
-                    play_start_override.unwrap_or_else(|| first_pts.unwrap_or(packet.pts_us)),
+                    PlaybackStart {
+                        pts_us: play_start_override
+                            .unwrap_or_else(|| first_pts.unwrap_or(packet.pts_us)),
+                        prebuffer_audio: play_start_override.is_none(),
+                    },
                 )?;
                 started = true;
                 playback_started_at.get_or_insert_with(Instant::now);
@@ -640,7 +653,10 @@ pub fn play(
                 &video_track,
                 &mut presenter_audio,
                 &mut local_audio,
-                play_start_override.unwrap_or_else(|| first_pts.unwrap_or(0)),
+                PlaybackStart {
+                    pts_us: play_start_override.unwrap_or_else(|| first_pts.unwrap_or(0)),
+                    prebuffer_audio: play_start_override.is_none(),
+                },
             )?;
             started = true;
             playback_started_at.get_or_insert_with(Instant::now);
@@ -778,6 +794,7 @@ pub fn play(
                         epoch,
                     );
                 }
+                prime_video_seek(client, &video_track, target_pts)?;
                 local_audio = None;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = false;
@@ -922,6 +939,7 @@ pub fn play(
                         }
                     }
                 });
+                prime_video_seek(client, &video_track, target_pts)?;
                 local_audio = None;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = false;
@@ -1497,6 +1515,19 @@ fn activate_and_play(
     Ok(audio_active)
 }
 
+fn prime_video_seek(
+    client: &mut vivid_sdk::Session,
+    video: &Track,
+    start_pts_us: i64,
+) -> io::Result<()> {
+    client.play(video, start_pts_us, 0, MAXIMUM_LATENCY_US)
+}
+
+struct PlaybackStart {
+    pts_us: i64,
+    prebuffer_audio: bool,
+}
+
 fn start_video_playback(
     config: &Config,
     client: &mut VividClient,
@@ -1504,13 +1535,24 @@ fn start_video_playback(
     video: &Track,
     presenter_audio: &mut Option<PresenterAudio>,
     local_audio: &mut Option<audio_player::AudioPlayback>,
-    start_pts_us: i64,
+    start: PlaybackStart,
 ) -> io::Result<()> {
+    let PlaybackStart {
+        pts_us: start_pts_us,
+        prebuffer_audio,
+    } = start;
     let audio_ready = presenter_audio
         .as_ref()
-        .map(|audio| audio.progress.wait_for_prebuffer())
+        .map(|audio| {
+            if prebuffer_audio {
+                audio.progress.wait_for_prebuffer()
+            } else {
+                audio.progress.snapshot()
+            }
+        })
         .filter(|state| {
-            !state.failed && (state.buffered_us >= AUDIO_PREBUFFER_US || state.finished)
+            !state.failed
+                && (!prebuffer_audio || state.buffered_us >= AUDIO_PREBUFFER_US || state.finished)
         });
     if presenter_audio.is_some() && audio_ready.is_none() {
         client.verbose(format_args!(
@@ -1525,7 +1567,13 @@ fn start_video_playback(
         video,
         presenter_audio.as_ref().map(|audio| &audio.track),
         start_pts_us,
-        audio_ready.map_or(0, |state| state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)),
+        audio_ready.map_or(0, |state| {
+            if prebuffer_audio {
+                state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)
+            } else {
+                0
+            }
+        }),
     )?;
     if !audio_active {
         cancel_presenter_audio(client, presenter_audio);
@@ -2080,6 +2128,7 @@ mod tests {
             .unwrap();
         let mut video_channel = Arc::new(session.open_track_channel(&video).unwrap());
         replace_video_channel(&mut session, &video, &mut video_channel, 2, false, 1).unwrap();
+        prime_video_seek(&mut session, &video, 7_000_000).unwrap();
 
         let observed = presenter.observed();
         assert_eq!(
@@ -2121,6 +2170,7 @@ mod tests {
                             request.record_type,
                             vivid_protocol::messages::ADVANCE_CHANNEL
                                 | vivid_protocol::messages::FLUSH
+                                | vivid_protocol::messages::PLAY
                         )
                 })
                 .map(|request| request.record_type)
@@ -2128,7 +2178,32 @@ mod tests {
             vec![
                 vivid_protocol::messages::ADVANCE_CHANNEL,
                 vivid_protocol::messages::FLUSH,
+                vivid_protocol::messages::PLAY,
             ]
+        );
+        let seek_play = observed
+            .iter()
+            .find(|request| {
+                request.object_id == video.id()
+                    && request.record_type == vivid_protocol::messages::PLAY
+            })
+            .unwrap();
+        assert_eq!(
+            seek_play
+                .payload
+                .iter()
+                .find(|(key, _)| *key == 3)
+                .and_then(|(_, value)| value.as_i64()),
+            Some(7_000_000)
+        );
+        assert_eq!(
+            seek_play
+                .payload
+                .iter()
+                .find(|(key, _)| *key == 4)
+                .and_then(|(_, value)| value.as_u64()),
+            Some(0),
+            "seeks must not reintroduce the initial 100 ms audio barrier"
         );
         assert!(presenter.destroys().is_empty());
         drop(video_channel);
