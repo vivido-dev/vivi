@@ -527,11 +527,14 @@ pub fn play(
                 .ok_or_else(|| io::Error::other("video packet ID space exhausted"))?;
             let first_pts_before_send = first_pts;
             first_pts.get_or_insert(packet.pts_us);
+            let seek_pre_roll = is_seek_pre_roll(play_start_override, packet.pts_us);
             let send_result = if started {
-                // Presented media is delivered at the rate it plays. Pre-roll — the branch below,
-                // which runs until the presenter has decoded output to start from — is the traffic
-                // that has to catch up, and is paced at the ceiling this track declared instead.
-                video_delivery.admit_record();
+                // Presented media is delivered at the rate it plays; pre-roll still is not.
+                if seek_pre_roll {
+                    video_catchup.admit_record();
+                } else {
+                    video_delivery.admit_record();
+                }
                 video_channel.send_video(VideoPacket {
                     epoch,
                     packet_id,
@@ -548,13 +551,12 @@ pub fn play(
                 let dts_us = packet.dts_us;
                 let key = packet.key;
                 let duration_us = packet.duration_us;
-                // A seek's pre-roll is every access unit between the preceding random-access point
-                // and the target, and none of it can be shown. Stream it: the presenter already
-                // holds the exact target, discards those pictures without ever waiting on a clock,
-                // and returns capacity as it goes, so a barrier per record would buy nothing and
-                // cost a decode round trip on each one — the whole key-frame interval, serialized.
-                // Initial pre-roll keeps the barrier, where one record is all that is wanted
-                // before OUTPUT_READY and the presenter may hold the next output for PLAY.
+                // Stream a seek's pre-roll: the presenter already holds the exact target, discards
+                // those pictures without ever waiting on a clock, and returns capacity as it goes,
+                // so a barrier per record would buy nothing and cost a decode round trip on each
+                // one — the whole key-frame interval, serialized. Initial pre-roll keeps the
+                // barrier, where one record is all that is wanted before OUTPUT_READY and the
+                // presenter may hold the next output for PLAY.
                 let barrier = play_start_override.is_none();
                 video_catchup.admit_record();
                 let sender = thread::spawn(move || {
@@ -1550,6 +1552,22 @@ fn activate_and_play(
     Ok(audio_active)
 }
 
+/// Whether an access unit is still decoder pre-roll for the seek target published to the presenter.
+///
+/// Pre-roll is everything between the seek's random-access point and its target. The presenter
+/// decodes it as references and discards its pictures against that same target, so none of it can
+/// be shown — before or after the authoritative PLAY. It is catch-up traffic either way, and the
+/// pacer that carries it has to follow media time rather than the `started` bookkeeping.
+///
+/// A nested presenter answers `MILESTONE_OUTPUT_READY` on the first accepted record rather than on
+/// decoded output, so playback starts a whole key-frame interval before the target. Pacing what is
+/// left at playback rate then spends that interval in wall time before the first visible frame,
+/// while the linked audio activated beside it starts at the target: picture freezes, sound runs,
+/// and every later access unit reaches the outer presenter that same interval late.
+fn is_seek_pre_roll(play_start_override: Option<i64>, pts_us: i64) -> bool {
+    play_start_override.is_some_and(|target| pts_us < target)
+}
+
 /// How often pre-roll asks the control plane whether decoded output exists yet.
 const READINESS_POLL: Duration = Duration::from_millis(4);
 
@@ -2000,6 +2018,23 @@ mod tests {
         assert!(audio_packet_reaches_recovery_target(&mut target, 8_400_000));
         assert_eq!(target, None);
         assert!(audio_packet_reaches_recovery_target(&mut target, 8_420_000));
+    }
+
+    /// Playback pacing follows media time against the published seek target, not the `started`
+    /// flag. A presenter that reports readiness on its first accepted record rather than on decoded
+    /// output would otherwise have the producer walk the rest of a key-frame interval in real time
+    /// while the linked audio it just activated plays from the target.
+    #[test]
+    fn seek_pre_roll_is_catch_up_traffic_on_both_sides_of_playback_start() {
+        let target = 47_641_088;
+        assert!(is_seek_pre_roll(Some(target), 43_320_000));
+        assert!(is_seek_pre_roll(Some(target), target - 1));
+        assert!(!is_seek_pre_roll(Some(target), target));
+        assert!(!is_seek_pre_roll(Some(target), target + 40_000));
+        assert!(
+            !is_seek_pre_roll(None, 0),
+            "initial playback publishes no target and has no pre-roll to discard"
+        );
     }
 
     #[test]
