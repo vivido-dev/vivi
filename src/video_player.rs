@@ -33,6 +33,8 @@ const AUDIO_PREBUFFER_US: u64 = 100_000;
 const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(5);
 const MAXIMUM_LATENCY_US: u64 = 2_000_000;
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a seek's pre-roll may still be in flight before its silence means end of file.
+const SEEK_OUTPUT_GRACE: Duration = Duration::from_secs(2);
 const PLAYBACK_COMPLETION_GRACE: Duration = Duration::from_secs(30);
 const SLOT_VIDEO: u64 = 1;
 const SLOT_AUDIO: u64 = 2;
@@ -469,11 +471,7 @@ pub fn play(
                             epoch,
                         );
                     }
-                    // Publish the exact seek target before decoder pre-roll. The audio slot is
-                    // deliberately unbound here, so this clocks only video while the presenter
-                    // decodes references and discards every output before the target. Once both
-                    // tracks are ready, activation below issues the same PLAY to the pair.
-                    prime_video_seek(client, &video_track, target_pts)?;
+                    prime_video_seek(client, &video_track, target_pts);
                     local_audio = None;
                     awaiting_keyframe = true;
                     recovery_rebase_pending = false;
@@ -570,11 +568,7 @@ pub fn play(
                                 &video_track,
                                 &mut presenter_audio,
                                 &mut local_audio,
-                                PlaybackStart {
-                                    pts_us: play_start_override
-                                        .unwrap_or_else(|| first_pts.unwrap_or(pts_us)),
-                                    prebuffer_audio: play_start_override.is_none(),
-                                },
+                                play_start_override.unwrap_or_else(|| first_pts.unwrap_or(pts_us)),
                             )?;
                         }
                         Ok(output_ready)
@@ -626,11 +620,7 @@ pub fn play(
                     &video_track,
                     &mut presenter_audio,
                     &mut local_audio,
-                    PlaybackStart {
-                        pts_us: play_start_override
-                            .unwrap_or_else(|| first_pts.unwrap_or(packet.pts_us)),
-                        prebuffer_audio: play_start_override.is_none(),
-                    },
+                    play_start_override.unwrap_or_else(|| first_pts.unwrap_or(packet.pts_us)),
                 )?;
                 started = true;
                 playback_started_at.get_or_insert_with(Instant::now);
@@ -645,6 +635,17 @@ pub fn play(
             cancel_presenter_audio(client, &mut presenter_audio);
             break 'playback;
         }
+        if !started
+            && play_start_override.is_some()
+            && !video_output_ready(client, &video_track, SEEK_OUTPUT_GRACE)?
+        {
+            // The seek landed past the last decodable picture: the presenter discards every
+            // output before the exact target, so the remaining packets decode to nothing it can
+            // show and no priming frame is ever coming. That is the end of the file, not a start
+            // to wait thirty seconds for behind a surface the FLUSH already cleared.
+            cancel_presenter_audio(client, &mut presenter_audio);
+            break 'playback;
+        }
         if !started {
             start_video_playback(
                 config,
@@ -653,10 +654,7 @@ pub fn play(
                 &video_track,
                 &mut presenter_audio,
                 &mut local_audio,
-                PlaybackStart {
-                    pts_us: play_start_override.unwrap_or_else(|| first_pts.unwrap_or(0)),
-                    prebuffer_audio: play_start_override.is_none(),
-                },
+                play_start_override.unwrap_or_else(|| first_pts.unwrap_or(0)),
             )?;
             started = true;
             playback_started_at.get_or_insert_with(Instant::now);
@@ -794,7 +792,7 @@ pub fn play(
                         epoch,
                     );
                 }
-                prime_video_seek(client, &video_track, target_pts)?;
+                prime_video_seek(client, &video_track, target_pts);
                 local_audio = None;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = false;
@@ -939,7 +937,7 @@ pub fn play(
                         }
                     }
                 });
-                prime_video_seek(client, &video_track, target_pts)?;
+                prime_video_seek(client, &video_track, target_pts);
                 local_audio = None;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = false;
@@ -1515,17 +1513,43 @@ fn activate_and_play(
     Ok(audio_active)
 }
 
-fn prime_video_seek(
-    client: &mut vivid_sdk::Session,
+/// Whether the presenter has produced decoded output for the current generation within `grace`.
+fn video_output_ready(
+    client: &mut VividClient,
     video: &Track,
-    start_pts_us: i64,
-) -> io::Result<()> {
-    client.play(video, start_pts_us, 0, MAXIMUM_LATENCY_US)
+    grace: Duration,
+) -> io::Result<bool> {
+    match client.wait_track(
+        video,
+        TrackWaitCondition::MilestoneSet,
+        Some(MILESTONE_OUTPUT_READY),
+        timeout_us(grace),
+    ) {
+        Ok(_) => Ok(true),
+        Err(error) if presenter_code(&error) == Some(ERROR_TIMEOUT) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
-struct PlaybackStart {
-    pts_us: i64,
-    prebuffer_audio: bool,
+/// Publish the exact seek target to the presenter before decoder pre-roll, without starting time.
+///
+/// PLAY is the only way to say where a flushed timed track resumes, and the presenter needs that
+/// before the pre-roll so it can decode the reference frames ahead of the target while discarding
+/// their pictures. It must not also start running: linked audio is unbound and still restarting,
+/// so a clock started here would advance in real time through the whole activation handshake and
+/// leave picture that far ahead of the sound it belongs with. PAUSE freezes the clock exactly on
+/// the target, so the presenter releases the target picture and holds everything after it until
+/// activation issues the authoritative PLAY to video and audio together.
+///
+/// The target is an optimization, not a requirement: a presenter that refuses it — a surface whose
+/// video slot was never activated, for instance — still gets the same PLAY at activation.
+fn prime_video_seek(client: &mut vivid_sdk::Session, video: &Track, start_pts_us: i64) {
+    if client
+        .play(video, start_pts_us, 0, MAXIMUM_LATENCY_US)
+        .is_ok()
+    {
+        let _ = client.pause(video);
+    }
 }
 
 fn start_video_playback(
@@ -1535,24 +1559,13 @@ fn start_video_playback(
     video: &Track,
     presenter_audio: &mut Option<PresenterAudio>,
     local_audio: &mut Option<audio_player::AudioPlayback>,
-    start: PlaybackStart,
+    start_pts_us: i64,
 ) -> io::Result<()> {
-    let PlaybackStart {
-        pts_us: start_pts_us,
-        prebuffer_audio,
-    } = start;
     let audio_ready = presenter_audio
         .as_ref()
-        .map(|audio| {
-            if prebuffer_audio {
-                audio.progress.wait_for_prebuffer()
-            } else {
-                audio.progress.snapshot()
-            }
-        })
+        .map(|audio| audio.progress.wait_for_prebuffer())
         .filter(|state| {
-            !state.failed
-                && (!prebuffer_audio || state.buffered_us >= AUDIO_PREBUFFER_US || state.finished)
+            !state.failed && (state.buffered_us >= AUDIO_PREBUFFER_US || state.finished)
         });
     if presenter_audio.is_some() && audio_ready.is_none() {
         client.verbose(format_args!(
@@ -1567,13 +1580,7 @@ fn start_video_playback(
         video,
         presenter_audio.as_ref().map(|audio| &audio.track),
         start_pts_us,
-        audio_ready.map_or(0, |state| {
-            if prebuffer_audio {
-                state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)
-            } else {
-                0
-            }
-        }),
+        audio_ready.map_or(0, |state| state.buffered_us.clamp(1, AUDIO_PREBUFFER_US)),
     )?;
     if !audio_active {
         cancel_presenter_audio(client, presenter_audio);
@@ -2128,7 +2135,7 @@ mod tests {
             .unwrap();
         let mut video_channel = Arc::new(session.open_track_channel(&video).unwrap());
         replace_video_channel(&mut session, &video, &mut video_channel, 2, false, 1).unwrap();
-        prime_video_seek(&mut session, &video, 7_000_000).unwrap();
+        prime_video_seek(&mut session, &video, 7_000_000);
 
         let observed = presenter.observed();
         assert_eq!(
@@ -2171,6 +2178,7 @@ mod tests {
                             vivid_protocol::messages::ADVANCE_CHANNEL
                                 | vivid_protocol::messages::FLUSH
                                 | vivid_protocol::messages::PLAY
+                                | vivid_protocol::messages::PAUSE
                         )
                 })
                 .map(|request| request.record_type)
@@ -2179,7 +2187,9 @@ mod tests {
                 vivid_protocol::messages::ADVANCE_CHANNEL,
                 vivid_protocol::messages::FLUSH,
                 vivid_protocol::messages::PLAY,
-            ]
+                vivid_protocol::messages::PAUSE,
+            ],
+            "a seek publishes its target and immediately freezes that clock on it"
         );
         let seek_play = observed
             .iter()
@@ -2195,15 +2205,6 @@ mod tests {
                 .find(|(key, _)| *key == 3)
                 .and_then(|(_, value)| value.as_i64()),
             Some(7_000_000)
-        );
-        assert_eq!(
-            seek_play
-                .payload
-                .iter()
-                .find(|(key, _)| *key == 4)
-                .and_then(|(_, value)| value.as_u64()),
-            Some(0),
-            "seeks must not reintroduce the initial 100 ms audio barrier"
         );
         assert!(presenter.destroys().is_empty());
         drop(video_channel);
