@@ -19,7 +19,7 @@ use vivid_sdk::{
 use crate::audio_player;
 use crate::audio_streamer::audio_track;
 use crate::cli::Config;
-use crate::client::VividClient;
+use crate::client::{VividClient, catchup_delivery_rates};
 use crate::ffmpeg::{AudioDemuxer, EncodedMediaPacket, VideoDemuxer, VideoInfo};
 use crate::playback_ui::{Command, PlaybackUi};
 use crate::terminal_geometry::{
@@ -325,6 +325,7 @@ pub fn play(
     let mut playback_base_us = 0_u64;
     let mut playback_started_at: Option<Instant> = None;
     let mut play_start_override = None;
+    let mut readiness = ReadinessPoll::default();
     'playback: loop {
         let packets_before_generation = packet_id;
         while let Some(media) = demuxer.next_media_packet()? {
@@ -538,6 +539,14 @@ pub fn play(
                 let dts_us = packet.dts_us;
                 let key = packet.key;
                 let duration_us = packet.duration_us;
+                // A seek's pre-roll is every access unit between the preceding random-access point
+                // and the target, and none of it can be shown. Stream it: the presenter already
+                // holds the exact target, discards those pictures without ever waiting on a clock,
+                // and returns capacity as it goes, so a barrier per record would buy nothing and
+                // cost a decode round trip on each one — the whole key-frame interval, serialized.
+                // Initial pre-roll keeps the barrier, where one record is all that is wanted
+                // before OUTPUT_READY and the presenter may hold the next output for PLAY.
+                let barrier = play_start_override.is_none();
                 let sender = thread::spawn(move || {
                     let sequence = channel.send_video(VideoPacket {
                         epoch,
@@ -548,15 +557,16 @@ pub fn play(
                         key,
                         data: &data,
                     })?;
-                    // Keep pre-roll to one presenter-processed record. In particular, do not fill the
-                    // socket with reordered packets after the first decoded output: the presenter is
-                    // allowed to hold the next output for PLAY, and the control-plane observer below
-                    // must remain able to see OUTPUT_READY and start that clock.
-                    channel.wait_for_reusable_media_capacity()?;
+                    if barrier {
+                        channel.wait_for_reusable_media_capacity()?;
+                    }
                     Ok(sequence)
                 });
                 let (result, started_while_sending) =
                     finish_send_while_observing_start(sender, || {
+                        if !readiness.due() {
+                            return Ok(false);
+                        }
                         let output_ready = client.query_track(&video_track)?.milestones
                             & MILESTONE_OUTPUT_READY
                             != 0;
@@ -611,6 +621,7 @@ pub fn play(
             }
 
             let output_ready = !started
+                && readiness.due()
                 && client.query_track(&video_track)?.milestones & MILESTONE_OUTPUT_READY != 0;
             if output_ready {
                 start_video_playback(
@@ -1513,6 +1524,33 @@ fn activate_and_play(
     Ok(audio_active)
 }
 
+/// How often pre-roll asks the control plane whether decoded output exists yet.
+const READINESS_POLL: Duration = Duration::from_millis(4);
+
+/// Rate limiter for the `OUTPUT_READY` question asked between pre-roll records.
+///
+/// Each answer is a control round trip, and pre-roll for a seek is hundreds of records. Asking per
+/// record, and again every millisecond a record is in flight, spends more of the seek on the
+/// control plane than on the decoding it is waiting for. The interval is far below the delay a
+/// person can see, so nothing is lost by asking less often.
+#[derive(Default)]
+struct ReadinessPoll {
+    last: Option<Instant>,
+}
+
+impl ReadinessPoll {
+    fn due(&mut self) -> bool {
+        if self
+            .last
+            .is_some_and(|last| last.elapsed() < READINESS_POLL)
+        {
+            return false;
+        }
+        self.last = Some(Instant::now());
+        true
+    }
+}
+
 /// Whether the presenter has produced decoded output for the current generation within `grace`.
 fn video_output_ready(
     client: &mut VividClient,
@@ -1830,6 +1868,11 @@ fn video_track(
     let retained_pixel_charge = u64::from(info.width)
         .checked_mul(u64::from(info.height))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "video pixels overflow"))?;
+    let (maximum_records_per_second, maximum_encoded_bits_per_second) = catchup_delivery_rates(
+        client,
+        info.maximum_records_per_second.max(1),
+        info.maximum_encoded_bits_per_second.max(1),
+    );
     Ok(TrackConfiguration {
         context_id: surface.context_id(),
         surface_id: surface.id(),
@@ -1839,8 +1882,8 @@ fn video_track(
         lane: LaneClass::Bulk,
         maximum_record_body,
         maximum_rate_millihertz: info.maximum_rate_millihertz.max(1),
-        maximum_encoded_bits_per_second: info.maximum_encoded_bits_per_second.max(1),
-        maximum_records_per_second: info.maximum_records_per_second.max(1),
+        maximum_encoded_bits_per_second,
+        maximum_records_per_second,
         maximum_inflight_body_bytes: u64::from(maximum_record_body).saturating_mul(8),
         kind: KindConfiguration::Video(VideoConfiguration {
             codec: info.codec.clone(),

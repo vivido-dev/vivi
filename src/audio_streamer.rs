@@ -11,7 +11,7 @@ use vivid_sdk::{
 };
 
 use crate::cli::Config;
-use crate::client::VividClient;
+use crate::client::{VividClient, catchup_delivery_rates};
 use crate::ffmpeg::{AudioDemuxer, AudioInfo};
 use crate::playback_ui::{Command, PlaybackUi};
 
@@ -350,6 +350,11 @@ pub(crate) fn audio_track(
     let maximum_inflight_body_bytes = u64::from(maximum_record_body)
         .saturating_mul(8)
         .max(u64::from(maximum_record_body));
+    let (maximum_records_per_second, maximum_encoded_bits_per_second) = catchup_delivery_rates(
+        client,
+        info.maximum_records_per_second.max(1),
+        info.maximum_encoded_bits_per_second.max(1),
+    );
     Ok(TrackConfiguration {
         context_id: surface.context_id(),
         surface_id: surface.id(),
@@ -359,8 +364,8 @@ pub(crate) fn audio_track(
         lane: LaneClass::Realtime,
         maximum_record_body,
         maximum_rate_millihertz: info.maximum_rate_millihertz.max(1),
-        maximum_encoded_bits_per_second: info.maximum_encoded_bits_per_second.max(1),
-        maximum_records_per_second: info.maximum_records_per_second.max(1),
+        maximum_encoded_bits_per_second,
+        maximum_records_per_second,
         maximum_inflight_body_bytes,
         kind: KindConfiguration::Audio(AudioConfiguration {
             codec: info.codec.clone(),

@@ -2,6 +2,7 @@ use std::fmt;
 use std::io;
 use std::ops::{Deref, DerefMut};
 
+use vivid_protocol::resource::Resource;
 use vivid_sdk::{ProducerAuthentication, ProducerConfig, Session};
 
 use crate::cli::Config;
@@ -66,6 +67,48 @@ impl DerefMut for VividClient {
     }
 }
 
+/// How much faster than its own timeline a timed track may be delivered.
+///
+/// Enough to cover any ordinary key-frame interval in a single burst, since the token bucket a
+/// presenter shapes with begins full and holds one second of the declared rate.
+const TIMELINE_CATCHUP: u64 = 8;
+
+/// The delivery ceilings a timed track declares, given the timeline rates measured from the file.
+///
+/// Media §5.2 makes the declared rates the sender's pacing contract and lets a presenter shape
+/// ingress to them. Timed media is never delivered at its timeline rate: a seek has to hand over
+/// every access unit from the preceding random-access point before the first picture at the target
+/// can be decoded, so declaring the timeline rate makes that pre-roll take exactly as long as the
+/// material it covers — a five-second key-frame interval costs a five-second seek. Declare the
+/// catch-up headroom the producer actually uses, bounded by what this session reserves, and keep
+/// the timeline rate itself (`maximum_rate_millihertz`, and the decoded pixels reserved from it)
+/// honest.
+pub fn catchup_delivery_rates(
+    session: &Session,
+    records_per_second: u64,
+    bits_per_second: u64,
+) -> (u64, u64) {
+    let contract = &session.info().resource_contract;
+    (
+        catchup_within(
+            records_per_second,
+            contract.get(Resource::MediaRecordsPerSecond),
+        ),
+        catchup_within(
+            bits_per_second,
+            contract.get(Resource::EncodedBitsPerSecond),
+        ),
+    )
+}
+
+/// One rate's catch-up ceiling: never above what the session reserves, never below the timeline.
+fn catchup_within(timeline: u64, reserved: u64) -> u64 {
+    timeline
+        .saturating_mul(TIMELINE_CATCHUP)
+        .min(reserved.max(timeline))
+        .max(1)
+}
+
 pub fn producer_config(config: &Config) -> ProducerConfig {
     ProducerConfig {
         endpoint_control: config.control_endpoint.clone(),
@@ -94,6 +137,20 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn timed_delivery_asks_for_catch_up_headroom_within_the_session_contract() {
+        // A seek hands over the whole random-access unit before its target can be shown. Declaring
+        // only the timeline rate makes a presenter shape that pre-roll to real time, which is a
+        // seek as long as the material it covers.
+        assert_eq!(catchup_within(30, 4_000), 240);
+        // Never past what the session reserves, and never below the timeline the file really has:
+        // an under-provisioned contract is the presenter's decision to make at track creation.
+        assert_eq!(catchup_within(600, 4_000), 4_000);
+        assert_eq!(catchup_within(600, 100), 600);
+        assert_eq!(catchup_within(0, 4_000), 1);
+        assert_eq!(catchup_within(u64::MAX, u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn producer_profiles_are_strictly_sorted_and_prerequisite_closed() {
