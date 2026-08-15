@@ -1,8 +1,10 @@
 use std::fmt;
 use std::io;
 use std::ops::{Deref, DerefMut};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use vivid_protocol::resource::Resource;
+use vivid_protocol::resource::{Resource, TokenBucket};
 use vivid_sdk::{ProducerAuthentication, ProducerConfig, Session};
 
 use crate::cli::Config;
@@ -109,6 +111,55 @@ fn catchup_within(timeline: u64, reserved: u64) -> u64 {
         .max(1)
 }
 
+/// The longest a single record waits for the timeline rate before the caller gets control back.
+const PACING_SLICE: Duration = Duration::from_millis(50);
+
+/// Paces media that will be presented at the rate its own timeline plays.
+///
+/// The declared ceiling says what a presenter must *admit*. It is not a rate to deliver at: a
+/// timed presenter buffers what it needs and paces the rest against its clock, so media handed
+/// over faster than it plays only accumulates in whatever queue sits between the producer and the
+/// screen. Attached directly that queue is the presenter's own flow window, which pushes back. A
+/// nested presenter relays through a bounded queue that drops when it overflows, and every drop
+/// costs a recovery episode, so running ahead there is how a producer stalls its own playback.
+///
+/// The declared headroom is left for the traffic that genuinely has to catch up — the pre-roll a
+/// seek must hand over before its target can be shown, which is not admitted through here at all.
+pub struct DeliveryPacer {
+    bucket: TokenBucket,
+    updated: Instant,
+}
+
+impl DeliveryPacer {
+    pub fn new(records_per_second: u64) -> Self {
+        Self {
+            // Capacity is `max(rate, charge)`, so a one-record charge asks for one second of burst.
+            bucket: TokenBucket::new(records_per_second.max(1), 1),
+            updated: Instant::now(),
+        }
+    }
+
+    /// Block until one more record fits the timeline rate.
+    pub fn admit_record(&mut self) {
+        loop {
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(self.updated);
+            self.updated = now;
+            if self.bucket.replenish(elapsed).is_err() {
+                return;
+            }
+            match self.bucket.time_until(1) {
+                Ok(None) => {
+                    let _ = self.bucket.charge(1);
+                    return;
+                }
+                Ok(Some(wait)) => thread::sleep(wait.min(PACING_SLICE)),
+                Err(_) => return,
+            }
+        }
+    }
+}
+
 pub fn producer_config(config: &Config) -> ProducerConfig {
     ProducerConfig {
         endpoint_control: config.control_endpoint.clone(),
@@ -150,6 +201,32 @@ mod tests {
         assert_eq!(catchup_within(600, 100), 600);
         assert_eq!(catchup_within(0, 4_000), 1);
         assert_eq!(catchup_within(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn presented_media_is_delivered_at_the_rate_its_timeline_plays() {
+        // One second of burst is admitted at once, which is what fills a presenter's prebuffer.
+        let mut pacer = DeliveryPacer::new(100);
+        let burst = Instant::now();
+        for _ in 0..100 {
+            pacer.admit_record();
+        }
+        assert!(
+            burst.elapsed() < Duration::from_millis(50),
+            "the first second of records is the burst, not a wait"
+        );
+        // Past the burst the rate is the timeline's. Regression: delivering at the declared
+        // ceiling instead filled a nested presenter's relay queue until it dropped records, and
+        // every drop cost a recovery episode the producer could not see.
+        let paced = Instant::now();
+        for _ in 0..20 {
+            pacer.admit_record();
+        }
+        assert!(
+            paced.elapsed() >= Duration::from_millis(150),
+            "twenty records at a hundred per second cannot arrive in {:?}",
+            paced.elapsed()
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use vivid_sdk::{
 use crate::audio_player;
 use crate::audio_streamer::audio_track;
 use crate::cli::Config;
-use crate::client::{VividClient, catchup_delivery_rates};
+use crate::client::{DeliveryPacer, VividClient, catchup_delivery_rates};
 use crate::ffmpeg::{AudioDemuxer, EncodedMediaPacket, VideoDemuxer, VideoInfo};
 use crate::playback_ui::{Command, PlaybackUi};
 use crate::terminal_geometry::{
@@ -165,6 +165,8 @@ struct PresenterAudio {
     packet_ids: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     progress: Arc<AudioProgress>,
+    /// The rate this track's timeline plays at, which is the rate it is delivered at.
+    records_per_second: u64,
     worker: thread::JoinHandle<AudioOutcome>,
 }
 
@@ -262,6 +264,7 @@ pub fn play(
     }
 
     let video_configuration = video_track(client, &surface, &info)?;
+    let catchup_records = video_configuration.maximum_records_per_second;
     let mut video_probe = video_configuration.clone();
     video_probe.track_id = 0;
     if !client.probe_track(&video_probe)?.supported {
@@ -326,6 +329,8 @@ pub fn play(
     let mut playback_started_at: Option<Instant> = None;
     let mut play_start_override = None;
     let mut readiness = ReadinessPoll::default();
+    let mut video_delivery = DeliveryPacer::new(info.maximum_records_per_second);
+    let mut video_catchup = DeliveryPacer::new(catchup_records);
     'playback: loop {
         let packets_before_generation = packet_id;
         while let Some(media) = demuxer.next_media_packet()? {
@@ -523,6 +528,10 @@ pub fn play(
             let first_pts_before_send = first_pts;
             first_pts.get_or_insert(packet.pts_us);
             let send_result = if started {
+                // Presented media is delivered at the rate it plays. Pre-roll — the branch below,
+                // which runs until the presenter has decoded output to start from — is the traffic
+                // that has to catch up, and is paced at the ceiling this track declared instead.
+                video_delivery.admit_record();
                 video_channel.send_video(VideoPacket {
                     epoch,
                     packet_id,
@@ -547,6 +556,7 @@ pub fn play(
                 // Initial pre-roll keeps the barrier, where one record is all that is wanted
                 // before OUTPUT_READY and the presenter may hold the next output for PLAY.
                 let barrier = play_start_override.is_none();
+                video_catchup.admit_record();
                 let sender = thread::spawn(move || {
                     let sequence = channel.send_video(VideoPacket {
                         epoch,
@@ -937,6 +947,7 @@ pub fn play(
                         audio.packet_ids.clone(),
                         target_pts,
                         epoch,
+                        info.audio.as_ref().map_or(1, |audio| audio.maximum_records_per_second),
                     ) {
                         Ok(audio) => Some(audio),
                         Err(error) => {
@@ -1178,9 +1189,11 @@ fn create_presenter_audio(
         recovery,
         start_pts_us,
         1,
+        info.maximum_records_per_second,
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_presenter_audio(
     track: Track,
     channel: Arc<TrackChannel>,
@@ -1189,6 +1202,7 @@ fn spawn_presenter_audio(
     recovery: Arc<AudioRecoveryTarget>,
     start_pts_us: Option<i64>,
     epoch: u32,
+    records_per_second: u64,
 ) -> PresenterAudio {
     let progress = Arc::new(AudioProgress::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -1209,6 +1223,7 @@ fn spawn_presenter_audio(
             },
             start_pts_us,
             epoch,
+            records_per_second,
         );
         worker_progress.finish(result.is_err());
         match result {
@@ -1230,6 +1245,7 @@ fn spawn_presenter_audio(
         packet_ids,
         stop,
         progress,
+        records_per_second,
         worker,
     }
 }
@@ -1248,6 +1264,7 @@ fn restart_presenter_audio(
         packet_ids,
         stop,
         progress: _,
+        records_per_second,
         worker,
     } = audio;
 
@@ -1278,6 +1295,7 @@ fn restart_presenter_audio(
                 recovery,
                 Some(start_pts_us),
                 epoch,
+                records_per_second,
             )
         })
     });
@@ -1293,6 +1311,7 @@ fn restart_presenter_audio(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn restart_presenter_audio_track(
     client: &mut VividClient,
     path: &Path,
@@ -1301,6 +1320,7 @@ fn restart_presenter_audio_track(
     packet_ids: Arc<AtomicU64>,
     start_pts_us: i64,
     epoch: u32,
+    records_per_second: u64,
 ) -> io::Result<PresenterAudio> {
     let channel = advance_presenter_audio_channel(client, &track, epoch)?;
     Ok(spawn_presenter_audio(
@@ -1311,6 +1331,7 @@ fn restart_presenter_audio_track(
         recovery,
         Some(start_pts_us),
         epoch,
+        records_per_second,
     ))
 }
 
@@ -1338,8 +1359,10 @@ fn stream_audio(
     state: AudioStreamState<'_>,
     start_pts_us: Option<i64>,
     epoch: u32,
+    records_per_second: u64,
 ) -> io::Result<u64> {
     let mut demuxer = AudioDemuxer::open(path)?;
+    let mut delivery = DeliveryPacer::new(records_per_second);
     if let Some(start_pts_us) = start_pts_us {
         demuxer.seek_to_us(start_pts_us)?;
     }
@@ -1366,6 +1389,9 @@ fn stream_audio(
         if state.stop.load(Ordering::Acquire) {
             break;
         }
+        // Audio is all presented media, so it is paced at the rate it plays from the first
+        // packet. The pacer's one second of burst is what fills the presenter's prebuffer.
+        delivery.admit_record();
         let packet_id = next_audio_packet_id(state.packet_ids)?;
         channel.send_audio(AudioPacket {
             epoch,
