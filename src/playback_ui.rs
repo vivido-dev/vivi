@@ -150,18 +150,18 @@ struct TerminalSession;
 impl TerminalSession {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            Hide,
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        ) {
+        if let Err(error) = enter_terminal(&mut io::stdout()) {
             let _ = disable_raw_mode();
             return Err(error);
         }
         Ok(Self)
     }
+}
+
+/// Entering DECSET 1049 already provides a fresh alternate buffer. An explicit ED 2 here would
+/// also be observed by a Vivid presenter and could destroy retained media on the primary screen.
+fn enter_terminal(output: &mut impl Write) -> io::Result<()> {
+    execute!(output, EnterAlternateScreen, Hide, MoveTo(0, 0))
 }
 
 impl Drop for TerminalSession {
@@ -176,7 +176,7 @@ impl Drop for TerminalSession {
 /// Moving afterward would overwrite that restored position and make the shell redraw its prompt
 /// at the top-left of the still-populated primary screen.
 fn leave_terminal(output: &mut impl Write) -> io::Result<()> {
-    execute!(output, Show, Clear(ClearType::All), LeaveAlternateScreen)
+    execute!(output, Show, LeaveAlternateScreen)
 }
 
 fn input_loop(
@@ -466,16 +466,26 @@ mod tests {
     }
 
     #[test]
-    fn leaving_playback_does_not_overwrite_the_restored_primary_cursor() {
-        let mut output = Vec::new();
-        leave_terminal(&mut output).unwrap();
+    fn playback_screen_transitions_preserve_primary_cursor_and_media() {
+        let mut enter = Vec::new();
+        enter_terminal(&mut enter).unwrap();
+        let mut leave = Vec::new();
+        leave_terminal(&mut leave).unwrap();
 
-        assert!(output.ends_with(b"\x1b[?1049l"));
+        assert!(leave.ends_with(b"\x1b[?1049l"));
         assert!(
-            !output
+            !leave
                 .windows(b"\x1b[1;1H".len())
                 .any(|bytes| bytes == b"\x1b[1;1H"),
             "a cursor-home command after rmcup moves the shell prompt to the top"
         );
+        for transition in [&enter, &leave] {
+            assert!(
+                !transition
+                    .windows(b"\x1b[2J".len())
+                    .any(|bytes| bytes == b"\x1b[2J"),
+                "clearing the alternate buffer is redundant and destroys retained primary-screen media"
+            );
+        }
     }
 }
