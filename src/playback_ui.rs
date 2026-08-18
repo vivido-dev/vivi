@@ -166,15 +166,17 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = execute!(
-            io::stdout(),
-            Show,
-            Clear(ClearType::All),
-            LeaveAlternateScreen,
-            MoveTo(0, 0)
-        );
+        let _ = leave_terminal(&mut io::stdout());
         let _ = disable_raw_mode();
     }
+}
+
+/// Restore the primary screen and the cursor position saved by DECSET 1049.
+///
+/// Moving afterward would overwrite that restored position and make the shell redraw its prompt
+/// at the top-left of the still-populated primary screen.
+fn leave_terminal(output: &mut impl Write) -> io::Result<()> {
+    execute!(output, Show, Clear(ClearType::All), LeaveAlternateScreen)
 }
 
 fn input_loop(
@@ -461,5 +463,19 @@ mod tests {
             goto_buffer: None,
         };
         assert!(status_text(&status).contains("f +10s"));
+    }
+
+    #[test]
+    fn leaving_playback_does_not_overwrite_the_restored_primary_cursor() {
+        let mut output = Vec::new();
+        leave_terminal(&mut output).unwrap();
+
+        assert!(output.ends_with(b"\x1b[?1049l"));
+        assert!(
+            !output
+                .windows(b"\x1b[1;1H".len())
+                .any(|bytes| bytes == b"\x1b[1;1H"),
+            "a cursor-home command after rmcup moves the shell prompt to the top"
+        );
     }
 }
