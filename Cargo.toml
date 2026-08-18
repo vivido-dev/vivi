@@ -1,6 +1,6 @@
 [package]
 name = "vivi"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 description = "A Vivid Protocol image viewer and media player for the Vivido terminal"
