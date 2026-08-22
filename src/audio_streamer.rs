@@ -251,8 +251,11 @@ fn stream_with_controls(
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("audio epoch exhausted"))?;
             client.pause(track)?;
-            client.flush(track, epoch)?;
+            // Control and media use independent transports. Retire the old generation before
+            // publishing the replacement epoch so a delayed old packet cannot arrive after
+            // FLUSH while it still names the current generation and lose the track.
             client.advance_channel(track, 1, &RequestMetadata::default())?;
+            client.flush(track, epoch)?;
         }
         generation = generation.saturating_add(1);
         let channel = client.open_track_channel(track)?;
@@ -735,8 +738,8 @@ mod tests {
         channel.close()?;
         drop(channel);
         session.pause(audio)?;
-        session.flush(audio, 2)?;
         session.advance_channel(audio, 1, &RequestMetadata::default())?;
+        session.flush(audio, 2)?;
         session.open_track_channel(audio)
     }
 
@@ -808,6 +811,19 @@ mod tests {
             "the pane is never the clock"
         );
         assert_eq!(count(audio_id, messages::ADVANCE_CHANNEL), 1);
+        let audio_control_position = |record_type| {
+            observed
+                .iter()
+                .position(|request| {
+                    request.object_id == audio_id && request.record_type == record_type
+                })
+                .unwrap()
+        };
+        assert!(
+            audio_control_position(messages::ADVANCE_CHANNEL)
+                < audio_control_position(messages::FLUSH),
+            "a seek must retire the old media generation before publishing its new epoch"
+        );
 
         let plays = observed
             .iter()
