@@ -527,79 +527,90 @@ pub fn play(
                 .ok_or_else(|| io::Error::other("video packet ID space exhausted"))?;
             let first_pts_before_send = first_pts;
             first_pts.get_or_insert(packet.pts_us);
-            let seek_pre_roll = is_seek_pre_roll(play_start_override, packet.pts_us);
-            let send_result = if started {
-                // Presented media is delivered at the rate it plays; pre-roll still is not.
-                if seek_pre_roll {
+            let delivery_kind = video_delivery_kind(play_start_override, started, packet.pts_us);
+            let send_result = match delivery_kind {
+                VideoDeliveryKind::CatchUp => {
+                    // Pre-roll cannot produce a visible frame before the published seek target.
+                    // Stream it directly: observing OUTPUT_READY here serializes media behind one
+                    // control round trip per packet whenever the transports have noticeable RTT.
                     video_catchup.admit_record();
-                } else {
-                    video_delivery.admit_record();
-                }
-                video_channel.send_video(VideoPacket {
-                    epoch,
-                    packet_id,
-                    pts_us: packet.pts_us,
-                    dts_us: packet.dts_us,
-                    duration_us: packet.duration_us,
-                    key: packet.key,
-                    data: &packet.data,
-                })
-            } else {
-                let channel = video_channel.clone();
-                let data = packet.data.clone();
-                let pts_us = packet.pts_us;
-                let dts_us = packet.dts_us;
-                let key = packet.key;
-                let duration_us = packet.duration_us;
-                // Stream a seek's pre-roll: the presenter already holds the exact target, discards
-                // those pictures without ever waiting on a clock, and returns capacity as it goes,
-                // so a barrier per record would buy nothing and cost a decode round trip on each
-                // one — the whole key-frame interval, serialized. Initial pre-roll keeps the
-                // barrier, where one record is all that is wanted before OUTPUT_READY and the
-                // presenter may hold the next output for PLAY.
-                let barrier = play_start_override.is_none();
-                video_catchup.admit_record();
-                let sender = thread::spawn(move || {
-                    let sequence = channel.send_video(VideoPacket {
+                    video_channel.send_video(VideoPacket {
                         epoch,
                         packet_id,
-                        pts_us,
-                        dts_us,
-                        duration_us,
-                        key,
-                        data: &data,
-                    })?;
-                    if barrier {
-                        channel.wait_for_reusable_media_capacity()?;
-                    }
-                    Ok(sequence)
-                });
-                let (result, started_while_sending) =
-                    finish_send_while_observing_start(sender, || {
-                        if !readiness.due() {
-                            return Ok(false);
-                        }
-                        let output_ready = client.query_track(&video_track)?.milestones
-                            & MILESTONE_OUTPUT_READY
-                            != 0;
-                        if output_ready {
-                            start_video_playback(
-                                config,
-                                client,
-                                &surface,
-                                &video_track,
-                                &mut presenter_audio,
-                                &mut local_audio,
-                                play_start_override.unwrap_or_else(|| first_pts.unwrap_or(pts_us)),
-                            )?;
-                        }
-                        Ok(output_ready)
-                    })?;
-                started = started_while_sending;
-                if started {
-                    playback_started_at.get_or_insert_with(Instant::now);
+                        pts_us: packet.pts_us,
+                        dts_us: packet.dts_us,
+                        duration_us: packet.duration_us,
+                        key: packet.key,
+                        data: &packet.data,
+                    })
                 }
-                result
+                VideoDeliveryKind::Timeline => {
+                    video_delivery.admit_record();
+                    video_channel.send_video(VideoPacket {
+                        epoch,
+                        packet_id,
+                        pts_us: packet.pts_us,
+                        dts_us: packet.dts_us,
+                        duration_us: packet.duration_us,
+                        key: packet.key,
+                        data: &packet.data,
+                    })
+                }
+                VideoDeliveryKind::ObserveStart => {
+                    let channel = video_channel.clone();
+                    let data = packet.data.clone();
+                    let pts_us = packet.pts_us;
+                    let dts_us = packet.dts_us;
+                    let key = packet.key;
+                    let duration_us = packet.duration_us;
+                    // Initial startup may need control progress to release a blocked priming write.
+                    // A seek reaches this path only at or after its target, where decoded output can
+                    // actually become visible and readiness observation becomes useful.
+                    let barrier = play_start_override.is_none();
+                    video_catchup.admit_record();
+                    let sender = thread::spawn(move || {
+                        let sequence = channel.send_video(VideoPacket {
+                            epoch,
+                            packet_id,
+                            pts_us,
+                            dts_us,
+                            duration_us,
+                            key,
+                            data: &data,
+                        })?;
+                        if barrier {
+                            channel.wait_for_reusable_media_capacity()?;
+                        }
+                        Ok(sequence)
+                    });
+                    let (result, started_while_sending) =
+                        finish_send_while_observing_start(sender, || {
+                            if !readiness.due() {
+                                return Ok(false);
+                            }
+                            let output_ready = client.query_track(&video_track)?.milestones
+                                & MILESTONE_OUTPUT_READY
+                                != 0;
+                            if output_ready {
+                                start_video_playback(
+                                    config,
+                                    client,
+                                    &surface,
+                                    &video_track,
+                                    &mut presenter_audio,
+                                    &mut local_audio,
+                                    play_start_override
+                                        .unwrap_or_else(|| first_pts.unwrap_or(pts_us)),
+                                )?;
+                            }
+                            Ok(output_ready)
+                        })?;
+                    started = started_while_sending;
+                    if started {
+                        playback_started_at.get_or_insert_with(Instant::now);
+                    }
+                    result
+                }
             };
             if let Err(error) = send_result {
                 if first_pts_before_send.is_none() && !started {
@@ -632,7 +643,8 @@ pub fn play(
                 }
             }
 
-            let output_ready = !started
+            let output_ready = delivery_kind == VideoDeliveryKind::ObserveStart
+                && !started
                 && readiness.due()
                 && client.query_track(&video_track)?.milestones & MILESTONE_OUTPUT_READY != 0;
             if output_ready {
@@ -1568,15 +1580,38 @@ fn is_seek_pre_roll(play_start_override: Option<i64>, pts_us: i64) -> bool {
     play_start_override.is_some_and(|target| pts_us < target)
 }
 
-/// How often pre-roll asks the control plane whether decoded output exists yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoDeliveryKind {
+    /// Decoder reference traffic before a known seek target.
+    CatchUp,
+    /// Media delivered against an already-running playback clock.
+    Timeline,
+    /// A packet that may make a stopped generation ready to start.
+    ObserveStart,
+}
+
+fn video_delivery_kind(
+    play_start_override: Option<i64>,
+    started: bool,
+    pts_us: i64,
+) -> VideoDeliveryKind {
+    if is_seek_pre_roll(play_start_override, pts_us) {
+        VideoDeliveryKind::CatchUp
+    } else if started {
+        VideoDeliveryKind::Timeline
+    } else {
+        VideoDeliveryKind::ObserveStart
+    }
+}
+
+/// How often target-or-later startup traffic asks whether decoded output exists yet.
 const READINESS_POLL: Duration = Duration::from_millis(4);
 
-/// Rate limiter for the `OUTPUT_READY` question asked between pre-roll records.
+/// Rate limiter for the `OUTPUT_READY` question asked while a startup record is in flight.
 ///
-/// Each answer is a control round trip, and pre-roll for a seek is hundreds of records. Asking per
-/// record, and again every millisecond a record is in flight, spends more of the seek on the
-/// control plane than on the decoding it is waiting for. The interval is far below the delay a
-/// person can see, so nothing is lost by asking less often.
+/// Each answer is a control round trip. Seek pre-roll never enters this poll; after the target, the
+/// interval prevents a blocked record from flooding the control plane while still detecting the
+/// first visible output below a perceptible delay.
 #[derive(Default)]
 struct ReadinessPoll {
     last: Option<Instant>,
@@ -2028,7 +2063,7 @@ mod tests {
     /// output would otherwise have the producer walk the rest of a key-frame interval in real time
     /// while the linked audio it just activated plays from the target.
     #[test]
-    fn seek_pre_roll_is_catch_up_traffic_on_both_sides_of_playback_start() {
+    fn seek_pre_roll_streams_without_readiness_round_trips() {
         let target = 47_641_088;
         assert!(is_seek_pre_roll(Some(target), 43_320_000));
         assert!(is_seek_pre_roll(Some(target), target - 1));
@@ -2037,6 +2072,28 @@ mod tests {
         assert!(
             !is_seek_pre_roll(None, 0),
             "initial playback publishes no target and has no pre-roll to discard"
+        );
+        assert_eq!(
+            video_delivery_kind(Some(target), false, target - 1),
+            VideoDeliveryKind::CatchUp,
+            "pre-roll streams directly instead of paying a control RTT per packet"
+        );
+        assert_eq!(
+            video_delivery_kind(Some(target), true, target - 1),
+            VideoDeliveryKind::CatchUp,
+            "a relay's early readiness must not pace the rest of pre-roll"
+        );
+        assert_eq!(
+            video_delivery_kind(Some(target), false, target),
+            VideoDeliveryKind::ObserveStart
+        );
+        assert_eq!(
+            video_delivery_kind(None, false, 0),
+            VideoDeliveryKind::ObserveStart
+        );
+        assert_eq!(
+            video_delivery_kind(Some(target), true, target + 40_000),
+            VideoDeliveryKind::Timeline
         );
     }
 
