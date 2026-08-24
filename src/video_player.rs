@@ -188,6 +188,19 @@ struct VideoRecovery {
     advance_epoch: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamingRecoveryPlan {
+    resume_pts_us: i64,
+    rebase_playback: bool,
+}
+
+fn streaming_recovery_plan(current_packet_pts_us: i64, started: bool) -> StreamingRecoveryPlan {
+    StreamingRecoveryPlan {
+        resume_pts_us: current_packet_pts_us,
+        rebase_playback: started,
+    }
+}
+
 enum AudioWaitEvent {
     Recovery(VideoRecovery),
     Quit,
@@ -495,8 +508,7 @@ pub fn play(
                 }
             }
             if let Some(recovery) = take_video_recovery(&video_channel)? {
-                awaiting_keyframe = true;
-                recovery_rebase_pending = started;
+                let recovery_plan = streaming_recovery_plan(packet.pts_us, started);
                 apply_video_recovery(
                     client,
                     &video_track,
@@ -505,6 +517,17 @@ pub fn play(
                     &mut epoch,
                     started,
                 )?;
+                // A NEED_KEYFRAME can arrive after this packet was read. Waiting for the next
+                // keyframe in file order can strand playback at EOF (and can freeze for a whole
+                // GOP anywhere else). Rewind from the current packet so FFmpeg supplies the
+                // preceding random-access unit immediately. This is especially important for a
+                // vvmux handoff: switching tabs also requests recovery, which used to appear to
+                // "fix" the stalled seek by taking the EOF recovery path below.
+                demuxer.seek_to_us(recovery_plan.resume_pts_us)?;
+                awaiting_keyframe = true;
+                recovery_rebase_pending = recovery_plan.rebase_playback;
+                recovery_start_pts_us = Some(recovery_plan.resume_pts_us);
+                continue 'playback;
             }
             if packet.data.is_empty() || (awaiting_keyframe && !packet.key) {
                 continue;
@@ -563,9 +586,11 @@ pub fn play(
                     let dts_us = packet.dts_us;
                     let key = packet.key;
                     let duration_us = packet.duration_us;
-                    // Initial startup may need control progress to release a blocked priming write.
-                    // A seek reaches this path only at or after its target, where decoded output can
-                    // actually become visible and readiness observation becomes useful.
+                    // Initial startup and seek pre-roll may need control progress to release a
+                    // blocked priming write. In particular, a nested presenter grants only bounded
+                    // pre-PLAY capacity. Start the target clock as soon as the replacement decoder
+                    // reports output from its keyframe; packets before that target remain catch-up
+                    // traffic below, so activation does not pace a long GOP in wall time.
                     let barrier = play_start_override.is_none();
                     video_catchup.admit_record();
                     let sender = thread::spawn(move || {
@@ -1595,12 +1620,12 @@ fn video_delivery_kind(
     started: bool,
     pts_us: i64,
 ) -> VideoDeliveryKind {
-    if is_seek_pre_roll(play_start_override, pts_us) {
-        VideoDeliveryKind::CatchUp
-    } else if started {
-        VideoDeliveryKind::Timeline
-    } else {
+    if !started {
         VideoDeliveryKind::ObserveStart
+    } else if is_seek_pre_roll(play_start_override, pts_us) {
+        VideoDeliveryKind::CatchUp
+    } else {
+        VideoDeliveryKind::Timeline
     }
 }
 
@@ -2058,12 +2083,11 @@ mod tests {
         assert!(audio_packet_reaches_recovery_target(&mut target, 8_420_000));
     }
 
-    /// Playback pacing follows media time against the published seek target, not the `started`
-    /// flag. A presenter that reports readiness on its first accepted record rather than on decoded
-    /// output would otherwise have the producer walk the rest of a key-frame interval in real time
-    /// while the linked audio it just activated plays from the target.
+    /// Seek startup observes readiness on the first replacement keyframe so bounded pre-PLAY flow
+    /// cannot deadlock before a long GOP reaches the exact target. Once started, every remaining
+    /// packet before the target is still catch-up traffic rather than timeline-paced media.
     #[test]
-    fn seek_pre_roll_streams_without_readiness_round_trips() {
+    fn seek_pre_roll_starts_on_readiness_then_remains_catch_up_traffic() {
         let target = 47_641_088;
         assert!(is_seek_pre_roll(Some(target), 43_320_000));
         assert!(is_seek_pre_roll(Some(target), target - 1));
@@ -2075,8 +2099,8 @@ mod tests {
         );
         assert_eq!(
             video_delivery_kind(Some(target), false, target - 1),
-            VideoDeliveryKind::CatchUp,
-            "pre-roll streams directly instead of paying a control RTT per packet"
+            VideoDeliveryKind::ObserveStart,
+            "the replacement keyframe must be able to publish PLAY before bounded pre-roll fills"
         );
         assert_eq!(
             video_delivery_kind(Some(target), true, target - 1),
@@ -2115,6 +2139,26 @@ mod tests {
                 RecoveryControl::Flush,
                 RecoveryControl::Open,
             ]
+        );
+    }
+
+    #[test]
+    fn streaming_recovery_rewinds_from_the_current_packet() {
+        assert_eq!(
+            streaming_recovery_plan(58_440_000, true),
+            StreamingRecoveryPlan {
+                resume_pts_us: 58_440_000,
+                rebase_playback: true,
+            },
+            "a playing stream must replay the preceding keyframe and rebase its clock"
+        );
+        assert_eq!(
+            streaming_recovery_plan(58_440_000, false),
+            StreamingRecoveryPlan {
+                resume_pts_us: 58_440_000,
+                rebase_playback: false,
+            },
+            "seek pre-roll must replay its keyframe without starting the clock early"
         );
     }
 
