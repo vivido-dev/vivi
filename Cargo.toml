@@ -1,10 +1,10 @@
 [package]
 name = "vivi"
-version = "0.2.0"
+version = "0.3.1"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 description = "A Vivid Protocol image viewer and media player for the Vivido terminal"
-license = "MIT"
+license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/vivido-dev/vivi"
 build = "build.rs"
@@ -15,9 +15,14 @@ crossterm = "0.29"
 image = "0.25"
 libc = "0.2"
 getrandom = "0.4"
+resvg = "0.48"
 sha2 = "0.11"
-vivid_protocol = { version = "1.4", path = "../vivid_protocol" }
-vivid_sdk = { version = "0.2", path = "../vivid_sdk" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vvreceive = { version = "0.1", path = "../vvreceive" }
+
+[dev-dependencies]
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["testing"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 cpal = "0.18"

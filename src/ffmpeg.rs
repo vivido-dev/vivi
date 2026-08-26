@@ -3,6 +3,7 @@
 //! Unlike Kitim, Vivi does not decode video into RGBA frames. It demultiplexes the selected video
 //! track and forwards encoded access units, timestamps, codec configuration, and keyframe flags.
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::io;
 use std::path::Path;
@@ -15,6 +16,7 @@ const AV_SAMPLE_FMT_FLT: c_int = 3;
 const AV_LOG_QUIET: c_int = -8;
 const AV_NOPTS_VALUE: i64 = i64::MIN;
 const AV_PKT_DATA_SKIP_SAMPLES: c_int = 11;
+const AVSEEK_FLAG_BACKWARD: c_int = 1;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 const AVERROR_EOF: c_int = -541_478_725;
 const AVCOL_RANGE_UNSPECIFIED: c_int = 0;
@@ -197,6 +199,13 @@ unsafe extern "C" {
     -> c_int;
     fn avformat_close_input(context: *mut *mut AVFormatContext);
     fn av_read_frame(context: *mut AVFormatContext, packet: *mut AVPacket) -> c_int;
+    fn av_seek_frame(
+        context: *mut AVFormatContext,
+        stream_index: c_int,
+        timestamp: i64,
+        flags: c_int,
+    ) -> c_int;
+    fn avformat_flush(context: *mut AVFormatContext);
     fn av_packet_alloc() -> *mut AVPacket;
     fn av_packet_unref(packet: *mut AVPacket);
     fn av_packet_get_side_data(
@@ -286,7 +295,11 @@ pub struct VideoInfo {
     pub sar_num: u32,
     pub sar_den: u32,
     pub max_access_unit_bytes: u32,
+    pub maximum_rate_millihertz: u64,
+    pub maximum_encoded_bits_per_second: u64,
+    pub maximum_records_per_second: u64,
     pub first_pts_us: Option<i64>,
+    pub duration_us: Option<u64>,
     pub has_audio: bool,
     pub audio: Option<AudioInfo>,
     /// RFC 6381 codec string derived from the container decoder configuration
@@ -307,9 +320,124 @@ pub struct AudioInfo {
     pub channel_mask: u64,
     pub bitrate: i64,
     pub max_access_unit_bytes: u32,
+    pub maximum_rate_millihertz: u64,
+    pub maximum_encoded_bits_per_second: u64,
+    pub maximum_records_per_second: u64,
     pub first_pts_us: Option<i64>,
+    pub duration_us: Option<u64>,
     /// RFC 6381 codec string (`decoder-description-v1`).
     pub codec_string: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RateClaims {
+    window: VecDeque<(i64, u64)>,
+    window_bytes: u64,
+    maximum_records: u64,
+    maximum_bytes: u64,
+    untimed_records: u64,
+    untimed_bytes: u64,
+}
+
+fn packet_timestamp(dts_us: i64, pts_us: i64) -> i64 {
+    if dts_us != AV_NOPTS_VALUE {
+        dts_us
+    } else {
+        pts_us
+    }
+}
+
+impl RateClaims {
+    fn observe(&mut self, timestamp_us: i64, encoded_bytes: usize) -> io::Result<()> {
+        if timestamp_us == AV_NOPTS_VALUE {
+            self.untimed_records = self.untimed_records.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "packet count overflow")
+            })?;
+            self.untimed_bytes = self
+                .untimed_bytes
+                .checked_add(u64::try_from(encoded_bytes).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "packet length exceeds u64")
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "packet bytes overflow")
+                })?;
+            return Ok(());
+        }
+        let encoded_bytes = u64::try_from(encoded_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "packet length exceeds u64"))?;
+        if self
+            .window
+            .back()
+            .is_some_and(|(previous, _)| timestamp_us < *previous)
+        {
+            self.window.clear();
+            self.window_bytes = 0;
+        }
+        let cutoff = timestamp_us.saturating_sub(1_000_000);
+        while self
+            .window
+            .front()
+            .is_some_and(|(timestamp, _)| *timestamp <= cutoff)
+        {
+            let (_, bytes) = self.window.pop_front().expect("front entry exists");
+            self.window_bytes = self.window_bytes.checked_sub(bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "packet rate accounting underflow",
+                )
+            })?;
+        }
+        self.window.push_back((timestamp_us, encoded_bytes));
+        self.window_bytes = self
+            .window_bytes
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet bytes overflow"))?;
+        self.maximum_records = self
+            .maximum_records
+            .max(u64::try_from(self.window.len()).unwrap_or(u64::MAX));
+        self.maximum_bytes = self.maximum_bytes.max(self.window_bytes);
+        Ok(())
+    }
+
+    fn apply_video(&self, info: &mut VideoInfo) {
+        let maximum_record_body = u64::from(
+            vivid_protocol::media::video_body_len(info.max_access_unit_bytes)
+                .unwrap_or(info.max_access_unit_bytes),
+        );
+        let records = self.effective_records();
+        info.maximum_records_per_second = records;
+        info.maximum_rate_millihertz = records.saturating_mul(1_000);
+        info.maximum_encoded_bits_per_second = self
+            .effective_bits(maximum_record_body)
+            .max(u64::try_from(info.bitrate.max(0)).unwrap_or(0))
+            .max(1);
+    }
+
+    fn apply_audio(&self, info: &mut AudioInfo) {
+        let maximum_record_body = u64::from(
+            vivid_protocol::media::audio_body_len(info.max_access_unit_bytes)
+                .unwrap_or(info.max_access_unit_bytes),
+        );
+        let records = self.effective_records();
+        info.maximum_records_per_second = records;
+        info.maximum_rate_millihertz = records.saturating_mul(1_000);
+        info.maximum_encoded_bits_per_second = self
+            .effective_bits(maximum_record_body)
+            .max(u64::try_from(info.bitrate.max(0)).unwrap_or(0))
+            .max(1);
+    }
+
+    fn effective_records(&self) -> u64 {
+        self.maximum_records
+            .saturating_add(self.untimed_records)
+            .max(1)
+    }
+
+    fn effective_bits(&self, maximum_record_body: u64) -> u64 {
+        let observed = self.maximum_bytes.saturating_add(self.untimed_bytes);
+        let bytes = observed.max(maximum_record_body);
+        bytes.saturating_mul(8)
+    }
 }
 
 #[derive(Debug)]
@@ -317,6 +445,7 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     pub pts_us: i64,
     pub dts_us: i64,
+    pub duration_us: u64,
     pub key: bool,
 }
 
@@ -335,6 +464,19 @@ pub enum EncodedMediaPacket {
     Video(EncodedPacket),
     Audio(EncodedAudioPacket),
 }
+
+/// Sentinel cause carried by `VideoDemuxer` errors for containers with no video stream, so
+/// callers can fall back to audio-only handling without matching error text.
+#[derive(Debug)]
+pub struct NoVideoStream;
+
+impl std::fmt::Display for NoVideoStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("media has no video stream")
+    }
+}
+
+impl std::error::Error for NoVideoStream {}
 
 pub struct VideoDemuxer {
     context: *mut AVFormatContext,
@@ -384,10 +526,7 @@ impl VideoDemuxer {
             Some(selected) => selected,
             None => {
                 unsafe { avformat_close_input(&mut context) };
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "media has no video stream",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, NoVideoStream));
             }
         };
 
@@ -441,20 +580,58 @@ impl VideoDemuxer {
         let mut demuxer = Self::open(path)?;
         let mut maximum = 0_usize;
         let mut audio_maximum = 0_usize;
+        let mut video_rate = RateClaims::default();
+        let mut audio_rate = RateClaims::default();
+        let mut video_end_pts = None;
+        let mut audio_end_pts = None;
         while let Some(packet) = demuxer.next_media_packet()? {
             match packet {
                 EncodedMediaPacket::Video(packet) => {
                     maximum = maximum.max(packet.data.len());
+                    let body_length = vivid_protocol::media::video_body_len(
+                        u32::try_from(packet.data.len()).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "video access unit exceeds u32",
+                            )
+                        })?,
+                    )
+                    .map_err(io::Error::other)?;
+                    video_rate.observe(
+                        packet_timestamp(packet.dts_us, packet.pts_us),
+                        usize::try_from(body_length).unwrap_or(usize::MAX),
+                    )?;
                     if packet.pts_us != AV_NOPTS_VALUE {
                         demuxer.info.first_pts_us.get_or_insert(packet.pts_us);
+                        video_end_pts = Some(video_end_pts.map_or(
+                            packet_end_pts(packet.pts_us, packet.duration_us),
+                            |end: i64| end.max(packet_end_pts(packet.pts_us, packet.duration_us)),
+                        ));
                     }
                 }
                 EncodedMediaPacket::Audio(packet) => {
                     audio_maximum = audio_maximum.max(packet.data.len());
+                    let body_length = vivid_protocol::media::audio_body_len(
+                        u32::try_from(packet.data.len()).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "audio access unit exceeds u32",
+                            )
+                        })?,
+                    )
+                    .map_err(io::Error::other)?;
+                    audio_rate.observe(
+                        packet_timestamp(packet.dts_us, packet.pts_us),
+                        usize::try_from(body_length).unwrap_or(usize::MAX),
+                    )?;
                     if packet.pts_us != AV_NOPTS_VALUE
                         && let Some(info) = demuxer.info.audio.as_mut()
                     {
                         info.first_pts_us.get_or_insert(packet.pts_us);
+                        audio_end_pts = Some(audio_end_pts.map_or(
+                            packet_end_pts(packet.pts_us, packet.duration_us),
+                            |end: i64| end.max(packet_end_pts(packet.pts_us, packet.duration_us)),
+                        ));
                     }
                 }
             }
@@ -467,12 +644,17 @@ impl VideoDemuxer {
         }
         demuxer.info.max_access_unit_bytes = u32::try_from(maximum)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "access unit exceeds u32"))?;
+        video_rate.apply_video(&mut demuxer.info);
+        demuxer.info.duration_us = duration_between(demuxer.info.first_pts_us, video_end_pts);
         if let Some(audio) = demuxer.info.audio.as_mut() {
             audio.max_access_unit_bytes = u32::try_from(audio_maximum).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "audio access unit exceeds u32")
             })?;
             if audio.max_access_unit_bytes == 0 {
                 demuxer.info.audio = None;
+            } else {
+                audio_rate.apply_audio(audio);
+                audio.duration_us = duration_between(audio.first_pts_us, audio_end_pts);
             }
         }
         Ok(demuxer.info.clone())
@@ -513,6 +695,7 @@ impl VideoDemuxer {
                     data,
                     pts_us: timestamp_us(packet.pts, self.time_base),
                     dts_us: timestamp_us(packet.dts, self.time_base),
+                    duration_us: timestamp_duration_us(packet.duration, self.time_base),
                 })));
             }
             let time_base = self.audio_time_base.ok_or_else(|| {
@@ -538,6 +721,16 @@ impl VideoDemuxer {
                 trim_end_samples,
             })));
         }
+    }
+
+    pub fn seek_to_us(&mut self, target_pts_us: i64) -> io::Result<()> {
+        seek_context(
+            self.context,
+            self.packet,
+            self.stream_index,
+            self.time_base,
+            target_pts_us,
+        )
     }
 }
 
@@ -620,10 +813,25 @@ impl AudioDemuxer {
     pub fn inspect(path: &Path) -> io::Result<AudioInfo> {
         let mut demuxer = Self::open(path)?;
         let mut maximum = 0_usize;
+        let mut rate = RateClaims::default();
+        let mut end_pts = None;
         while let Some(packet) = demuxer.next_packet()? {
             maximum = maximum.max(packet.data.len());
+            let body_length =
+                vivid_protocol::media::audio_body_len(u32::try_from(packet.data.len()).map_err(
+                    |_| io::Error::new(io::ErrorKind::InvalidData, "audio access unit exceeds u32"),
+                )?)
+                .map_err(io::Error::other)?;
+            rate.observe(
+                packet_timestamp(packet.dts_us, packet.pts_us),
+                usize::try_from(body_length).unwrap_or(usize::MAX),
+            )?;
             if packet.pts_us != AV_NOPTS_VALUE {
                 demuxer.info.first_pts_us.get_or_insert(packet.pts_us);
+                end_pts = Some(end_pts.map_or(
+                    packet_end_pts(packet.pts_us, packet.duration_us),
+                    |end: i64| end.max(packet_end_pts(packet.pts_us, packet.duration_us)),
+                ));
             }
         }
         if maximum == 0 {
@@ -635,7 +843,19 @@ impl AudioDemuxer {
         demuxer.info.max_access_unit_bytes = u32::try_from(maximum).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "audio access unit exceeds u32")
         })?;
+        rate.apply_audio(&mut demuxer.info);
+        demuxer.info.duration_us = duration_between(demuxer.info.first_pts_us, end_pts);
         Ok(demuxer.info.clone())
+    }
+
+    pub fn seek_to_us(&mut self, target_pts_us: i64) -> io::Result<()> {
+        seek_context(
+            self.context,
+            self.packet,
+            self.stream_index,
+            self.time_base,
+            target_pts_us,
+        )
     }
 
     pub fn next_packet(&mut self) -> io::Result<Option<EncodedAudioPacket>> {
@@ -1148,7 +1368,7 @@ unsafe fn video_info(parameters: *mut AVCodecParameters) -> io::Result<(VideoInf
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("codec {codec:?} has no Vivid 1.0 portable packetization"),
+                format!("codec {codec:?} has no Vivid 1.5 portable packetization"),
             ));
         }
     };
@@ -1193,7 +1413,11 @@ unsafe fn video_info(parameters: *mut AVCodecParameters) -> io::Result<(VideoInf
             sar_num,
             sar_den,
             max_access_unit_bytes: 0,
+            maximum_rate_millihertz: 0,
+            maximum_encoded_bits_per_second: 0,
+            maximum_records_per_second: 0,
             first_pts_us: None,
+            duration_us: None,
             has_audio: false,
             audio: None,
             codec_string,
@@ -1346,9 +1570,9 @@ unsafe fn audio_info(
         "mp3" => "mp3-frame-v1",
         "aac" => "aac-raw-au-v1",
         "alac" => "alac-frame-v1",
-        "opus" => vivid_protocol::messages::AUDIO_PACKETIZATION_OPUS,
-        "vorbis" => vivid_protocol::messages::AUDIO_PACKETIZATION_VORBIS,
-        "flac" => vivid_protocol::messages::AUDIO_PACKETIZATION_FLAC,
+        "opus" => vivid_protocol::media::AUDIO_PACKETIZATION_OPUS,
+        "vorbis" => vivid_protocol::media::AUDIO_PACKETIZATION_VORBIS,
+        "flac" => vivid_protocol::media::AUDIO_PACKETIZATION_FLAC,
         "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" | "pcm_f64le"
         | "pcm_mulaw" | "pcm_alaw" => "pcm-packet-v1",
         _ => "unsupported-audio-packetization",
@@ -1370,8 +1594,8 @@ unsafe fn audio_info(
     let sample_rate = u32::try_from(parameters.sample_rate).unwrap_or(0);
     let channels = u16::try_from(parameters.ch_layout.nb_channels).unwrap_or(0);
     let extradata = normalize_audio_extradata(&codec, &extradata)?;
-    if vivid_protocol::messages::valid_audio_packetization(&codec, packetization) {
-        vivid_protocol::messages::validate_audio_initialization(
+    if vivid_protocol::media::valid_audio_packetization(&codec, packetization) {
+        vivid_protocol::media::validate_audio_initialization(
             &codec,
             packetization,
             &extradata,
@@ -1399,7 +1623,11 @@ unsafe fn audio_info(
         channel_mask,
         bitrate: parameters.bit_rate,
         max_access_unit_bytes: 0,
+        maximum_rate_millihertz: 0,
+        maximum_encoded_bits_per_second: 0,
+        maximum_records_per_second: 0,
         first_pts_us,
+        duration_us: stream_duration_us(stream),
         codec_string,
     })
 }
@@ -1725,6 +1953,41 @@ fn timestamp_duration_us(timestamp: i64, time_base: AVRational) -> u64 {
     u64::try_from(timestamp_us(timestamp, time_base)).unwrap_or(u64::MAX)
 }
 
+fn stream_duration_us(stream: &AVStream) -> Option<u64> {
+    (stream.duration > 0).then(|| timestamp_duration_us(stream.duration, stream.time_base))
+}
+
+fn duration_between(first: Option<i64>, end: Option<i64>) -> Option<u64> {
+    first
+        .zip(end)
+        .and_then(|(first, end)| u64::try_from(end.saturating_sub(first)).ok())
+}
+
+fn packet_end_pts(pts_us: i64, duration_us: u64) -> i64 {
+    pts_us.saturating_add(i64::try_from(duration_us).unwrap_or(i64::MAX))
+}
+
+fn seek_context(
+    context: *mut AVFormatContext,
+    packet: *mut AVPacket,
+    stream_index: c_int,
+    time_base: AVRational,
+    target_pts_us: i64,
+) -> io::Result<()> {
+    let timestamp = i128::from(target_pts_us).saturating_mul(i128::from(time_base.den))
+        / i128::from(time_base.num).saturating_mul(1_000_000);
+    let timestamp = timestamp.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    let result = unsafe { av_seek_frame(context, stream_index, timestamp, AVSEEK_FLAG_BACKWARD) };
+    if result < 0 {
+        return Err(ffmpeg_error("could not seek media", result));
+    }
+    unsafe {
+        av_packet_unref(packet);
+        avformat_flush(context);
+    }
+    Ok(())
+}
+
 fn packet_trim(packet: &AVPacket) -> (u32, u32) {
     let mut size = 0_usize;
     let data = unsafe { av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &mut size) };
@@ -1849,5 +2112,42 @@ mod tests {
         assert_eq!(codec_string.as_deref(), Some("vp09.00.41.08"));
         assert_eq!(decoder_config, None);
         assert_eq!(vp9_codec_string(2, 41, 0), None);
+    }
+
+    #[test]
+    fn finite_claims_measure_peak_one_second_windows() {
+        let mut claims = RateClaims::default();
+        claims.observe(0, 10).unwrap();
+        claims.observe(100_000, 20).unwrap();
+        claims.observe(1_100_000, 7).unwrap();
+        assert_eq!(claims.maximum_records, 2);
+        assert_eq!(claims.maximum_bytes, 30);
+    }
+
+    #[test]
+    fn video_demuxer_reports_typed_no_video_stream_for_audio_only_media() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::audio_player::pcm_wav;
+
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "vivi-no-video-{}-{sequence}.wav",
+            std::process::id()
+        ));
+        fs::write(&path, pcm_wav()).unwrap();
+        let video = VideoDemuxer::inspect(&path);
+        let audio = AudioDemuxer::inspect(&path);
+        let _ = fs::remove_file(&path);
+
+        let error = video.expect_err("video inspection must fail without a video stream");
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.downcast_ref::<NoVideoStream>().is_some())
+        );
+        assert!(audio.is_ok(), "audio inspection must succeed: {audio:?}");
     }
 }

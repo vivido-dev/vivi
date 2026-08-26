@@ -1,102 +1,66 @@
 # Vivi
 
-`vivi` is the Vivid Protocol 1.1 image viewer and media player for
-[Vivido](../vivido/). It requires a presenter that selects Vivid 1.1; there is no fallback to the
-retired pre-current profile, anchor-v1, or FFmpeg-packet-v0.
+`vivi` is the Vivid Protocol 1.5 image viewer and media player for
+[Vivido](../vivido/). It is a clean 1.5 producer and does not negotiate or emit Vivid 1.1.
 
-Vivi streams encoded embedded audio and standalone MP3, M4A, FLAC, Ogg/Opus, Ogg/Vorbis, and WAV
-access units to Vivido. Vivido decodes and plays them through the system default CoreAudio, ALSA,
-or WASAPI device. This same path carries sound from a remote Linux Vivi over SSH to a local Windows
-or macOS Vivido. A local Vivi can fall back to direct CPAL output when a presenter does not accept
-the requested audio configuration.
-
-Vivido exposes a private endpoint and per-window token to its child shell:
+Vivido exports private transport discovery and a root secret to its terminal child:
 
 ```text
-VIVID_ENDPOINT=unix:/private/path/to/endpoint.sock
-VIVID_ENDPOINT_BULK=unix:/optional/private/media.sock
-VIVID_TOKEN=<64 hexadecimal characters>
+VIVID_ENDPOINT_CONTROL=unix:/private/path/to/control.sock
+VIVID_ENDPOINT_REALTIME=unix:/optional/private/realtime.sock
+VIVID_ENDPOINT_BULK=unix:/optional/private/bulk.sock
+VIVID_ROOT_SECRET=<64 hexadecimal characters>
 ```
 
-Control always uses `VIVID_ENDPOINT`. If `VIVID_ENDPOINT_BULK` or `--bulk-endpoint` is set,
-non-control connections prefer it and fall back to the primary endpoint only if connection setup
-fails before ticket attachment. Media records never use stdout. Stdout carries only normal
-terminal output and the bounded, authenticated marker-v2 sequence used for inline placement.
-Under multiplexers without Vivid anchor support, Vivi suppresses the marker and places the node at
-the reported grid cursor instead; vvmux consumes and securely projects marker-v2 anchors.
+The realtime endpoint falls back to bulk and then control; bulk falls back to control. The root
+secret is read only from the environment and has no command-line option. Media bytes use
+authenticated track connections, never the terminal PTY. Stdout contains ordinary terminal output
+and, when safe, one bounded authenticated anchor-v3 marker.
 
-## Install
+## Media model
 
-**Pre-requisites:**
+- Every visual input owns a stable `generic-content-v1` surface and terminal scene node.
+- PNG and JPEG normally use a live encoded-image poster track with exact dimensions, length, and
+  SHA-256. A presenter cache hit needs no track connection. Unsupported encoded-image
+  configurations fall back to a complete RGBA8 raster track. SVG and SVGZ inputs are rendered
+  locally with resvg and use the same RGBA8 path; relative image assets are confined to the SVG's
+  directory tree.
+- Video uses a timed primary-video track on the bulk lane. Vivi performs a complete inspection pass
+  before allocation to establish canonical codec metadata, maximum access-unit size, and finite
+  rate/bitrate claims.
+- Presenter audio uses an independent timed audio track on the realtime lane. Audio pre-roll cannot
+  be blocked by video flow, and the active audio slot is the surface playback clock.
+- Opus uses canonical `OpusHead`, Vorbis uses Xiph-laced initialization headers, and FLAC uses the
+  raw 34-byte STREAMINFO payload.
+- Track activation waits for current-generation decoded output and applies video/audio slot changes
+  atomically. EOS is ordered on each track channel and buffered playback completes afterward.
+- A local Vivi may fall back to CPAL when presenter audio is unsupported. Remote sessions never
+  open a remote audio device.
 
-    sudo apt install ffmpeg libasound2-dev  # linux
-    brew install ffmpeg  # mac
-
-Install:
-
-    cargo install vivi
-
-
-## Media paths
-
-- PNG and JPEG are sent as their original encoded bytes with exact dimensions, length, and SHA-256.
-- Other still formats decode to straight-alpha RGBA8. Vivi sends zstd only when the complete zstd
-  record is smaller than the raw record.
-- Video is inspected in a first pass to determine exact metadata and maximum access-unit size, then
-  reopened and streamed as portable H.264/HEVC Annex B, VP9 frames, or AV1 low-overhead units.
-- The first supported audio stream is submitted independently of video decode order. Vivi creates
-  linked video/audio in one ordered control flight and sends a bounded audio pre-roll before
-  `PLAY`. Vivido resamples audio for the default device and uses played audio frames as the A/V
-  clock.
-- Opus uses a complete canonical `OpusHead`, Vorbis uses one three-header Xiph-laced block, and
-  FLAC uses the raw 34-byte STREAMINFO payload. Vivi normalizes FFmpeg/container variants before
-  source creation and never applies Opus pre-skip twice.
-- MP3, AAC/ALAC M4A, Opus, Vorbis, FLAC, and common PCM files keep the Vivid session open until
-  buffered playback has completed. Remote audio-only playback fails clearly when the presenter
-  cannot accept the audio configuration.
-- Unsupported codecs, packetization, or declared color metadata values fail explicitly. When a
-  video omits color metadata, Vivi warns and uses deterministic conventional defaults: BT.601 for
-  SD or BT.709 for HD, with BT.709 transfer and limited range. Vivi never falls back to the retired
-  FFmpeg packet profile.
-
-The background control dispatcher preserves concurrent correlated replies and immediately routes
-credit, visibility, display, keyframe-recovery, source-loss, and keepalive records. Valid inbound
-traffic proves liveness. Clean `PONG` samples conservatively increase the initial `PLAY` buffer to
-at least twice RTT plus 25 ms, capped at 500 ms; they do not drive ongoing adaptation. Video
-production pauses or throttles while invisible and resumes from an acceptable random-access unit
-after `NEED_KEYFRAME`.
-
-After 15 seconds without inbound control traffic, Vivi sends an idle `PING`. Any valid inbound
-record resets liveness; three consecutive unanswered probes terminate the session with a timeout.
+Terminal placement uses marker v3 with complete context identity. Windows SSH sessions select the
+bounded ConPTY form with `VIVID_ANCHOR_TRANSPORT=conpty`. Vivi suppresses markers under an
+untrusted tmux/screen intermediary and uses a viewport-grid node instead.
 
 ## Build
 
-Vivi uses Rust edition 2024 (Rust 1.85 or newer) and FFmpeg development libraries for
-`libavformat`, `libavcodec`, `libavutil`, and `libswresample`. Direct compatibility playback uses
-CPAL (CoreAudio on macOS, ALSA on Linux, and WASAPI on Windows).
+Vivi uses Rust edition 2024 and FFmpeg development libraries for `libavformat`, `libavcodec`,
+`libavutil`, and `libswresample`.
 
 ```bash
 cd vivi
 cargo build
 ```
 
-On macOS, install `ffmpeg` and `pkg-config` with Homebrew. On Debian or Ubuntu, install
-`pkg-config`, the matching FFmpeg development packages including `libswresample-dev`, and
-`libasound2-dev`.
+Typical dependencies:
 
-On Windows, build with the MSVC Rust toolchain from a Visual Studio Developer Command Prompt:
-
-```powershell
-$env:VCPKG_ROOT = "C:\path\to\vcpkg"
-vcpkg install ffmpeg:x64-windows
-$env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
-$env:PATH = "$env:VCPKG_ROOT\installed\x64-windows\bin;$env:PATH"
-cargo build --release
+```bash
+sudo apt install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libasound2-dev
+brew install ffmpeg pkg-config
 ```
 
-The build script derives the FFmpeg ABI layout from the selected vcpkg headers and requires the
-`swresample` import library. Keep that triplet's `bin` directory on `PATH` when running Vivi so its
-FFmpeg DLLs can be found.
+On Windows, use the MSVC Rust toolchain and an FFmpeg vcpkg triplet. The build stages the required
+FFmpeg DLLs beside Cargo's `vivi.exe`, so a successful build runs without a developer-specific
+`PATH`.
 
 ## Usage
 
@@ -104,47 +68,42 @@ Inside Vivido:
 
 ```bash
 vivi photo.png
+vivi drawing.svg
 vivi clip.mkv
 vivi song.mp3
 vivi -z 1.5 photo.webp clip.mp4
+vivi -i clip.mkv
 vivi --bulk-endpoint unix:/private/media.sock clip.mkv
 ```
 
-For a remote login, use `vvssh`; see [Running Vivi over SSH](../docs/vivi-over-ssh.md). The wrapper
-uses private stream-local forwarding and transfers the token through protected stdin setup, never
-as an SSH or remote-shell argument. Audio uses the same Vivid tunnel; see
-[Remote Linux audio over SSH](docs/ssh-linux-audio.md).
+Video and audio use the full terminal window by default. `-i`/`--inline` preserves the previous
+inline placement and non-interactive playback behavior. Full-window playback uses the same keys as
+Kitim: Space pauses or resumes, `f`/`b` seek 10 seconds, Left/Right seek 5 seconds, Up/Down change
+volume by 5%, `g` opens a timestamp prompt, and `q` or Ctrl-C stops the current file. Seeking while
+paused holds the new position until Space is pressed again. Images always remain inline.
 
-To run Linux Vivi in WSL under Windows Vivido, see
-[Running WSL Vivi inside Windows Vivido](../docs/vivi-over-wsl.md). That setup uses WSL environment
-bridging, mirrored loopback networking, and the Windows ConPTY anchor transport.
+For remote use, run `vvssh`; see [Remote Linux audio](docs/ssh-linux-audio.md). A separate media
+transport may provide `VIVID_ENDPOINT_BULK`; realtime audio inherits the protocol fallback chain.
 
-For high-bandwidth or high-latency links, `vvssh --separate-media-transport user@host` creates a
-second lifecycle-bound SSH TCP connection and exports `VIVID_ENDPOINT_BULK` remotely. It is opt-in;
-the ordinary single-transport path remains the default.
+Installing Vivi also installs the small Linux `vvreceive` companion. A current `vvssh` starts it
+quietly before the login shell so a confirmed local file drop can be copied into that shell's
+current directory. Older remote installations keep the existing filename-paste behavior; pass
+`vvssh --no-receive-drops` to suppress helper startup explicitly.
 
-Conformance traces can be generated without a presenter:
+Generate protocol fixtures without a presenter:
 
 ```bash
 vivi --dry-run --verbose photo.png
 vivi --trace-dir /tmp/vivi-trace --verbose clip.mkv
 ```
 
-Each trace begins with the version-1.1 `VIVD` preface and contains Vivid 1.1 records.
-Dry-run and trace modes emit deterministic audio control/media records and never open an audio
-output device.
+Traces contain separate Vivid 1.5 control and track connections with exact 1.5 prefaces. Dry-run
+and trace modes do not read a root secret or open an audio device.
 
-`--no-wait` preserves immediate video submission and skips local video audio. It is invalid for an
-audio-only file, because local playback cannot continue after Vivi exits.
+`--no-wait` still submits ordered media and EOS, but skips presentation/playback completion waits
+and local video audio. Audio-only input still uses a presenter audio track; it does not fall back
+to a local audio device in this mode.
 
-## Limits
-
-Audio device selection, volume controls, generic fragmentation, damage rectangles, shared memory,
-caching, source reconfiguration, session resumption, blind keyframe seeking, adaptive playback
-telemetry, and seek/loop APIs are outside the current profile.
-Very large raw raster frames and access units that exceed their negotiated source ceiling are
-rejected. Windows uses a private loopback TCP endpoint; non-loopback TCP endpoints are rejected by
-`vvssh`.
-
-The normative wire contract is
-[vivid-protocol-1.1-spec.md](../vivid_protocol/vivid-protocol-1.1-spec.md).
+See [Migrating Vivi from Vivid 1.1 to 1.5](docs/vivid-1.1-to-1.5-migration.md) for the breaking
+discovery and object-model changes. The normative contract is
+[Vivid Protocol 1.5](../vivid_protocol/vivid-protocol-1.5-spec.md).
