@@ -1,6 +1,7 @@
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 
 use vivid_protocol::media::AudioPacket;
 use vivid_protocol::messages::{ERROR_TIMEOUT, LaneClass};
@@ -15,7 +16,7 @@ use crate::cli::Config;
 use crate::client::{VividClient, catchup_delivery_rates};
 use crate::ffmpeg::{AudioDemuxer, AudioInfo};
 use crate::image_viewer::{raster_track_configuration, send_full_raster_frame};
-use crate::playback_ui::{Command, PlaybackUi};
+use crate::playback_ui::{Command, PlaybackTimeline, PlaybackUi};
 use crate::terminal_geometry::{
     TerminalGeometry, place_full_window_surface, place_surface, reserve_rows,
     resize_placed_surface, update_full_window_surface,
@@ -239,7 +240,7 @@ fn stream_with_controls(
     ui: Option<&PlaybackUi>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let origin_us = info.first_pts_us.unwrap_or(0);
-    let mut elapsed_us = 0_u64;
+    let mut timeline = PlaybackTimeline::new(0);
     let mut epoch = 1_u32;
     let mut packet_id = 0_u64;
     let mut volume_percent = 100_u32;
@@ -259,38 +260,46 @@ fn stream_with_controls(
         }
         generation = generation.saturating_add(1);
         let channel = client.open_track_channel(track)?;
-        let target_pts_us = origin_us.saturating_add(i64::try_from(elapsed_us).unwrap_or(i64::MAX));
+        let target_pts_us =
+            origin_us.saturating_add(i64::try_from(timeline.current_us()).unwrap_or(i64::MAX));
         let mut demuxer = AudioDemuxer::open(path)?;
-        if elapsed_us != 0 {
+        if timeline.current_us() != 0 {
             demuxer.seek_to_us(target_pts_us)?;
         }
         let mut started = false;
         let mut buffered_us = 0_u64;
-        let mut started_at = None;
         let mut packets_this_generation = 0_u64;
 
         while let Some(packet) = demuxer.next_packet()? {
-            if let Some(geometry) = take_target_geometry(client, track.id())? {
-                pane.resize(client, geometry, config.zoom)?;
-            }
-            if let Some(action) = handle_commands(
-                client,
-                track,
-                ui,
-                pane,
-                config.zoom,
-                &mut volume_percent,
-                current_elapsed(elapsed_us, started_at),
-                info.duration_us,
-            )? {
-                channel.close()?;
-                match action {
-                    ControlAction::Seek(target) => {
-                        elapsed_us = target;
-                        continue 'generation;
-                    }
-                    ControlAction::Quit => return Ok(()),
+            loop {
+                if let Some(geometry) = take_target_geometry(client, track.id())? {
+                    pane.resize(client, geometry, config.zoom)?;
                 }
+                if let Some(action) = handle_commands(
+                    client,
+                    track,
+                    ui,
+                    pane,
+                    config.zoom,
+                    &mut volume_percent,
+                    &mut timeline,
+                    origin_us,
+                    started,
+                    info.duration_us,
+                )? {
+                    channel.close()?;
+                    match action {
+                        ControlAction::Seek(target) => {
+                            timeline.seek(target);
+                            continue 'generation;
+                        }
+                        ControlAction::Quit => return Ok(()),
+                    }
+                }
+                if !timeline.is_paused() || !started {
+                    break;
+                }
+                thread::sleep(Duration::from_micros(UI_POLL_TIMEOUT_US));
             }
             if packet.data.is_empty()
                 || packet
@@ -325,10 +334,14 @@ fn stream_with_controls(
                     INITIAL_BUFFER_US,
                 )?;
                 started = true;
-                started_at = Some(Instant::now());
+                if timeline.is_paused() {
+                    client.pause(track)?;
+                } else {
+                    timeline.started();
+                }
             }
             if let Some(ui) = ui {
-                ui.set_position_us(current_elapsed(elapsed_us, started_at));
+                ui.set_position_us(timeline.current_us());
                 ui.redraw()?;
             }
         }
@@ -349,7 +362,12 @@ fn stream_with_controls(
                 target_pts_us,
                 buffered_us.max(1),
             )?;
-            started_at = Some(Instant::now());
+            started = true;
+            if timeline.is_paused() {
+                client.pause(track)?;
+            } else {
+                timeline.started();
+            }
         }
         channel.eos()?;
         if config.no_wait {
@@ -359,7 +377,7 @@ fn stream_with_controls(
             client.drain(track)?;
         }
         loop {
-            let current = current_elapsed(elapsed_us, started_at);
+            let current = timeline.current_us();
             if let Some(ui) = ui {
                 ui.set_position_us(current.min(info.duration_us.unwrap_or(u64::MAX)));
                 ui.redraw()?;
@@ -371,12 +389,14 @@ fn stream_with_controls(
                 pane,
                 config.zoom,
                 &mut volume_percent,
-                current,
+                &mut timeline,
+                origin_us,
+                started,
                 info.duration_us,
             )? {
                 match action {
                     ControlAction::Seek(target) => {
-                        elapsed_us = target;
+                        timeline.seek(target);
                         continue 'generation;
                     }
                     ControlAction::Quit => return Ok(()),
@@ -420,13 +440,40 @@ fn handle_commands(
     pane: &mut BlankPane,
     zoom: f32,
     volume_percent: &mut u32,
-    current_us: u64,
+    timeline: &mut PlaybackTimeline,
+    origin_us: i64,
+    started: bool,
     duration_us: Option<u64>,
 ) -> io::Result<Option<ControlAction>> {
     let Some(ui) = ui else { return Ok(None) };
     while let Some(command) = ui.try_command() {
         match command {
+            Command::TogglePause => {
+                if timeline.is_paused() {
+                    if started {
+                        let resume_pts_us = origin_us.saturating_add(
+                            i64::try_from(timeline.current_us()).unwrap_or(i64::MAX),
+                        );
+                        client.play(track, resume_pts_us, 1, MAXIMUM_LATENCY_US)?;
+                        timeline.resume();
+                    } else {
+                        timeline.unpause_before_start();
+                    }
+                    ui.set_paused(false);
+                    ui.set_message("Resumed");
+                } else {
+                    if started {
+                        client.pause(track)?;
+                    }
+                    timeline.pause();
+                    ui.set_paused(true);
+                    ui.set_message("Paused");
+                }
+                ui.set_position_us(timeline.current_us());
+                ui.redraw()?;
+            }
             Command::SeekBy(delta) => {
+                let current_us = timeline.current_us();
                 let target = if delta < 0 {
                     current_us.saturating_sub(delta.unsigned_abs())
                 } else {
@@ -500,14 +547,6 @@ fn take_target_geometry(
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(error),
     }
-}
-
-fn current_elapsed(base_us: u64, started_at: Option<Instant>) -> u64 {
-    base_us.saturating_add(
-        started_at
-            .map(|instant| u64::try_from(instant.elapsed().as_micros()).unwrap_or(u64::MAX))
-            .unwrap_or(0),
-    )
 }
 
 fn presenter_code(error: &io::Error) -> Option<u64> {

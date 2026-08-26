@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,10 +17,12 @@ use crate::cli::Config;
 use crate::terminal_geometry::TerminalGeometry;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const STATUS_SHORTCUTS: &str = "f +10s b -10s Left -5s Right +5s Up/Down vol g goto q quit";
+const STATUS_SHORTCUTS: &str =
+    "Space pause/resume f +10s b -10s Left -5s Right +5s Up/Down vol g goto q quit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
+    TogglePause,
     SeekBy(i64),
     SeekTo(u64),
     VolumeBy(i32),
@@ -33,8 +35,66 @@ struct Status {
     current_us: u64,
     duration_us: Option<u64>,
     volume_percent: Option<u32>,
+    paused: bool,
     message: String,
     goto_buffer: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaybackTimeline {
+    position_us: u64,
+    started_at: Option<Instant>,
+    paused: bool,
+}
+
+impl PlaybackTimeline {
+    pub fn new(position_us: u64) -> Self {
+        Self {
+            position_us,
+            started_at: None,
+            paused: false,
+        }
+    }
+
+    pub fn current_us(&self) -> u64 {
+        self.position_us.saturating_add(
+            self.started_at
+                .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+        )
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn started(&mut self) {
+        if !self.paused && self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+        }
+    }
+
+    pub fn pause(&mut self) -> u64 {
+        self.position_us = self.current_us();
+        self.started_at = None;
+        self.paused = true;
+        self.position_us
+    }
+
+    pub fn resume(&mut self) -> u64 {
+        self.paused = false;
+        self.started_at = Some(Instant::now());
+        self.position_us
+    }
+
+    pub fn unpause_before_start(&mut self) {
+        self.paused = false;
+    }
+
+    pub fn seek(&mut self, position_us: u64) {
+        self.position_us = position_us;
+        self.started_at = None;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +143,7 @@ impl PlaybackUi {
             current_us: 0,
             duration_us,
             volume_percent: volume_available.then_some(100),
+            paused: false,
             message: String::new(),
             goto_buffer: None,
         }));
@@ -116,6 +177,10 @@ impl PlaybackUi {
 
     pub fn set_volume_percent(&self, volume_percent: Option<u32>) {
         self.update(|status| status.volume_percent = volume_percent);
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.update(|status| status.paused = paused);
     }
 
     pub fn set_message(&self, message: impl Into<String>) {
@@ -282,6 +347,11 @@ fn handle_key(key: KeyEvent, state: &mut InputState) -> (Option<Command>, Option
     }
 
     match key.code {
+        KeyCode::Char(' ')
+            if key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::NONE =>
+        {
+            (Some(Command::TogglePause), None, false)
+        }
         KeyCode::Char('f') => (Some(Command::SeekBy(10_000_000)), None, false),
         KeyCode::Char('b') => (Some(Command::SeekBy(-10_000_000)), None, false),
         KeyCode::Left => (Some(Command::SeekBy(-5_000_000)), None, false),
@@ -337,6 +407,8 @@ fn status_text(status: &Status) -> String {
         .unwrap_or_else(|| "Vol --".into());
     let middle = if let Some(input) = &status.goto_buffer {
         format!("Goto> {input}  Enter seek Esc cancel")
+    } else if status.paused {
+        "Paused".into()
     } else {
         status.message.clone()
     };
@@ -437,6 +509,43 @@ mod tests {
     }
 
     #[test]
+    fn space_press_toggles_once_and_repeat_is_ignored() {
+        let mut state = InputState::default();
+        let press = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(handle_key(press, &mut state).0, Some(Command::TogglePause));
+
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert_eq!(handle_key(repeat, &mut state).0, None);
+    }
+
+    #[test]
+    fn space_does_not_toggle_while_entering_a_timestamp() {
+        let mut state = InputState {
+            goto_buffer: Some("1".into()),
+        };
+        let press = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(handle_key(press, &mut state).0, None);
+        assert_eq!(state.goto_buffer.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn timeline_freezes_and_seeks_without_clearing_pause() {
+        let mut timeline = PlaybackTimeline::new(2_000_000);
+        timeline.started();
+        let held = timeline.pause();
+        assert!(held >= 2_000_000);
+        assert!(timeline.is_paused());
+        assert_eq!(timeline.current_us(), held);
+
+        timeline.seek(7_000_000);
+        assert!(timeline.is_paused());
+        assert_eq!(timeline.current_us(), 7_000_000);
+        assert_eq!(timeline.resume(), 7_000_000);
+        assert!(!timeline.is_paused());
+    }
+
+    #[test]
     fn goto_accepts_seconds_minutes_and_hours() {
         assert_eq!(parse_timestamp_us("90"), Some(90_000_000));
         assert_eq!(parse_timestamp_us("1:30"), Some(90_000_000));
@@ -459,6 +568,7 @@ mod tests {
             current_us: 0,
             duration_us: None,
             volume_percent: Some(100),
+            paused: false,
             message: String::new(),
             goto_buffer: None,
         };

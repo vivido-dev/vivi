@@ -132,6 +132,14 @@ mod platform {
             Ok(())
         }
 
+        pub fn pause(&self) {
+            self.shared.enabled.store(false, Ordering::SeqCst);
+        }
+
+        pub fn resume(&self) -> io::Result<()> {
+            self.start()
+        }
+
         pub fn set_volume_percent(&self, percent: u32) {
             let gain = (percent.min(200) as f32 / 100.0).to_bits();
             self.shared.gain_bits.store(gain, Ordering::SeqCst);
@@ -415,6 +423,12 @@ mod platform_stub {
             Ok(())
         }
 
+        pub fn pause(&self) {}
+
+        pub fn resume(&self) -> io::Result<()> {
+            Ok(())
+        }
+
         pub fn wait(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -447,24 +461,38 @@ pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
         use std::time::Duration;
 
         use crate::ffmpeg::AudioDemuxer;
-        use crate::playback_ui::{Command, PlaybackUi};
+        use crate::playback_ui::{Command, PlaybackTimeline, PlaybackUi};
 
         let info = AudioDemuxer::inspect(path)?;
         let ui = PlaybackUi::enter(config, path, info.duration_us, true, true)?;
         let mut playback = AudioPlayback::open(path, None)?;
         playback.start()?;
-        let started = std::time::Instant::now();
+        let mut timeline = PlaybackTimeline::new(0);
+        timeline.started();
         let mut volume_percent = 100_u32;
         while !playback.is_finished() {
             if let Some(ui) = ui.as_ref() {
                 ui.set_position_us(
-                    u64::try_from(started.elapsed().as_micros())
-                        .unwrap_or(u64::MAX)
+                    timeline
+                        .current_us()
                         .min(info.duration_us.unwrap_or(u64::MAX)),
                 );
                 while let Some(command) = ui.try_command() {
                     match command {
                         Command::Quit => return Ok(()),
+                        Command::TogglePause => {
+                            if timeline.is_paused() {
+                                playback.resume()?;
+                                timeline.resume();
+                                ui.set_paused(false);
+                                ui.set_message("Resumed");
+                            } else {
+                                playback.pause();
+                                timeline.pause();
+                                ui.set_paused(true);
+                                ui.set_message("Paused");
+                            }
+                        }
                         Command::VolumeBy(delta) => {
                             volume_percent = (volume_percent as i32 + delta).clamp(0, 200) as u32;
                             playback.set_volume_percent(volume_percent);

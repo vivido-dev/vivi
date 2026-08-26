@@ -21,7 +21,7 @@ use crate::audio_streamer::audio_track;
 use crate::cli::Config;
 use crate::client::{DeliveryPacer, VividClient, catchup_delivery_rates};
 use crate::ffmpeg::{AudioDemuxer, EncodedMediaPacket, VideoDemuxer, VideoInfo};
-use crate::playback_ui::{Command, PlaybackUi};
+use crate::playback_ui::{Command, PlaybackTimeline, PlaybackUi};
 use crate::terminal_geometry::{
     TerminalGeometry, cells_for_pixels, place_full_window_surface, place_surface, reserve_rows,
     resize_placed_surface, update_full_window_surface,
@@ -338,8 +338,7 @@ pub fn play(
     let mut recovery_rebase_pending = false;
     let mut recovery_start_pts_us = None;
     let timeline_origin_us = info.first_pts_us.unwrap_or(0);
-    let mut playback_base_us = 0_u64;
-    let mut playback_started_at: Option<Instant> = None;
+    let mut timeline = PlaybackTimeline::new(0);
     let mut play_start_override = None;
     let mut readiness = ReadinessPoll::default();
     let mut video_delivery = DeliveryPacer::new(info.maximum_records_per_second);
@@ -378,83 +377,101 @@ pub fn play(
                 }
             }
             if let Some(ui) = ui.as_ref() {
-                let current_us = playback_base_us.saturating_add(
-                    playback_started_at
-                        .map(|started| {
-                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
-                        })
-                        .unwrap_or(0),
-                );
-                ui.set_position_us(current_us.min(info.duration_us.unwrap_or(u64::MAX)));
                 let mut seek_target = None;
-                while let Some(command) = ui.try_command() {
-                    match command {
-                        Command::Quit => {
-                            let _ = video_channel.close();
-                            cancel_presenter_audio(client, &mut presenter_audio);
-                            cleanup_full_window(
-                                client,
-                                &surface,
-                                &video_track,
-                                placed_node.node_id,
-                            );
-                            return Ok(());
-                        }
-                        Command::Resize(geometry) => {
-                            let layout_geometry = media_geometry(geometry, true);
-                            let size = display_size(
-                                info.width,
-                                info.height,
-                                info.sar_num,
-                                info.sar_den,
-                                config.zoom,
-                                layout_geometry,
-                            );
-                            (column, row) = centered_origin(layout_geometry, size.0, size.1);
-                            update_full_window_surface(
-                                client,
-                                &mut placed_node,
-                                column,
-                                row,
-                                size.0,
-                                size.1,
-                            )?;
-                            (columns, rows) = size;
-                            ui.redraw()?;
-                        }
-                        Command::VolumeBy(delta) => {
-                            let next = (volume_percent as i32 + delta).clamp(0, 200) as u32;
-                            if let Some(audio) = presenter_audio.as_ref()
-                                && client.supports(vivid_protocol::registry::AUDIO_GAIN)
-                            {
-                                client.set_audio_gain(
-                                    &audio.track,
-                                    vivid_sdk::AudioGain::from_percent(next)
-                                        .expect("clamped volume is valid"),
-                                )?;
-                                volume_percent = next;
-                                ui.set_volume_percent(Some(next));
-                                ui.set_message(format!("Volume {next}%"));
-                            } else if let Some(audio) = local_audio.as_ref() {
-                                audio.set_volume_percent(next);
-                                volume_percent = next;
-                                ui.set_volume_percent(Some(next));
-                                ui.set_message(format!("Volume {next}%"));
-                            } else {
-                                ui.set_volume_percent(None);
-                                ui.set_message("Volume unavailable");
+                loop {
+                    let current_us = timeline.current_us();
+                    ui.set_position_us(current_us.min(info.duration_us.unwrap_or(u64::MAX)));
+                    while let Some(command) = ui.try_command() {
+                        match command {
+                            Command::Quit => {
+                                let _ = video_channel.close();
+                                cancel_presenter_audio(client, &mut presenter_audio);
+                                cleanup_full_window(
+                                    client,
+                                    &surface,
+                                    &video_track,
+                                    placed_node.node_id,
+                                );
+                                return Ok(());
                             }
-                            ui.redraw()?;
+                            Command::TogglePause => {
+                                toggle_video_pause(
+                                    client,
+                                    &video_track,
+                                    presenter_audio.as_ref().map(|audio| &audio.track),
+                                    local_audio.as_ref(),
+                                    &mut timeline,
+                                    timeline_origin_us,
+                                    started,
+                                )?;
+                                ui.set_paused(timeline.is_paused());
+                                ui.set_message(if timeline.is_paused() {
+                                    "Paused"
+                                } else {
+                                    "Resumed"
+                                });
+                                ui.redraw()?;
+                            }
+                            Command::Resize(geometry) => {
+                                let layout_geometry = media_geometry(geometry, true);
+                                let size = display_size(
+                                    info.width,
+                                    info.height,
+                                    info.sar_num,
+                                    info.sar_den,
+                                    config.zoom,
+                                    layout_geometry,
+                                );
+                                (column, row) = centered_origin(layout_geometry, size.0, size.1);
+                                update_full_window_surface(
+                                    client,
+                                    &mut placed_node,
+                                    column,
+                                    row,
+                                    size.0,
+                                    size.1,
+                                )?;
+                                (columns, rows) = size;
+                                ui.redraw()?;
+                            }
+                            Command::VolumeBy(delta) => {
+                                let next = (volume_percent as i32 + delta).clamp(0, 200) as u32;
+                                if let Some(audio) = presenter_audio.as_ref()
+                                    && client.supports(vivid_protocol::registry::AUDIO_GAIN)
+                                {
+                                    client.set_audio_gain(
+                                        &audio.track,
+                                        vivid_sdk::AudioGain::from_percent(next)
+                                            .expect("clamped volume is valid"),
+                                    )?;
+                                    volume_percent = next;
+                                    ui.set_volume_percent(Some(next));
+                                    ui.set_message(format!("Volume {next}%"));
+                                } else if let Some(audio) = local_audio.as_ref() {
+                                    audio.set_volume_percent(next);
+                                    volume_percent = next;
+                                    ui.set_volume_percent(Some(next));
+                                    ui.set_message(format!("Volume {next}%"));
+                                } else {
+                                    ui.set_volume_percent(None);
+                                    ui.set_message("Volume unavailable");
+                                }
+                                ui.redraw()?;
+                            }
+                            Command::SeekBy(delta) => {
+                                seek_target = Some(if delta < 0 {
+                                    current_us.saturating_sub(delta.unsigned_abs())
+                                } else {
+                                    current_us.saturating_add(delta as u64)
+                                });
+                            }
+                            Command::SeekTo(target) => seek_target = Some(target),
                         }
-                        Command::SeekBy(delta) => {
-                            seek_target = Some(if delta < 0 {
-                                current_us.saturating_sub(delta.unsigned_abs())
-                            } else {
-                                current_us.saturating_add(delta as u64)
-                            });
-                        }
-                        Command::SeekTo(target) => seek_target = Some(target),
                     }
+                    if seek_target.is_some() || !timeline.is_paused() || !started {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
                 }
                 if let Some(target) = seek_target {
                     let target = target.min(info.duration_us.unwrap_or(u64::MAX));
@@ -499,8 +516,7 @@ pub fn play(
                     first_pts = None;
                     last_pts = None;
                     play_start_override = Some(target_pts);
-                    playback_base_us = target;
-                    playback_started_at = None;
+                    timeline.seek(target);
                     ui.set_position_us(target);
                     ui.set_message(format!("Seek {}", target / 1_000_000));
                     ui.redraw()?;
@@ -632,7 +648,16 @@ pub fn play(
                         })?;
                     started = started_while_sending;
                     if started {
-                        playback_started_at.get_or_insert_with(Instant::now);
+                        if timeline.is_paused() {
+                            pause_video_outputs(
+                                client,
+                                &video_track,
+                                presenter_audio.as_ref().map(|audio| &audio.track),
+                                local_audio.as_ref(),
+                            )?;
+                        } else {
+                            timeline.started();
+                        }
                     }
                     result
                 }
@@ -683,7 +708,16 @@ pub fn play(
                     play_start_override.unwrap_or_else(|| first_pts.unwrap_or(packet.pts_us)),
                 )?;
                 started = true;
-                playback_started_at.get_or_insert_with(Instant::now);
+                if timeline.is_paused() {
+                    pause_video_outputs(
+                        client,
+                        &video_track,
+                        presenter_audio.as_ref().map(|audio| &audio.track),
+                        local_audio.as_ref(),
+                    )?;
+                } else {
+                    timeline.started();
+                }
             }
         }
         if packet_id == 0 {
@@ -717,7 +751,16 @@ pub fn play(
                 play_start_override.unwrap_or_else(|| first_pts.unwrap_or(0)),
             )?;
             started = true;
-            playback_started_at.get_or_insert_with(Instant::now);
+            if timeline.is_paused() {
+                pause_video_outputs(
+                    client,
+                    &video_track,
+                    presenter_audio.as_ref().map(|audio| &audio.track),
+                    local_audio.as_ref(),
+                )?;
+            } else {
+                timeline.started();
+            }
         }
 
         let audio_wait_event = if let Some(audio) = presenter_audio.as_ref() {
@@ -729,17 +772,29 @@ pub fn play(
                 let Some(ui) = ui.as_ref() else {
                     return Ok(None);
                 };
-                let current_us = playback_base_us.saturating_add(
-                    playback_started_at
-                        .map(|started| {
-                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
-                        })
-                        .unwrap_or(0),
-                );
+                let current_us = timeline.current_us();
                 ui.set_position_us(current_us.min(info.duration_us.unwrap_or(u64::MAX)));
                 while let Some(command) = ui.try_command() {
                     match command {
                         Command::Quit => return Ok(Some(AudioWaitEvent::Quit)),
+                        Command::TogglePause => {
+                            toggle_video_pause(
+                                client,
+                                &video_track,
+                                Some(&audio_track),
+                                None,
+                                &mut timeline,
+                                timeline_origin_us,
+                                started,
+                            )?;
+                            ui.set_paused(timeline.is_paused());
+                            ui.set_message(if timeline.is_paused() {
+                                "Paused"
+                            } else {
+                                "Resumed"
+                            });
+                            ui.redraw()?;
+                        }
                         Command::SeekBy(delta) => {
                             let target = if delta < 0 {
                                 current_us.saturating_sub(delta.unsigned_abs())
@@ -861,8 +916,7 @@ pub fn play(
                 first_pts = None;
                 last_pts = None;
                 play_start_override = Some(target_pts);
-                playback_base_us = target;
-                playback_started_at = None;
+                timeline.seek(target);
                 if let Some(ui) = ui.as_ref() {
                     ui.set_position_us(target);
                     ui.set_message(format!("Seek {}", target / 1_000_000));
@@ -917,18 +971,19 @@ pub fn play(
         if config.no_wait {
             break 'playback;
         }
-        let timeline = last_pts
+        let media_span = last_pts
             .zip(first_pts)
             .map_or(0, |(last, first)| last.saturating_sub(first).max(0) as u64);
-        let timeout = Duration::from_micros(timeline).saturating_add(PLAYBACK_COMPLETION_GRACE);
+        let timeout = Duration::from_micros(media_span).saturating_add(PLAYBACK_COMPLETION_GRACE);
         let outcome = wait_for_playback_end(
             client,
             &video_track,
             audio_to_drain.as_ref().map(|audio| &audio.track),
             ui.as_ref(),
             &mut volume_percent,
-            playback_base_us,
-            playback_started_at,
+            &mut timeline,
+            &mut local_audio,
+            timeline_origin_us,
             info.duration_us,
             &info,
             config.zoom,
@@ -1007,8 +1062,7 @@ pub fn play(
                 first_pts = None;
                 last_pts = None;
                 play_start_override = Some(target_pts);
-                playback_base_us = target;
-                playback_started_at = None;
+                timeline.seek(target);
                 if let Some(ui) = ui.as_ref() {
                     ui.set_position_us(target);
                     ui.set_message(format!("Seek {}", target / 1_000_000));
@@ -1035,8 +1089,9 @@ fn wait_for_playback_end(
     audio: Option<&Track>,
     ui: Option<&PlaybackUi>,
     volume_percent: &mut u32,
-    playback_base_us: u64,
-    playback_started_at: Option<Instant>,
+    timeline: &mut PlaybackTimeline,
+    local_audio: &mut Option<audio_player::AudioPlayback>,
+    timeline_origin_us: i64,
     duration_us: Option<u64>,
     info: &VideoInfo,
     zoom: f32,
@@ -1047,20 +1102,45 @@ fn wait_for_playback_end(
     rows: &mut u32,
     overall_timeout: Duration,
 ) -> io::Result<WaitOutcome> {
-    let deadline = Instant::now()
+    let mut deadline = Instant::now()
         .checked_add(overall_timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "playback wait is too long"))?;
+    let mut paused_at = timeline.is_paused().then(Instant::now);
     loop {
         if let Some(ui) = ui {
-            let current = playback_base_us.saturating_add(
-                playback_started_at
-                    .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
-                    .unwrap_or(0),
-            );
+            let current = timeline.current_us();
             ui.set_position_us(current.min(duration_us.unwrap_or(u64::MAX)));
             while let Some(command) = ui.try_command() {
                 match command {
                     Command::Quit => return Ok(WaitOutcome::Quit),
+                    Command::TogglePause => {
+                        toggle_video_pause(
+                            client,
+                            track,
+                            audio,
+                            local_audio.as_ref(),
+                            timeline,
+                            timeline_origin_us,
+                            true,
+                        )?;
+                        if timeline.is_paused() {
+                            paused_at = Some(Instant::now());
+                        } else if let Some(started) = paused_at.take() {
+                            deadline =
+                                deadline.checked_add(started.elapsed()).ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "playback wait is too long",
+                                    )
+                                })?;
+                        }
+                        ui.set_paused(timeline.is_paused());
+                        ui.set_message(if timeline.is_paused() {
+                            "Paused"
+                        } else {
+                            "Resumed"
+                        });
+                    }
                     Command::VolumeBy(delta) => {
                         let next = (*volume_percent as i32 + delta).clamp(0, 200) as u32;
                         if let Some(audio) = audio
@@ -1119,7 +1199,11 @@ fn wait_for_playback_end(
             }
             ui.redraw()?;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = if timeline.is_paused() {
+            Duration::from_millis(50)
+        } else {
+            deadline.saturating_duration_since(Instant::now())
+        };
         if remaining.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1694,6 +1778,54 @@ fn prime_video_seek(client: &mut vivid_sdk::Session, video: &Track, start_pts_us
     }
 }
 
+fn pause_video_outputs(
+    client: &mut vivid_sdk::Session,
+    video: &Track,
+    presenter_audio: Option<&Track>,
+    local_audio: Option<&audio_player::AudioPlayback>,
+) -> io::Result<()> {
+    client.pause(presenter_audio.unwrap_or(video))?;
+    if let Some(audio) = local_audio {
+        audio.pause();
+    }
+    Ok(())
+}
+
+fn toggle_video_pause(
+    client: &mut vivid_sdk::Session,
+    video: &Track,
+    presenter_audio: Option<&Track>,
+    local_audio: Option<&audio_player::AudioPlayback>,
+    timeline: &mut PlaybackTimeline,
+    timeline_origin_us: i64,
+    started: bool,
+) -> io::Result<()> {
+    if timeline.is_paused() {
+        if started {
+            let resume_pts_us = timeline_origin_us
+                .saturating_add(i64::try_from(timeline.current_us()).unwrap_or(i64::MAX));
+            client.play(
+                presenter_audio.unwrap_or(video),
+                resume_pts_us,
+                1,
+                MAXIMUM_LATENCY_US,
+            )?;
+            if let Some(audio) = local_audio {
+                audio.resume()?;
+            }
+            timeline.resume();
+        } else {
+            timeline.unpause_before_start();
+        }
+    } else {
+        if started {
+            pause_video_outputs(client, video, presenter_audio, local_audio)?;
+        }
+        timeline.pause();
+    }
+    Ok(())
+}
+
 fn start_video_playback(
     config: &Config,
     client: &mut VividClient,
@@ -2194,6 +2326,115 @@ mod tests {
         let state = progress.snapshot();
         assert_eq!(state.buffered_us, 40_000);
         assert_eq!(state.last_submitted_end_pts_us, Some(4_040_000));
+    }
+
+    #[test]
+    fn pause_resume_targets_presenter_audio_without_replacing_its_generation() {
+        use vivid_protocol::messages;
+        use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
+
+        let presenter = TestPresenter::start(80, 24).unwrap();
+        let producer = vivid_sdk::ProducerConfig {
+            endpoint_control: Some(presenter.endpoint().to_owned()),
+            endpoint_realtime: Some(presenter.endpoint().to_owned()),
+            endpoint_bulk: Some(presenter.endpoint().to_owned()),
+            authentication: vivid_sdk::ProducerAuthentication::root_hex(ROOT_SECRET_HEX).unwrap(),
+            ..Default::default()
+        };
+        let mut session = vivid_sdk::Session::connect(producer).unwrap();
+        let surface = session
+            .create_surface(
+                video_surface(
+                    session.info().root_context_id,
+                    51,
+                    Path::new("pause-test.webm"),
+                    1,
+                    1,
+                ),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut opus_head = b"OpusHead".to_vec();
+        opus_head.extend_from_slice(&[1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]);
+        let maximum_record_body = vivid_protocol::media::audio_body_len(4_096).unwrap();
+        let audio = session
+            .create_track(
+                TrackConfiguration {
+                    context_id: surface.context_id(),
+                    surface_id: surface.id(),
+                    track_id: 52,
+                    slot: SLOT_AUDIO,
+                    mode: TrackMode::Timed,
+                    lane: LaneClass::Realtime,
+                    maximum_record_body,
+                    maximum_rate_millihertz: 50_000,
+                    maximum_encoded_bits_per_second: 512_000,
+                    maximum_records_per_second: 50,
+                    maximum_inflight_body_bytes: u64::from(maximum_record_body) * 4,
+                    kind: KindConfiguration::Audio(vivid_sdk::AudioConfiguration {
+                        codec: "opus".into(),
+                        packetization: vivid_protocol::media::AUDIO_PACKETIZATION_OPUS.into(),
+                        extradata: opus_head,
+                        sample_rate: 48_000,
+                        channels: 2,
+                        channel_mask: 3,
+                        maximum_access_unit_bytes: 4_096,
+                        codec_string: Some("opus".into()),
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: MAXIMUM_LATENCY_US,
+                    retained_pixel_charge: 0,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let channel = session.open_track_channel(&audio).unwrap();
+        let generation_before = audio.channel_generation();
+        let origin_us = 4_000_000;
+        let mut timeline = PlaybackTimeline::new(2_000_000);
+        timeline.started();
+
+        toggle_video_pause(
+            &mut session,
+            &audio,
+            Some(&audio),
+            None,
+            &mut timeline,
+            origin_us,
+            true,
+        )
+        .unwrap();
+        let held_us = timeline.current_us();
+        toggle_video_pause(
+            &mut session,
+            &audio,
+            Some(&audio),
+            None,
+            &mut timeline,
+            origin_us,
+            true,
+        )
+        .unwrap();
+
+        let controls = presenter.observed();
+        let pause = &controls[controls.len() - 2];
+        let play = &controls[controls.len() - 1];
+        assert_eq!(
+            (pause.record_type, pause.object_id),
+            (messages::PAUSE, audio.id())
+        );
+        assert_eq!(
+            (play.record_type, play.object_id),
+            (messages::PLAY, audio.id())
+        );
+        assert_eq!(
+            play.payload
+                .iter()
+                .find_map(|(key, value)| (*key == 3).then(|| value.as_i64()).flatten()),
+            Some(origin_us.saturating_add(i64::try_from(held_us).unwrap()))
+        );
+        assert_eq!(audio.channel_generation(), generation_before);
+        drop(channel);
     }
 
     #[test]
