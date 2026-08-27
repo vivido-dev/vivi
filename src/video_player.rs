@@ -164,10 +164,33 @@ struct PresenterAudio {
     channel: Arc<TrackChannel>,
     packet_ids: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    pause: Arc<AudioPause>,
     progress: Arc<AudioProgress>,
     /// The rate this track's timeline plays at, which is the rate it is delivered at.
     records_per_second: u64,
     worker: thread::JoinHandle<AudioOutcome>,
+}
+
+#[derive(Clone, Copy)]
+struct PresenterAudioControl<'a> {
+    track: &'a Track,
+    producer_pause: Option<&'a AudioPause>,
+}
+
+impl<'a> PresenterAudioControl<'a> {
+    fn running(audio: &'a PresenterAudio) -> Self {
+        Self {
+            track: &audio.track,
+            producer_pause: Some(&audio.pause),
+        }
+    }
+
+    fn drained(track: &'a Track) -> Self {
+        Self {
+            track,
+            producer_pause: None,
+        }
+    }
 }
 
 struct DrainedPresenterAudio {
@@ -178,8 +201,52 @@ struct DrainedPresenterAudio {
 struct AudioStreamState<'a> {
     packet_ids: &'a AtomicU64,
     stop: &'a AtomicBool,
+    pause: &'a AudioPause,
     progress: &'a AudioProgress,
     recovery: &'a AudioRecoveryTarget,
+}
+
+#[derive(Default)]
+struct AudioPause {
+    paused: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl AudioPause {
+    fn pause(&self) {
+        *self
+            .paused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
+
+    fn resume(&self) {
+        *self
+            .paused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        self.changed.notify_all();
+    }
+
+    fn stop(&self, stop: &AtomicBool) {
+        let _paused = self
+            .paused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        stop.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    fn wait_until_resumed(&self, stop: &AtomicBool) {
+        let paused = self
+            .paused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _paused = self
+            .changed
+            .wait_while(paused, |paused| *paused && !stop.load(Ordering::Acquire))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -398,7 +465,7 @@ pub fn play(
                                 toggle_video_pause(
                                     client,
                                     &video_track,
-                                    presenter_audio.as_ref().map(|audio| &audio.track),
+                                    presenter_audio.as_ref().map(PresenterAudioControl::running),
                                     local_audio.as_ref(),
                                     &mut timeline,
                                     timeline_origin_us,
@@ -652,7 +719,7 @@ pub fn play(
                             pause_video_outputs(
                                 client,
                                 &video_track,
-                                presenter_audio.as_ref().map(|audio| &audio.track),
+                                presenter_audio.as_ref().map(PresenterAudioControl::running),
                                 local_audio.as_ref(),
                             )?;
                         } else {
@@ -712,7 +779,7 @@ pub fn play(
                     pause_video_outputs(
                         client,
                         &video_track,
-                        presenter_audio.as_ref().map(|audio| &audio.track),
+                        presenter_audio.as_ref().map(PresenterAudioControl::running),
                         local_audio.as_ref(),
                     )?;
                 } else {
@@ -755,7 +822,7 @@ pub fn play(
                 pause_video_outputs(
                     client,
                     &video_track,
-                    presenter_audio.as_ref().map(|audio| &audio.track),
+                    presenter_audio.as_ref().map(PresenterAudioControl::running),
                     local_audio.as_ref(),
                 )?;
             } else {
@@ -781,7 +848,10 @@ pub fn play(
                             toggle_video_pause(
                                 client,
                                 &video_track,
-                                Some(&audio_track),
+                                Some(PresenterAudioControl {
+                                    track: &audio_track,
+                                    producer_pause: Some(&audio.pause),
+                                }),
                                 None,
                                 &mut timeline,
                                 timeline_origin_us,
@@ -1117,7 +1187,7 @@ fn wait_for_playback_end(
                         toggle_video_pause(
                             client,
                             track,
-                            audio,
+                            audio.map(PresenterAudioControl::drained),
                             local_audio.as_ref(),
                             timeline,
                             timeline_origin_us,
@@ -1329,10 +1399,12 @@ fn spawn_presenter_audio(
 ) -> PresenterAudio {
     let progress = Arc::new(AudioProgress::default());
     let stop = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AudioPause::default());
     let worker_progress = progress.clone();
     let worker_channel = channel.clone();
     let worker_packet_ids = packet_ids.clone();
     let worker_stop = stop.clone();
+    let worker_pause = pause.clone();
     let path = path.to_path_buf();
     let worker = thread::spawn(move || {
         let result = stream_audio(
@@ -1341,6 +1413,7 @@ fn spawn_presenter_audio(
             AudioStreamState {
                 packet_ids: &worker_packet_ids,
                 stop: &worker_stop,
+                pause: &worker_pause,
                 progress: &worker_progress,
                 recovery: &recovery,
             },
@@ -1367,6 +1440,7 @@ fn spawn_presenter_audio(
         channel,
         packet_ids,
         stop,
+        pause,
         progress,
         records_per_second,
         worker,
@@ -1386,6 +1460,7 @@ fn restart_presenter_audio(
         channel,
         packet_ids,
         stop,
+        pause,
         progress: _,
         records_per_second,
         worker,
@@ -1396,7 +1471,7 @@ fn restart_presenter_audio(
     // generations against the replacement. Advance while the old transport is still owned, which
     // makes any in-flight record stale without losing the track, then wake and join that worker
     // before FLUSH/OPEN starts the next generation.
-    stop.store(true, Ordering::Release);
+    pause.stop(&stop);
     let advanced = client.advance_channel(&track, 1, &RequestMetadata::default());
     let _ = channel.close();
     let worker_result = worker.join();
@@ -1491,6 +1566,13 @@ fn stream_audio(
     }
     let mut recovery_target = None;
     while !state.stop.load(Ordering::Acquire) {
+        // PAUSE is a producer boundary as well as an output clock edge. In particular, a nested
+        // presenter rejects timed packets submitted after an already-started source is paused. If
+        // this demuxer keeps advancing, those rejected packets become an audible skip on resume.
+        state.pause.wait_until_resumed(state.stop);
+        if state.stop.load(Ordering::Acquire) {
+            break;
+        }
         let Some(packet) = demuxer.next_packet()? else {
             break;
         };
@@ -1512,9 +1594,21 @@ fn stream_audio(
         if state.stop.load(Ordering::Acquire) {
             break;
         }
+        // Pause may have arrived while FFmpeg was reading this packet. Hold the packet itself
+        // across the pause rather than dropping it or advancing the demuxer past it.
+        state.pause.wait_until_resumed(state.stop);
+        if state.stop.load(Ordering::Acquire) {
+            break;
+        }
         // Audio is all presented media, so it is paced at the rate it plays from the first
         // packet. The pacer's one second of burst is what fills the presenter's prebuffer.
         delivery.admit_record();
+        // The pacer sleeps in bounded slices. A PAUSE during that wait must still prevent this
+        // exact packet from crossing the paused producer boundary.
+        state.pause.wait_until_resumed(state.stop);
+        if state.stop.load(Ordering::Acquire) {
+            break;
+        }
         let packet_id = next_audio_packet_id(state.packet_ids)?;
         channel.send_audio(AudioPacket {
             epoch,
@@ -1781,10 +1875,18 @@ fn prime_video_seek(client: &mut vivid_sdk::Session, video: &Track, start_pts_us
 fn pause_video_outputs(
     client: &mut vivid_sdk::Session,
     video: &Track,
-    presenter_audio: Option<&Track>,
+    presenter_audio: Option<PresenterAudioControl<'_>>,
     local_audio: Option<&audio_player::AudioPlayback>,
 ) -> io::Result<()> {
-    client.pause(presenter_audio.unwrap_or(video))?;
+    if let Some(pause) = presenter_audio.and_then(|audio| audio.producer_pause) {
+        pause.pause();
+    }
+    if let Err(error) = client.pause(presenter_audio.map_or(video, |audio| audio.track)) {
+        if let Some(pause) = presenter_audio.and_then(|audio| audio.producer_pause) {
+            pause.resume();
+        }
+        return Err(error);
+    }
     if let Some(audio) = local_audio {
         audio.pause();
     }
@@ -1794,7 +1896,7 @@ fn pause_video_outputs(
 fn toggle_video_pause(
     client: &mut vivid_sdk::Session,
     video: &Track,
-    presenter_audio: Option<&Track>,
+    presenter_audio: Option<PresenterAudioControl<'_>>,
     local_audio: Option<&audio_player::AudioPlayback>,
     timeline: &mut PlaybackTimeline,
     timeline_origin_us: i64,
@@ -1805,11 +1907,14 @@ fn toggle_video_pause(
             let resume_pts_us = timeline_origin_us
                 .saturating_add(i64::try_from(timeline.current_us()).unwrap_or(i64::MAX));
             client.play(
-                presenter_audio.unwrap_or(video),
+                presenter_audio.map_or(video, |audio| audio.track),
                 resume_pts_us,
                 1,
                 MAXIMUM_LATENCY_US,
             )?;
+            if let Some(pause) = presenter_audio.and_then(|audio| audio.producer_pause) {
+                pause.resume();
+            }
             if let Some(audio) = local_audio {
                 audio.resume()?;
             }
@@ -1874,7 +1979,7 @@ fn cancel_presenter_audio(client: &mut VividClient, presenter_audio: &mut Option
     let Some(audio) = presenter_audio.take() else {
         return;
     };
-    audio.stop.store(true, Ordering::Release);
+    audio.pause.stop(&audio.stop);
     let _ = audio.channel.close();
     if audio.worker.join().is_err() {
         client.verbose(format_args!(
@@ -2329,6 +2434,31 @@ mod tests {
     }
 
     #[test]
+    fn paused_presenter_audio_holds_the_pending_packet_until_resume() {
+        let pause = Arc::new(AudioPause::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        pause.pause();
+        let worker_pause = pause.clone();
+        let worker_stop = stop.clone();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            worker_pause.wait_until_resumed(&worker_stop);
+            4_020_000
+        });
+
+        ready_receiver.recv().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !worker.is_finished(),
+            "the producer advanced its pending packet across PAUSE"
+        );
+
+        pause.resume();
+        assert_eq!(worker.join().unwrap(), 4_020_000);
+    }
+
+    #[test]
     fn pause_resume_targets_presenter_audio_without_replacing_its_generation() {
         use vivid_protocol::messages;
         use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
@@ -2392,29 +2522,50 @@ mod tests {
         let generation_before = audio.channel_generation();
         let origin_us = 4_000_000;
         let mut timeline = PlaybackTimeline::new(2_000_000);
+        let audio_pause = AudioPause::default();
         timeline.started();
 
         toggle_video_pause(
             &mut session,
             &audio,
-            Some(&audio),
+            Some(PresenterAudioControl {
+                track: &audio,
+                producer_pause: Some(&audio_pause),
+            }),
             None,
             &mut timeline,
             origin_us,
             true,
         )
         .unwrap();
+        assert!(
+            *audio_pause
+                .paused
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "the presenter-audio producer kept advancing after PAUSE"
+        );
         let held_us = timeline.current_us();
         toggle_video_pause(
             &mut session,
             &audio,
-            Some(&audio),
+            Some(PresenterAudioControl {
+                track: &audio,
+                producer_pause: Some(&audio_pause),
+            }),
             None,
             &mut timeline,
             origin_us,
             true,
         )
         .unwrap();
+        assert!(
+            !*audio_pause
+                .paused
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "the presenter-audio producer did not resume after PLAY"
+        );
 
         let controls = presenter.observed();
         let pause = &controls[controls.len() - 2];
