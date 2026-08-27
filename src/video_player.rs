@@ -535,7 +535,11 @@ pub fn play(
                             Command::SeekTo(target) => seek_target = Some(target),
                         }
                     }
-                    if seek_target.is_some() || !timeline.is_paused() || !started {
+                    if seek_target.is_some()
+                        || !timeline.is_paused()
+                        || !started
+                        || seek_pre_roll_outstanding(play_start_override, last_pts)
+                    {
                         break;
                     }
                     thread::sleep(Duration::from_millis(50));
@@ -1783,6 +1787,18 @@ fn is_seek_pre_roll(play_start_override: Option<i64>, pts_us: i64) -> bool {
     play_start_override.is_some_and(|target| pts_us < target)
 }
 
+/// Whether a seek still owes the presenter the access unit its published target sits on.
+///
+/// `started` is not that boundary. Because a nested presenter answers `MILESTONE_OUTPUT_READY`
+/// from the first admitted record, playback starts on the seek's random-access unit - a whole
+/// key-frame interval before the target picture can be decoded. Parking the paused UI there ends
+/// the seek after one reference frame: the presenter has nothing it may show at the target, so the
+/// pane goes blank, and the following resume spends that whole interval pushing pre-roll before
+/// the first visible frame. Deliver through the target first, then hold the pause.
+fn seek_pre_roll_outstanding(play_start_override: Option<i64>, last_pts: Option<i64>) -> bool {
+    play_start_override.is_some_and(|target| last_pts.is_none_or(|delivered| delivered < target))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoDeliveryKind {
     /// Decoder reference traffic before a known seek target.
@@ -2355,6 +2371,33 @@ mod tests {
         assert_eq!(
             video_delivery_kind(Some(target), true, target + 40_000),
             VideoDeliveryKind::Timeline
+        );
+    }
+
+    /// Pausing, then seeking, then holding the pause.
+    ///
+    /// `started` flips on the seek's random-access unit, so gating the paused UI on it alone ends
+    /// the seek one reference frame in: nothing the presenter may show at the target has been sent
+    /// yet, so the pane goes blank, and the resume that follows spends a whole key-frame interval
+    /// pushing pre-roll before the first visible frame.
+    #[test]
+    fn a_paused_seek_keeps_delivering_until_its_target_is_reached() {
+        const TARGET: i64 = 5_000_000;
+        assert!(
+            seek_pre_roll_outstanding(Some(TARGET), None),
+            "the pause gate engaged before the seek delivered anything"
+        );
+        assert!(
+            seek_pre_roll_outstanding(Some(TARGET), Some(TARGET - 1)),
+            "the pause gate engaged while the target was still undecodable"
+        );
+        assert!(
+            !seek_pre_roll_outstanding(Some(TARGET), Some(TARGET)),
+            "the paused seek kept streaming past the frame the user asked for"
+        );
+        assert!(
+            !seek_pre_roll_outstanding(None, None),
+            "an ordinary pause was mistaken for an outstanding seek"
         );
     }
 
