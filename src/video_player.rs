@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use vivid_protocol::MAX_TRACK_WAIT_TIMEOUT_US;
-use vivid_protocol::media::{AudioPacket, VideoPacket};
+use vivid_protocol::media::{self, AudioPacket, VideoPacket};
 use vivid_protocol::messages::{ERROR_TIMEOUT, LaneClass};
 use vivid_protocol::revision::ChannelGeneration;
 use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
@@ -30,6 +30,17 @@ use crate::terminal_geometry::{
 const FIT_MARGIN_COLS: u16 = 4;
 const FIT_MARGIN_ROWS: u16 = 2;
 const AUDIO_PREBUFFER_US: u64 = 100_000;
+/// Reorder depth declared for every relayed video track.
+///
+/// It is a ceiling rather than a measurement, which is what makes it the right bound on how far a
+/// paused seek may feed past its target: no conforming decoder can owe more than this many access
+/// units before it releases the picture the seek asked for.
+const MAXIMUM_REORDER_DEPTH: u8 = 16;
+/// How often a paused seek rechecks for the channel credit its next pre-roll record needs.
+const PAUSED_PRE_ROLL_POLL: Duration = Duration::from_millis(2);
+/// How long a paused seek keeps waiting for that credit past its target before calling the
+/// presenter's silence the end of the pre-roll rather than ordinary relay pacing.
+const PAUSED_PRE_ROLL_GRACE: Duration = Duration::from_millis(400);
 const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(5);
 const MAXIMUM_LATENCY_US: u64 = 2_000_000;
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -261,10 +272,23 @@ struct StreamingRecoveryPlan {
     rebase_playback: bool,
 }
 
-fn streaming_recovery_plan(current_packet_pts_us: i64, started: bool) -> StreamingRecoveryPlan {
+/// Whether a seek's published target is still the picture the presenter owes the user.
+fn seek_target_outstanding(play_start_override: Option<i64>, last_pts: Option<i64>) -> bool {
+    play_start_override.is_some_and(|target| last_pts.is_none_or(|delivered| delivered < target))
+}
+
+fn streaming_recovery_plan(
+    current_packet_pts_us: i64,
+    started: bool,
+    seek_target_outstanding: bool,
+) -> StreamingRecoveryPlan {
     StreamingRecoveryPlan {
         resume_pts_us: current_packet_pts_us,
-        rebase_playback: started,
+        // A seek's target stays authoritative until its pre-roll has reached it. Rebasing the
+        // clock onto the random-access unit this recovery restarts from would move the picture the
+        // user asked for to wherever the decoder happened to need a key unit - which, over a
+        // nested presenter that rebuilds its decoder for the seek, is every seek.
+        rebase_playback: started && !seek_target_outstanding,
     }
 }
 
@@ -407,6 +431,7 @@ pub fn play(
     let timeline_origin_us = info.first_pts_us.unwrap_or(0);
     let mut timeline = PlaybackTimeline::new(0);
     let mut play_start_override = None;
+    let mut paused_seek: Option<PausedSeekPreRoll> = None;
     let mut readiness = ReadinessPoll::default();
     let mut video_delivery = DeliveryPacer::new(info.maximum_records_per_second);
     let mut video_catchup = DeliveryPacer::new(catchup_records);
@@ -535,14 +560,30 @@ pub fn play(
                             Command::SeekTo(target) => seek_target = Some(target),
                         }
                     }
+                    let pre_roll_step = paused_seek.as_mut().map(|pre_roll| {
+                        let credit = video_channel.media_credit_available(
+                            media::video_body_len(
+                                u32::try_from(packet.data.len()).unwrap_or(u32::MAX),
+                            )
+                            .unwrap_or(u32::MAX),
+                        );
+                        pre_roll.step(last_pts, u32::from(MAXIMUM_REORDER_DEPTH), credit)
+                    });
+                    if pre_roll_step == Some(PreRollStep::Done) {
+                        paused_seek = None;
+                    }
                     if seek_target.is_some()
                         || !timeline.is_paused()
                         || !started
-                        || seek_pre_roll_outstanding(play_start_override, last_pts)
+                        || pre_roll_step == Some(PreRollStep::Deliver)
                     {
                         break;
                     }
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(if paused_seek.is_some() {
+                        PAUSED_PRE_ROLL_POLL
+                    } else {
+                        Duration::from_millis(50)
+                    });
                 }
                 if let Some(target) = seek_target {
                     let target = target.min(info.duration_us.unwrap_or(u64::MAX));
@@ -587,6 +628,9 @@ pub fn play(
                     first_pts = None;
                     last_pts = None;
                     play_start_override = Some(target_pts);
+                    paused_seek = timeline
+                        .is_paused()
+                        .then(|| PausedSeekPreRoll::new(target_pts));
                     timeline.seek(target);
                     ui.set_position_us(target);
                     ui.set_message(format!("Seek {}", target / 1_000_000));
@@ -595,7 +639,11 @@ pub fn play(
                 }
             }
             if let Some(recovery) = take_video_recovery(&video_channel)? {
-                let recovery_plan = streaming_recovery_plan(packet.pts_us, started);
+                let recovery_plan = streaming_recovery_plan(
+                    packet.pts_us,
+                    started,
+                    seek_target_outstanding(play_start_override, last_pts),
+                );
                 apply_video_recovery(
                     client,
                     &video_track,
@@ -751,6 +799,20 @@ pub fn play(
                 continue;
             }
             last_pts = Some(packet.pts_us);
+            if let Some(pre_roll) = paused_seek.as_mut()
+                && packet.pts_us >= pre_roll.target_pts_us
+            {
+                if pre_roll.drained == 0 {
+                    // Re-publish the paused position on the access unit that actually carries the
+                    // picture. A seek target is a position on the user's timeline and lands between
+                    // frames; a presenter holding its clock those few milliseconds short of the first
+                    // picture at or after it is holding a picture that is not due yet, and while the
+                    // clock is frozen it never becomes due. Nothing arrives, and the pane keeps
+                    // whatever it had - which, for a replacement decoder, is nothing.
+                    prime_video_seek(client, &video_track, packet.pts_us);
+                }
+                pre_roll.drained = pre_roll.drained.saturating_add(1);
+            }
 
             if started
                 && presenter_audio
@@ -1787,16 +1849,81 @@ fn is_seek_pre_roll(play_start_override: Option<i64>, pts_us: i64) -> bool {
     play_start_override.is_some_and(|target| pts_us < target)
 }
 
-/// Whether a seek still owes the presenter the access unit its published target sits on.
-///
-/// `started` is not that boundary. Because a nested presenter answers `MILESTONE_OUTPUT_READY`
-/// from the first admitted record, playback starts on the seek's random-access unit - a whole
-/// key-frame interval before the target picture can be decoded. Parking the paused UI there ends
-/// the seek after one reference frame: the presenter has nothing it may show at the target, so the
-/// pane goes blank, and the following resume spends that whole interval pushing pre-roll before
-/// the first visible frame. Deliver through the target first, then hold the pause.
-fn seek_pre_roll_outstanding(play_start_override: Option<i64>, last_pts: Option<i64>) -> bool {
-    play_start_override.is_some_and(|target| last_pts.is_none_or(|delivered| delivered < target))
+/// A seek taken while paused, tracked until the presenter can show the frame it asked for.
+#[derive(Debug, Clone, Copy)]
+struct PausedSeekPreRoll {
+    target_pts_us: i64,
+    /// Access units delivered at or after the target, draining the decoder's reorder buffer.
+    drained: u32,
+    /// When the channel first ran out of credit after the target was reached.
+    starved_since: Option<Instant>,
+}
+
+/// What a paused seek should do with the access unit the demuxer just produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreRollStep {
+    /// Hand it to the presenter.
+    Deliver,
+    /// Hold it and keep servicing the UI; the channel has no room right now.
+    Wait,
+    /// The presenter has everything it needs to show the target. Hold the pause.
+    Done,
+}
+
+impl PausedSeekPreRoll {
+    fn new(target_pts_us: i64) -> Self {
+        Self {
+            target_pts_us,
+            drained: 0,
+            starved_since: None,
+        }
+    }
+
+    /// Decide the next step of a paused seek's pre-roll.
+    ///
+    /// Reaching the target is necessary but not sufficient: a decoder releases a picture only once
+    /// it holds the access units that follow it in decode order, so stopping on the target's own
+    /// access unit leaves that picture inside the decoder and the pane on the frame before the
+    /// seek - or, across a presenter that discards everything before the target, on nothing at
+    /// all. Keep feeding past it, bounded by the reorder depth this track declared, which is the
+    /// most a conforming decoder may still owe.
+    ///
+    /// Never block the caller on the channel: it is the thread that reads the keyboard, and a
+    /// paused presenter holds every output past its frozen clock, so the credit a blocked write
+    /// waits for cannot come back until the user resumes.
+    fn step(
+        &mut self,
+        last_delivered_pts_us: Option<i64>,
+        reorder_depth: u32,
+        channel_has_credit: bool,
+    ) -> PreRollStep {
+        let before_target =
+            last_delivered_pts_us.is_none_or(|delivered| delivered < self.target_pts_us);
+        if !before_target && self.drained >= reorder_depth {
+            return PreRollStep::Done;
+        }
+        if channel_has_credit {
+            self.starved_since = None;
+            return PreRollStep::Deliver;
+        }
+        if before_target {
+            // The presenter discards every picture before the target, so it is still reading and
+            // its credit is still coming back. A shortfall here is pacing, not an end.
+            return PreRollStep::Wait;
+        }
+        // Past the target the presenter holds what it decodes and stops reading once the picture
+        // at the frozen clock is out, so sustained starvation is that stop. It has to be
+        // sustained: a nested relay forwards pre-roll one record at a time and empties this
+        // window routinely.
+        match self.starved_since {
+            Some(since) if since.elapsed() >= PAUSED_PRE_ROLL_GRACE => PreRollStep::Done,
+            Some(_) => PreRollStep::Wait,
+            None => {
+                self.starved_since = Some(Instant::now());
+                PreRollStep::Wait
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2250,7 +2377,7 @@ fn video_track(
             coded_height: info.height,
             profile: info.profile,
             level: info.level,
-            maximum_reorder_depth: 16,
+            maximum_reorder_depth: MAXIMUM_REORDER_DEPTH,
             color_primaries: info.color_primaries,
             transfer: info.transfer,
             matrix: info.matrix,
@@ -2378,26 +2505,82 @@ mod tests {
     ///
     /// `started` flips on the seek's random-access unit, so gating the paused UI on it alone ends
     /// the seek one reference frame in: nothing the presenter may show at the target has been sent
-    /// yet, so the pane goes blank, and the resume that follows spends a whole key-frame interval
-    /// pushing pre-roll before the first visible frame.
+    /// yet, and a presenter that discards everything before the target has nothing at all.
     #[test]
-    fn a_paused_seek_keeps_delivering_until_its_target_is_reached() {
+    fn a_paused_seek_delivers_pre_roll_and_then_drains_the_decoder() {
         const TARGET: i64 = 5_000_000;
-        assert!(
-            seek_pre_roll_outstanding(Some(TARGET), None),
-            "the pause gate engaged before the seek delivered anything"
-        );
-        assert!(
-            seek_pre_roll_outstanding(Some(TARGET), Some(TARGET - 1)),
+        let mut pre_roll = PausedSeekPreRoll::new(TARGET);
+        assert_eq!(pre_roll.step(None, 4, true), PreRollStep::Deliver);
+        assert_eq!(
+            pre_roll.step(Some(TARGET - 1), 4, true),
+            PreRollStep::Deliver,
             "the pause gate engaged while the target was still undecodable"
         );
+        assert_eq!(
+            pre_roll.step(Some(TARGET - 1), 4, false),
+            PreRollStep::Wait,
+            "a shortfall before the target ended the pre-roll instead of pacing it"
+        );
+
+        // Reaching the target is not enough: the picture it names is still inside the decoder.
+        pre_roll.drained = 1;
+        assert_eq!(
+            pre_roll.step(Some(TARGET), 4, true),
+            PreRollStep::Deliver,
+            "the drain stopped on the target's own access unit"
+        );
+        pre_roll.drained = 4;
+        assert_eq!(
+            pre_roll.step(Some(TARGET), 4, true),
+            PreRollStep::Done,
+            "the drain ran past the reorder depth the track declared"
+        );
+    }
+
+    /// A paused presenter holds every output past its frozen clock and stops reading once the
+    /// picture at that clock is out. Sustained starvation is that stop - but only sustained: a
+    /// nested relay forwards pre-roll one record at a time and empties this window routinely.
+    #[test]
+    fn a_paused_drain_ends_on_sustained_starvation_not_on_relay_pacing() {
+        const TARGET: i64 = 5_000_000;
+        let mut pre_roll = PausedSeekPreRoll::new(TARGET);
+        pre_roll.drained = 1;
+        assert_eq!(pre_roll.step(Some(TARGET), 8, false), PreRollStep::Wait);
+        assert_eq!(
+            pre_roll.step(Some(TARGET), 8, true),
+            PreRollStep::Deliver,
+            "credit returning after a shortfall did not resume the drain"
+        );
+        assert_eq!(
+            pre_roll.starved_since, None,
+            "a resumed drain kept counting the shortfall it recovered from"
+        );
+
+        pre_roll.starved_since = Some(Instant::now() - PAUSED_PRE_ROLL_GRACE);
+        assert_eq!(
+            pre_roll.step(Some(TARGET), 8, false),
+            PreRollStep::Done,
+            "the drain waited out a presenter that had stopped reading"
+        );
+    }
+
+    /// A seek's target stays authoritative until its pre-roll reaches it. A nested presenter
+    /// rebuilds its decoder for the seek and asks for a key unit, and rebasing onto that unit
+    /// moves the picture the user asked for to wherever the decoder happened to need one.
+    #[test]
+    fn a_keyframe_recovery_does_not_relocate_an_outstanding_seek_target() {
+        let target = 47_641_088;
+        assert!(seek_target_outstanding(Some(target), None));
+        assert!(seek_target_outstanding(Some(target), Some(target - 1)));
+        assert!(!seek_target_outstanding(Some(target), Some(target)));
+        assert!(!seek_target_outstanding(None, Some(0)));
         assert!(
-            !seek_pre_roll_outstanding(Some(TARGET), Some(TARGET)),
-            "the paused seek kept streaming past the frame the user asked for"
+            !streaming_recovery_plan(43_320_000, true, true).rebase_playback,
+            "recovery moved a seek target the pre-roll had not reached"
         );
         assert!(
-            !seek_pre_roll_outstanding(None, None),
-            "an ordinary pause was mistaken for an outstanding seek"
+            streaming_recovery_plan(43_320_000, true, false).rebase_playback,
+            "ordinary streaming recovery stopped rebasing its clock"
         );
     }
 
@@ -2425,7 +2608,7 @@ mod tests {
     #[test]
     fn streaming_recovery_rewinds_from_the_current_packet() {
         assert_eq!(
-            streaming_recovery_plan(58_440_000, true),
+            streaming_recovery_plan(58_440_000, true, false),
             StreamingRecoveryPlan {
                 resume_pts_us: 58_440_000,
                 rebase_playback: true,
@@ -2433,7 +2616,7 @@ mod tests {
             "a playing stream must replay the preceding keyframe and rebase its clock"
         );
         assert_eq!(
-            streaming_recovery_plan(58_440_000, false),
+            streaming_recovery_plan(58_440_000, false, false),
             StreamingRecoveryPlan {
                 resume_pts_us: 58_440_000,
                 rebase_playback: false,
