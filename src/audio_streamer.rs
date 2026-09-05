@@ -666,6 +666,7 @@ pub(crate) fn audio_track(
         info.maximum_encoded_bits_per_second.max(1),
     );
     Ok(TrackConfiguration {
+        direction: Default::default(),
         context_id: surface.context_id(),
         surface_id: surface.id(),
         track_id: client.allocate_id()?,

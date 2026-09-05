@@ -2478,6 +2478,7 @@ fn video_track(
         info.maximum_encoded_bits_per_second.max(1),
     );
     Ok(TrackConfiguration {
+        direction: Default::default(),
         context_id: surface.context_id(),
         surface_id: surface.id(),
         track_id: client.allocate_id()?,
@@ -2854,6 +2855,7 @@ mod tests {
         let audio = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id: surface.context_id(),
                     surface_id: surface.id(),
                     track_id: 52,
@@ -3000,6 +3002,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id: surface.context_id(),
                     surface_id: surface.id(),
                     track_id: 42,
@@ -3077,6 +3080,7 @@ mod tests {
         let video = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id: surface.context_id(),
                     surface_id: surface.id(),
                     track_id: 43,

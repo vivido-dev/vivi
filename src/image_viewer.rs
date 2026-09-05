@@ -189,6 +189,7 @@ fn encoded_image_track(
         .checked_mul(u64::from(height))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "image pixels overflow"))?;
     Ok(TrackConfiguration {
+        direction: Default::default(),
         context_id: surface.context_id(),
         surface_id: surface.id(),
         track_id: client.allocate_id()?,
@@ -223,6 +224,7 @@ pub(crate) fn raster_track_configuration(
 ) -> io::Result<TrackConfiguration> {
     let (maximum_record_body, retained_pixel_charge) = raster_limits(width, height)?;
     Ok(TrackConfiguration {
+        direction: Default::default(),
         context_id: surface.context_id(),
         surface_id: surface.id(),
         track_id: session.allocate_id()?,
