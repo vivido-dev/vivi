@@ -185,7 +185,7 @@ fn blank_frame(width: u32, height: u32) -> io::Result<Vec<u8>> {
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "blank frame size overflow"))?;
     let mut rgba = vec![0_u8; pixels];
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
     Ok(rgba)

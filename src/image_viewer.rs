@@ -13,7 +13,7 @@ use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
 use vivid_sdk::{
     CoordinateModel, ImageConfiguration, MILESTONE_OUTPUT_READY, MILESTONE_PRESENTED,
     RasterConfiguration, RequestMetadata, SlotBinding, SurfaceDefinition, SurfaceDescriptor,
-    SurfaceRole, TrackWaitCondition,
+    SurfaceRole, Track, TrackChannel, TrackWaitCondition,
 };
 
 use crate::cli::Config;
@@ -85,22 +85,22 @@ pub fn view(
         Some(image::ImageFormat::Jpeg) => Some(IMAGE_JPEG),
         _ => None,
     };
-    let track = if let Some(encoding) = encoded_kind {
+    let (track, _channel) = if let Some(encoding) = encoded_kind {
         let configuration =
             encoded_image_track(client, &surface, encoding, width, height, &encoded)?;
-        let probe = probe_configuration(&configuration);
-        if client.probe_track(&probe)?.supported {
-            let track = client.create_track(configuration, &RequestMetadata::default())?;
-            if track.connection_required()? {
-                client.open_track_channel(&track)?.send_image(&encoded)?;
-            } else {
+        if client
+            .probe_track(&probe_configuration(&configuration))?
+            .supported
+        {
+            let (track, channel) = create_encoded_image_track(client, configuration, &encoded)?;
+            if channel.is_none() {
                 client.verbose(format_args!(
                     "image {}: presenter cache hit; skipped {} encoded bytes",
                     path.display(),
                     encoded.len()
                 ));
             }
-            track
+            (track, channel)
         } else {
             let rgba = decode_raster(&encoded, format, width, height)?;
             create_raster_track(client, &surface, width, height, &rgba)?
@@ -146,6 +146,22 @@ pub fn view(
     Ok(())
 }
 
+fn create_encoded_image_track(
+    session: &mut vivid_sdk::Session,
+    configuration: TrackConfiguration,
+    encoded: &[u8],
+) -> io::Result<(Track, Option<TrackChannel>)> {
+    let track = session.create_track(configuration, &RequestMetadata::default())?;
+    let channel = if track.connection_required()? {
+        let channel = session.open_track_channel(&track)?;
+        channel.send_image(encoded)?;
+        Some(channel)
+    } else {
+        None
+    };
+    Ok((track, channel))
+}
+
 fn image_surface(
     context_id: u64,
     surface_id: u64,
@@ -176,7 +192,7 @@ fn image_surface(
 }
 
 fn encoded_image_track(
-    client: &VividClient,
+    client: &vivid_sdk::Session,
     surface: &vivid_sdk::Surface,
     encoding: u64,
     width: u32,
@@ -263,12 +279,12 @@ pub(crate) fn send_full_raster_frame(
 }
 
 fn create_raster_track(
-    client: &mut VividClient,
+    client: &mut vivid_sdk::Session,
     surface: &vivid_sdk::Surface,
     width: u32,
     height: u32,
     rgba: &[u8],
-) -> io::Result<vivid_sdk::Track> {
+) -> io::Result<(Track, Option<TrackChannel>)> {
     let expected_length = usize::try_from(u64::from(width) * u64::from(height))
         .ok()
         .and_then(|pixels| pixels.checked_mul(4))
@@ -290,8 +306,9 @@ fn create_raster_track(
         ));
     }
     let track = client.create_track(configuration, &RequestMetadata::default())?;
-    send_full_raster_frame(client, &track, rgba)?;
-    Ok(track)
+    let channel = client.open_track_channel(&track)?;
+    channel.send_raster(1, 1, rgba, false)?;
+    Ok((track, Some(channel)))
 }
 
 fn decode_raster(
@@ -456,8 +473,10 @@ fn display_size(width: u32, height: u32, zoom: f32, geometry: TerminalGeometry) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
 
     static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -490,6 +509,65 @@ mod tests {
         let path = directory.path().join("image.svg");
         std::fs::write(&path, source)?;
         render_svg(&path, source)
+    }
+
+    fn test_producer(presenter: &TestPresenter) -> vivid_sdk::ProducerConfig {
+        vivid_sdk::ProducerConfig {
+            endpoint_control: Some(presenter.endpoint().to_owned()),
+            endpoint_realtime: Some(presenter.endpoint().to_owned()),
+            endpoint_bulk: Some(presenter.endpoint().to_owned()),
+            authentication: vivid_sdk::ProducerAuthentication::root_hex(ROOT_SECRET_HEX).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn encoded_image_channel_survives_readiness_and_activation() {
+        let presenter = TestPresenter::start(80, 24).unwrap();
+        let mut session = vivid_sdk::Session::connect(test_producer(&presenter)).unwrap();
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                image_surface(context_id, 41, Path::new("image.png"), 1, 1),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        let configuration =
+            encoded_image_track(&session, &surface, IMAGE_PNG, 1, 1, &encoded).unwrap();
+
+        let (track, channel) =
+            create_encoded_image_track(&mut session, configuration, &encoded).unwrap();
+        session
+            .wait_track(
+                &track,
+                TrackWaitCondition::MilestoneSet,
+                Some(MILESTONE_OUTPUT_READY),
+                timeout_us(PRESENTATION_TIMEOUT),
+            )
+            .unwrap();
+        session
+            .activate_tracks(
+                &surface,
+                &[SlotBinding {
+                    slot: track.configuration().unwrap().slot,
+                    track_id: track.id(),
+                    expected_channel_generation: track.channel_generation(),
+                    required_milestone: MILESTONE_OUTPUT_READY,
+                }],
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        channel
+            .expect("an uncached encoded image retains its track channel")
+            .eos()
+            .unwrap();
+        session.close().unwrap();
     }
 
     #[test]
