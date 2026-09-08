@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,9 @@ use crossterm::style::Print;
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::cli::Config;
 use crate::terminal_geometry::TerminalGeometry;
@@ -37,6 +41,7 @@ struct Status {
     volume_percent: Option<u32>,
     paused: bool,
     message: String,
+    audio_unavailable: bool,
     goto_buffer: Option<String>,
 }
 
@@ -102,8 +107,54 @@ struct InputState {
     goto_buffer: Option<String>,
 }
 
+#[derive(Default)]
+struct CommandQueue {
+    pending: Mutex<VecDeque<Command>>,
+    quit: AtomicBool,
+}
+impl CommandQueue {
+    fn pop(&self) -> Option<Command> {
+        if self.quit.load(Ordering::SeqCst) {
+            return Some(Command::Quit);
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop_front()
+    }
+    fn push(&self, command: Command) -> bool {
+        let mut queue = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(last) = queue.back_mut() {
+            match (&mut *last, command) {
+                (Command::Resize(old), Command::Resize(new)) => {
+                    *old = new;
+                    return true;
+                }
+                (Command::SeekBy(old), Command::SeekBy(new)) => {
+                    *old = old.saturating_add(new);
+                    return true;
+                }
+                (Command::SeekTo(old), Command::SeekTo(new)) => {
+                    *old = new;
+                    return true;
+                }
+                (Command::VolumeBy(old), Command::VolumeBy(new)) => {
+                    *old = old.saturating_add(new);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if queue.len() >= 31 {
+            return false;
+        }
+        queue.push_back(command);
+        true
+    }
+}
+
 pub struct PlaybackUi {
-    receiver: mpsc::Receiver<Command>,
+    commands: Arc<CommandQueue>,
     running: Arc<AtomicBool>,
     input: Option<thread::JoinHandle<()>>,
     status: Arc<Mutex<Status>>,
@@ -126,6 +177,7 @@ impl PlaybackUi {
         duration_us: Option<u64>,
         volume_available: bool,
         audio_only: bool,
+        cancel: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> io::Result<Option<Self>> {
         if !Self::enabled(config) {
             return Ok(None);
@@ -145,20 +197,28 @@ impl PlaybackUi {
             volume_percent: volume_available.then_some(100),
             paused: false,
             message: String::new(),
+            audio_unavailable: false,
             goto_buffer: None,
         }));
         draw(&status, title.as_deref())?;
 
         let running = Arc::new(AtomicBool::new(true));
-        let (sender, receiver) = mpsc::channel();
+        let commands = Arc::new(CommandQueue::default());
+        let input_commands = commands.clone();
         let input_running = running.clone();
         let input_status = status.clone();
         let input_title = title.clone();
         let input = thread::spawn(move || {
-            input_loop(sender, input_running, input_status, input_title);
+            input_loop(
+                input_commands,
+                input_running,
+                input_status,
+                input_title,
+                cancel,
+            );
         });
         Ok(Some(Self {
-            receiver,
+            commands,
             running,
             input: Some(input),
             status,
@@ -168,7 +228,16 @@ impl PlaybackUi {
     }
 
     pub fn try_command(&self) -> Option<Command> {
-        self.receiver.try_recv().ok()
+        self.commands.pop()
+    }
+
+    pub fn defer_command(&self, command: Command) {
+        // Only the coordinator returns the one command it just removed.
+        self.commands
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_front(command);
     }
 
     pub fn set_position_us(&self, position_us: u64) {
@@ -181,6 +250,10 @@ impl PlaybackUi {
 
     pub fn set_paused(&self, paused: bool) {
         self.update(|status| status.paused = paused);
+    }
+
+    pub fn set_audio_unavailable(&self, unavailable: bool) {
+        self.update(|status| status.audio_unavailable = unavailable);
     }
 
     pub fn set_message(&self, message: impl Into<String>) {
@@ -245,10 +318,11 @@ fn leave_terminal(output: &mut impl Write) -> io::Result<()> {
 }
 
 fn input_loop(
-    sender: mpsc::Sender<Command>,
+    commands: Arc<CommandQueue>,
     running: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
     title: Option<String>,
+    cancel: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let mut input = InputState::default();
     let mut drawn_position_second = 0;
@@ -273,16 +347,29 @@ fn input_loop(
                     }
                     if let Some(command) = command {
                         if command == Command::Quit {
-                            running.store(false, Ordering::SeqCst);
-                        }
-                        if sender.send(command).is_err() {
+                            commands.quit.store(true, Ordering::SeqCst);
+                            crate::ffmpeg::cancel_native_io();
+                            let deadline = Instant::now() + Duration::from_secs(2);
+                            while running.load(Ordering::SeqCst) && Instant::now() < deadline {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            if running.load(Ordering::SeqCst)
+                                && let Some(cancel) = &cancel
+                            {
+                                cancel();
+                            }
                             break;
+                        }
+                        if !commands.push(command) {
+                            status.lock().unwrap_or_else(|p| p.into_inner()).message =
+                                "Controls busy; retry the command".into();
+                            let _ = draw(&status, title.as_deref());
                         }
                     }
                 }
                 Ok(Event::Resize(_, _)) => {
                     let geometry = TerminalGeometry::current();
-                    let _ = sender.send(Command::Resize(geometry));
+                    let _ = commands.push(Command::Resize(geometry));
                     let _ = draw(&status, title.as_deref());
                 }
                 Ok(_) => {}
@@ -375,7 +462,7 @@ fn draw(status: &Arc<Mutex<Status>>, title: Option<&str>) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     if let Some(title) = title {
         let title = truncate(title, columns);
-        let column = columns.saturating_sub(title.chars().count() as u16) / 2;
+        let column = columns.saturating_sub(u16::try_from(title.width()).unwrap_or(columns)) / 2;
         let row = rows.saturating_sub(1) / 2;
         execute!(
             stdout,
@@ -408,9 +495,18 @@ fn status_text(status: &Status) -> String {
     let middle = if let Some(input) = &status.goto_buffer {
         format!("Goto> {input}  Enter seek Esc cancel")
     } else if status.paused {
-        "Paused".into()
+        if status.message.is_empty() || matches!(status.message.as_str(), "Paused" | "Resumed") {
+            "Paused".into()
+        } else {
+            format!("Paused | {}", status.message)
+        }
     } else {
         status.message.clone()
+    };
+    let middle = if status.audio_unavailable {
+        format!("Audio unavailable | {middle}")
+    } else {
+        middle
     };
     if middle.is_empty() {
         format!(
@@ -466,13 +562,90 @@ fn parse_timestamp_us(value: &str) -> Option<u64> {
     seconds.checked_mul(1_000_000)
 }
 
+pub fn safe_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '�' } else { c })
+        .collect()
+}
+
 fn truncate(value: &str, columns: u16) -> String {
-    value.chars().take(columns as usize).collect()
+    let safe = safe_text(value);
+    let mut width = 0;
+    safe.graphemes(true)
+        .take_while(|g| {
+            width += g.width();
+            width <= usize::from(columns)
+        })
+        .collect()
+}
+
+/// Freeze the UI estimate at the current generation's observed presenter clock.
+pub fn paused_position(
+    session: &vivid_sdk::Session,
+    track: &vivid_sdk::Track,
+    origin_us: i64,
+) -> io::Result<u64> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = session.query_track(track)?;
+        if status.channel_generation == track.channel_generation()
+            && let Some(map) = &status.playback_state
+        {
+            let value = |key| map.iter().find(|(k, _)| *k == key).map(|(_, value)| value);
+            if value(3).and_then(vivid_protocol::cbor::Value::as_u64) == Some(3)
+                && value(5).and_then(vivid_protocol::cbor::Value::as_u64)
+                    == Some(u64::from(status.media_epoch))
+                && let Some(pts) = value(4).and_then(vivid_protocol::cbor::Value::as_i64)
+            {
+                return Ok(pts.saturating_sub(origin_us).max(0) as u64);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "presenter did not report a frozen clock; update the presenter and remote vvmux, then retry",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controls_are_bounded_and_quit_bypasses_capacity() {
+        let queue = CommandQueue::default();
+        for _ in 0..31 {
+            assert!(queue.push(Command::TogglePause));
+        }
+        assert!(!queue.push(Command::SeekTo(1)));
+        queue.quit.store(true, Ordering::SeqCst);
+        assert_eq!(queue.pop(), Some(Command::Quit));
+        assert_eq!(queue.pending.lock().unwrap().len(), 31);
+    }
+
+    #[test]
+    fn coalescing_preserves_pause_ordering_barriers() {
+        let queue = CommandQueue::default();
+        queue.push(Command::SeekBy(1));
+        queue.push(Command::SeekBy(2));
+        queue.push(Command::TogglePause);
+        queue.push(Command::SeekBy(4));
+        assert_eq!(queue.pop(), Some(Command::SeekBy(3)));
+        assert_eq!(queue.pop(), Some(Command::TogglePause));
+        assert_eq!(queue.pop(), Some(Command::SeekBy(4)));
+    }
+
+    #[test]
+    fn terminal_text_is_safe_and_clips_complete_graphemes() {
+        assert_eq!(truncate("\x1b[31m\n", 20), "�[31m�");
+        assert_eq!(truncate("界a", 2), "界");
+        assert_eq!(truncate("e\u{301}x", 1), "e\u{301}");
+        assert_eq!(truncate("界", 1), "");
+    }
 
     #[test]
     fn kitim_seek_keys_are_preserved() {
@@ -570,6 +743,7 @@ mod tests {
             volume_percent: Some(100),
             paused: false,
             message: String::new(),
+            audio_unavailable: false,
             goto_buffer: None,
         };
         assert!(status_text(&status).contains("f +10s"));

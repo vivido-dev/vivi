@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use vivid_protocol::MAX_TRACK_WAIT_TIMEOUT_US;
-use vivid_protocol::media::{self, AudioPacket, VideoPacket};
+use vivid_protocol::media::{self, AudioPacket};
 use vivid_protocol::messages::{ERROR_TIMEOUT, LaneClass};
 use vivid_protocol::revision::ChannelGeneration;
 use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
@@ -40,7 +40,6 @@ const MAXIMUM_REORDER_DEPTH: u8 = 16;
 const PAUSED_PRE_ROLL_POLL: Duration = Duration::from_millis(2);
 /// How long a paused seek keeps waiting for that credit past its target before calling the
 /// presenter's silence the end of the pre-roll rather than ordinary relay pacing.
-const PAUSED_PRE_ROLL_GRACE: Duration = Duration::from_millis(400);
 const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(5);
 const MAXIMUM_LATENCY_US: u64 = 2_000_000;
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -179,7 +178,37 @@ struct PresenterAudio {
     progress: Arc<AudioProgress>,
     /// The rate this track's timeline plays at, which is the rate it is delivered at.
     records_per_second: u64,
-    worker: thread::JoinHandle<AudioOutcome>,
+    worker: AudioWorker,
+}
+
+struct AudioWorker {
+    thread: Option<thread::JoinHandle<AudioOutcome>>,
+    stop: Arc<AtomicBool>,
+    pause: Arc<AudioPause>,
+    channel: Arc<TrackChannel>,
+}
+impl AudioWorker {
+    fn join(mut self) -> thread::Result<AudioOutcome> {
+        self.thread
+            .take()
+            .expect("audio worker owned until join")
+            .join()
+    }
+}
+impl std::ops::Deref for AudioWorker {
+    type Target = thread::JoinHandle<AudioOutcome>;
+    fn deref(&self) -> &Self::Target {
+        self.thread.as_ref().expect("audio worker owned until join")
+    }
+}
+impl Drop for AudioWorker {
+    fn drop(&mut self) {
+        if let Some(worker) = self.thread.take() {
+            self.pause.stop(&self.stop);
+            let _ = self.channel.close();
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -220,7 +249,7 @@ struct AdvancedPresenterAudio {
 
 struct AudioStreamState<'a> {
     packet_ids: &'a AtomicU64,
-    stop: &'a AtomicBool,
+    stop: &'a Arc<AtomicBool>,
     pause: &'a AudioPause,
     progress: &'a AudioProgress,
     recovery: &'a AudioRecoveryTarget,
@@ -340,6 +369,12 @@ fn accumulate_seek_by(target: &mut Option<u64>, current_us: u64, delta_us: i64) 
     });
 }
 
+fn clamp_video_seek(target: u64, origin_us: i64, last_pts_us: Option<i64>) -> u64 {
+    // Duration includes the last picture's display interval; no picture starts at duration itself.
+    let last = last_pts_us.map(|pts| u64::try_from(pts.saturating_sub(origin_us)).unwrap_or(0));
+    target.min(last.unwrap_or(u64::MAX))
+}
+
 fn seek_request_metadata() -> io::Result<RequestMetadata> {
     let mut causation_id = [0_u8; vivid_protocol::messages::CAUSATION_ID_BYTES];
     getrandom::fill(&mut causation_id).map_err(io::Error::other)?;
@@ -361,6 +396,7 @@ pub fn play(
         info.duration_us,
         info.has_audio && client.supports(vivid_protocol::registry::AUDIO_GAIN),
         false,
+        Some(client.cancel_handle()),
     )?;
     if info.colorimetry_inferred {
         client.verbose(format_args!(
@@ -413,7 +449,7 @@ pub fn play(
     let video_track = client.create_track(video_configuration, &RequestMetadata::default())?;
     let mut video_channel = Arc::new(client.open_track_channel(&video_track)?);
 
-    let remote = std::env::var_os("VIVID_REMOTE").is_some();
+    let remote = !crate::client::local_audio_allowed();
     let audio_recovery = Arc::new(AudioRecoveryTarget::default());
     let mut volume_percent = 100_u32;
     let mut presenter_audio = create_presenter_audio(
@@ -452,6 +488,7 @@ pub fn play(
     }
 
     let mut demuxer = VideoDemuxer::open(path)?;
+    demuxer.skip_audio();
     let mut packet_id = 0_u64;
     let mut epoch = 1_u32;
     let mut awaiting_keyframe = true;
@@ -464,13 +501,16 @@ pub fn play(
     let mut timeline = PlaybackTimeline::new(0);
     let mut play_start_override = None;
     let mut paused_seek: Option<PausedSeekPreRoll> = None;
+    let mut pending_seek_metadata = None;
     let mut readiness = ReadinessPoll::default();
     let mut video_delivery = DeliveryPacer::new(info.maximum_records_per_second);
     let mut video_catchup = DeliveryPacer::new(catchup_records);
+    let mut consecutive_send_failures = 0_u32;
+    let mut media_sender = crate::media_sender::MediaSender::new()?;
     'playback: loop {
         let packets_before_generation = packet_id;
         while let Some(media) = demuxer.next_media_packet()? {
-            let EncodedMediaPacket::Video(packet) = media else {
+            let EncodedMediaPacket::Video(mut packet) = media else {
                 continue;
             };
             if let Some(geometry) = take_target_geometry(client, video_track.id())? {
@@ -501,6 +541,9 @@ pub fn play(
                 }
             }
             if let Some(ui) = ui.as_ref() {
+                ui.set_audio_unavailable(
+                    info.has_audio && presenter_audio.is_none() && local_audio.is_none(),
+                );
                 let mut seek_target = None;
                 loop {
                     let current_us = timeline.current_us();
@@ -591,6 +634,25 @@ pub fn play(
                             Command::SeekTo(target) => seek_target = Some(target),
                         }
                     }
+                    if let Some(pre_roll) = paused_seek.as_mut()
+                        && pre_roll
+                            .last_query
+                            .is_none_or(|last| last.elapsed() >= Duration::from_millis(100))
+                    {
+                        pre_roll.last_query = Some(Instant::now());
+                        let status = client.query_track(&video_track)?;
+                        pre_roll.observed = status.channel_generation
+                            == video_track.channel_generation()
+                            && status.media_epoch == epoch
+                            && status.last_presentation_id != 0
+                            && status.last_presented_pts_us >= pre_roll.target_pts_us;
+                        if !pre_roll.observed
+                            && pre_roll.started_at.elapsed() >= PLAYBACK_START_TIMEOUT
+                        {
+                            ui.set_message("Seek timed out waiting for the displayed frame; resume or seek again");
+                            paused_seek = None;
+                        }
+                    }
                     let pre_roll_step = paused_seek.as_mut().map(|pre_roll| {
                         let credit = video_channel.media_credit_available(
                             media::video_body_len(
@@ -617,50 +679,25 @@ pub fn play(
                     });
                 }
                 if let Some(target) = seek_target {
-                    let target = target.min(info.duration_us.unwrap_or(u64::MAX));
+                    let target = clamp_video_seek(target, timeline_origin_us, info.last_pts_us);
                     let target_pts = timeline_origin_us
                         .saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
-                    if started {
-                        client.pause(&video_track)?;
-                    }
-                    epoch = epoch
-                        .checked_add(1)
-                        .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
-                    let seek_metadata = seek_request_metadata()?;
-                    let advanced_audio = if presenter_audio.is_some() {
-                        // Make the linked slot non-authoritative, then retire its old producer
-                        // before changing video generation. No old or replacement audio can race
-                        // either of the bridge snapshots produced by the paired advances.
-                        clear_audio_slot(client, &surface)?;
-                        presenter_audio.take().and_then(|audio| {
-                            advance_presenter_audio_for_seek(client, audio, &seek_metadata)
-                        })
-                    } else {
-                        None
-                    };
-                    replace_video_channel(
+                    presenter_audio = seek_video_generation(
                         client,
-                        &video_track,
-                        &mut video_channel,
-                        epoch,
-                        false,
-                        vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY,
-                        &seek_metadata,
-                    )?;
-                    demuxer.seek_to_us(target_pts)?;
-                    let _ = audio_recovery.take();
-                    presenter_audio = advanced_audio.and_then(|audio| {
-                        open_presenter_audio_after_seek(
-                            client,
+                        SeekTransition {
                             path,
-                            audio_recovery.clone(),
-                            audio,
+                            surface: &surface,
+                            video: &video_track,
+                            channel: &mut video_channel,
+                            demuxer: &mut demuxer,
+                            epoch: &mut epoch,
                             target_pts,
-                            epoch,
-                        )
-                    });
-                    prime_video_seek(client, &video_track, target_pts);
-                    local_audio = None;
+                            metadata: pending_seek_metadata.take(),
+                            audio: SeekAudio::Running(presenter_audio.take()),
+                            recovery: audio_recovery.clone(),
+                            local_audio: &mut local_audio,
+                        },
+                    )?;
                     awaiting_keyframe = true;
                     recovery_rebase_pending = false;
                     recovery_start_pts_us = None;
@@ -682,7 +719,7 @@ pub fn play(
                 let recovery_plan = streaming_recovery_plan(
                     packet.pts_us,
                     started,
-                    seek_target_outstanding(play_start_override, last_pts),
+                    paused_seek.is_some() || seek_target_outstanding(play_start_override, last_pts),
                 );
                 apply_video_recovery(
                     client,
@@ -726,87 +763,120 @@ pub fn play(
             let first_pts_before_send = first_pts;
             first_pts.get_or_insert(packet.pts_us);
             let delivery_kind = video_delivery_kind(play_start_override, started, packet.pts_us);
-            let send_result = match delivery_kind {
-                VideoDeliveryKind::CatchUp => {
-                    // Pre-roll cannot produce a visible frame before the published seek target.
-                    // Stream it directly: observing OUTPUT_READY here serializes media behind one
-                    // control round trip per packet whenever the transports have noticeable RTT.
-                    video_catchup.admit_record();
-                    video_channel.send_video(VideoPacket {
-                        epoch,
-                        packet_id,
-                        pts_us: packet.pts_us,
-                        dts_us: packet.dts_us,
-                        duration_us: packet.duration_us,
-                        key: packet.key,
-                        data: &packet.data,
-                    })
-                }
-                VideoDeliveryKind::Timeline => {
-                    video_delivery.admit_record();
-                    video_channel.send_video(VideoPacket {
-                        epoch,
-                        packet_id,
-                        pts_us: packet.pts_us,
-                        dts_us: packet.dts_us,
-                        duration_us: packet.duration_us,
-                        key: packet.key,
-                        data: &packet.data,
-                    })
-                }
-                VideoDeliveryKind::ObserveStart => {
-                    let channel = video_channel.clone();
-                    let data = packet.data.clone();
-                    let pts_us = packet.pts_us;
-                    let dts_us = packet.dts_us;
-                    let key = packet.key;
-                    let duration_us = packet.duration_us;
-                    // Initial startup and seek pre-roll may need control progress to release a
-                    // blocked priming write. In particular, a nested presenter grants only bounded
-                    // pre-PLAY capacity. Start the target clock as soon as the replacement decoder
-                    // reports output from its keyframe; packets before that target remain catch-up
-                    // traffic below, so activation does not pace a long GOP in wall time.
-                    let barrier = play_start_override.is_none();
-                    video_catchup.admit_record();
-                    let sender = thread::spawn(move || {
-                        let sequence = channel.send_video(VideoPacket {
-                            epoch,
-                            packet_id,
-                            pts_us,
-                            dts_us,
-                            duration_us,
-                            key,
-                            data: &data,
-                        })?;
-                        if barrier {
-                            channel.wait_for_reusable_media_capacity()?;
-                        }
-                        Ok(sequence)
-                    });
-                    let (result, started_while_sending) =
-                        finish_send_while_observing_start(sender, || {
-                            if !readiness.due() {
-                                return Ok(false);
+            match delivery_kind {
+                VideoDeliveryKind::Timeline => video_delivery.admit_record(),
+                _ => video_catchup.admit_record(),
+            }
+            media_sender.video(
+                video_channel.clone(),
+                epoch,
+                packet_id,
+                &mut packet,
+                delivery_kind == VideoDeliveryKind::ObserveStart && play_start_override.is_none(),
+            )?;
+            let send_result = match media_sender.wait(|| {
+                if let Some(ui) = ui.as_ref() {
+                    while let Some(command) = ui.try_command() {
+                        match command {
+                            command @ (Command::Quit | Command::SeekBy(_) | Command::SeekTo(_)) => {
+                                if !matches!(command, Command::Quit) {
+                                    let metadata = seek_request_metadata()?;
+                                    client.advance_channel(&video_track,
+                                        vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY,
+                                        &metadata)?;
+                                    pending_seek_metadata = Some(metadata);
+                                }
+                                ui.defer_command(command);
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "playback transition requested",
+                                ));
                             }
-                            let output_ready = client.query_track(&video_track)?.milestones
-                                & MILESTONE_OUTPUT_READY
-                                != 0;
-                            if output_ready {
-                                start_video_playback(
-                                    config,
+                            Command::TogglePause => {
+                                toggle_video_pause(
                                     client,
-                                    &surface,
                                     &video_track,
-                                    &mut presenter_audio,
-                                    &mut local_audio,
-                                    play_start_override
-                                        .unwrap_or_else(|| first_pts.unwrap_or(pts_us)),
+                                    presenter_audio.as_ref().map(PresenterAudioControl::running),
+                                    local_audio.as_ref(),
+                                    VideoPauseState {
+                                        timeline: &mut timeline,
+                                        paused_seek: Some(&mut paused_seek),
+                                    },
+                                    timeline_origin_us,
+                                    started,
                                 )?;
+                                ui.set_paused(timeline.is_paused());
+                                ui.set_message(if timeline.is_paused() {
+                                    "Paused"
+                                } else {
+                                    "Resumed"
+                                });
+                                ui.redraw()?;
                             }
-                            Ok(output_ready)
-                        })?;
-                    started = started_while_sending;
-                    if started {
+                            Command::Resize(geometry) => {
+                                let layout_geometry = media_geometry(geometry, true);
+                                let size = display_size(
+                                    info.width,
+                                    info.height,
+                                    info.sar_num,
+                                    info.sar_den,
+                                    config.zoom,
+                                    layout_geometry,
+                                );
+                                (column, row) = centered_origin(layout_geometry, size.0, size.1);
+                                update_full_window_surface(
+                                    client,
+                                    &mut placed_node,
+                                    column,
+                                    row,
+                                    size.0,
+                                    size.1,
+                                )?;
+                                (columns, rows) = size;
+                                ui.redraw()?;
+                            }
+                            Command::VolumeBy(delta) => {
+                                let next = (volume_percent as i32 + delta).clamp(0, 200) as u32;
+                                if let Some(audio) = presenter_audio.as_ref()
+                                    && client.supports(vivid_protocol::registry::AUDIO_GAIN)
+                                {
+                                    client.set_audio_gain(
+                                        &audio.track,
+                                        vivid_sdk::AudioGain::from_percent(next)
+                                            .expect("clamped volume is valid"),
+                                    )?;
+                                    volume_percent = next;
+                                    ui.set_volume_percent(Some(next));
+                                    ui.set_message(format!("Volume {next}%"));
+                                } else if let Some(audio) = local_audio.as_ref() {
+                                    audio.set_volume_percent(next);
+                                    volume_percent = next;
+                                    ui.set_volume_percent(Some(next));
+                                    ui.set_message(format!("Volume {next}%"));
+                                } else {
+                                    ui.set_volume_percent(None);
+                                    ui.set_message("Volume unavailable");
+                                }
+                                ui.redraw()?;
+                            }
+                        }
+                    }
+                }
+                if delivery_kind == VideoDeliveryKind::ObserveStart && !started && readiness.due() {
+                    let output_ready =
+                        client.query_track(&video_track)?.milestones & MILESTONE_OUTPUT_READY != 0;
+                    if output_ready {
+                        start_video_playback(
+                            config,
+                            client,
+                            &surface,
+                            &video_track,
+                            &mut presenter_audio,
+                            &mut local_audio,
+                            play_start_override
+                                .unwrap_or_else(|| first_pts.unwrap_or(packet.pts_us)),
+                        )?;
+                        started = true;
                         if timeline.is_paused() {
                             pause_video_outputs(
                                 client,
@@ -818,12 +888,35 @@ pub fn play(
                             timeline.started();
                         }
                     }
-                    result
                 }
+                Ok(timeline.is_paused())
+            }) {
+                Ok(result) => result,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue 'playback,
+                Err(error) => return Err(error.into()),
             };
             if let Err(error) = send_result {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue 'playback;
+                }
+                consecutive_send_failures += 1;
+                if consecutive_send_failures > 3 {
+                    return Err(io::Error::other(format!(
+                        "video transport failed repeatedly: {error}"
+                    ))
+                    .into());
+                }
                 if first_pts_before_send.is_none() && !started {
                     first_pts = None;
+                }
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput
+                        | io::ErrorKind::InvalidData
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::Unsupported
+                ) {
+                    return Err(error.into());
                 }
                 client.verbose(format_args!(
                     "video track {} channel failed: {error}; advancing generation",
@@ -842,24 +935,23 @@ pub fn play(
                     vivid_protocol::registry::channel_advance_reason::RECOVERY,
                     &RequestMetadata::default(),
                 )?;
+                let recovery_plan = streaming_recovery_plan(
+                    packet.pts_us,
+                    started,
+                    paused_seek.is_some() || seek_target_outstanding(play_start_override, last_pts),
+                );
+                demuxer.seek_to_us(recovery_plan.resume_pts_us)?;
+                recovery_start_pts_us = Some(recovery_plan.resume_pts_us);
                 awaiting_keyframe = true;
                 recovery_rebase_pending = started;
-                continue;
+                continue 'playback;
             }
+            consecutive_send_failures = 0;
             last_pts = Some(packet.pts_us);
             if timeline.is_paused()
                 && let Some(pre_roll) = paused_seek.as_mut()
                 && packet.pts_us >= pre_roll.target_pts_us
             {
-                if pre_roll.drained == 0 {
-                    // Re-publish the paused position on the access unit that actually carries the
-                    // picture. A seek target is a position on the user's timeline and lands between
-                    // frames; a presenter holding its clock those few milliseconds short of the first
-                    // picture at or after it is holding a picture that is not due yet, and while the
-                    // clock is frozen it never becomes due. Nothing arrives, and the pane keeps
-                    // whatever it had - which, for a replacement decoder, is nothing.
-                    prime_video_seek(client, &video_track, packet.pts_us);
-                }
                 pre_roll.drained = pre_roll.drained.saturating_add(1);
             }
 
@@ -868,11 +960,8 @@ pub fn play(
                     .as_ref()
                     .is_some_and(|audio| audio.progress.snapshot().failed)
             {
-                let failed = presenter_audio.take().expect("failed audio track exists");
-                let _ = failed.worker.join();
-                if let Err(error) = clear_audio_slot(client, &surface) {
-                    client.verbose(format_args!("could not clear failed audio slot: {error}"));
-                }
+                clear_audio_slot(client, &surface)?;
+                cancel_presenter_audio(client, &mut presenter_audio);
             }
 
             let output_ready = delivery_kind == VideoDeliveryKind::ObserveStart
@@ -911,6 +1000,9 @@ pub fn play(
             cancel_presenter_audio(client, &mut presenter_audio);
             break 'playback;
         }
+        // Flush delayed decoder pictures as soon as video input ends. Linked audio may remain
+        // paused indefinitely; waiting for its worker before video EOS strands a final B-frame.
+        video_channel.eos()?;
         if !started
             && play_start_override.is_some()
             && !video_output_ready(client, &video_track, SEEK_OUTPUT_GRACE)?
@@ -1070,45 +1162,25 @@ pub fn play(
                 return Ok(());
             }
             Some(AudioWaitEvent::Seek(target)) => {
-                let target = target.min(info.duration_us.unwrap_or(u64::MAX));
+                let target = clamp_video_seek(target, timeline_origin_us, info.last_pts_us);
                 let target_pts =
                     timeline_origin_us.saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
-                client.pause(&video_track)?;
-                epoch = epoch
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
-                let seek_metadata = seek_request_metadata()?;
-                let advanced_audio = if presenter_audio.is_some() {
-                    clear_audio_slot(client, &surface)?;
-                    presenter_audio.take().and_then(|audio| {
-                        advance_presenter_audio_for_seek(client, audio, &seek_metadata)
-                    })
-                } else {
-                    None
-                };
-                replace_video_channel(
+                presenter_audio = seek_video_generation(
                     client,
-                    &video_track,
-                    &mut video_channel,
-                    epoch,
-                    false,
-                    vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY,
-                    &seek_metadata,
-                )?;
-                demuxer.seek_to_us(target_pts)?;
-                let _ = audio_recovery.take();
-                presenter_audio = advanced_audio.and_then(|audio| {
-                    open_presenter_audio_after_seek(
-                        client,
+                    SeekTransition {
                         path,
-                        audio_recovery.clone(),
-                        audio,
+                        surface: &surface,
+                        video: &video_track,
+                        channel: &mut video_channel,
+                        demuxer: &mut demuxer,
+                        epoch: &mut epoch,
                         target_pts,
-                        epoch,
-                    )
-                });
-                prime_video_seek(client, &video_track, target_pts);
-                local_audio = None;
+                        metadata: pending_seek_metadata.take(),
+                        audio: SeekAudio::Running(presenter_audio.take()),
+                        recovery: audio_recovery.clone(),
+                        local_audio: &mut local_audio,
+                    },
+                )?;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = false;
                 recovery_start_pts_us = None;
@@ -1164,7 +1236,6 @@ pub fn play(
         if presenter_audio_failed && let Err(error) = clear_audio_slot(client, &surface) {
             client.verbose(format_args!("could not clear failed audio slot: {error}"));
         }
-        video_channel.eos()?;
         if ui.is_none()
             && let Some(audio) = audio_to_drain.as_ref()
             && let Err(error) = client.drain(&audio.track)
@@ -1219,50 +1290,30 @@ pub fn play(
                 break 'playback;
             }
             WaitOutcome::Seek(target) => {
-                let seek_metadata = seek_request_metadata()?;
-                let advanced_audio = if let Some(audio) = audio_to_drain.take() {
-                    clear_audio_slot(client, &surface)?;
-                    advance_drained_presenter_audio_for_seek(
-                        client,
-                        audio,
-                        info.audio
-                            .as_ref()
-                            .map_or(1, |audio| audio.maximum_records_per_second),
-                        &seek_metadata,
-                    )
-                } else {
-                    None
-                };
-                let target = target.min(info.duration_us.unwrap_or(u64::MAX));
+                let target = clamp_video_seek(target, timeline_origin_us, info.last_pts_us);
                 let target_pts =
                     timeline_origin_us.saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
-                epoch = epoch
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
-                client.pause(&video_track)?;
-                replace_video_channel(
+                presenter_audio = seek_video_generation(
                     client,
-                    &video_track,
-                    &mut video_channel,
-                    epoch,
-                    false,
-                    vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY,
-                    &seek_metadata,
-                )?;
-                demuxer.seek_to_us(target_pts)?;
-                let _ = audio_recovery.take();
-                presenter_audio = advanced_audio.and_then(|audio| {
-                    open_presenter_audio_after_seek(
-                        client,
+                    SeekTransition {
                         path,
-                        audio_recovery.clone(),
-                        audio,
+                        surface: &surface,
+                        video: &video_track,
+                        channel: &mut video_channel,
+                        demuxer: &mut demuxer,
+                        epoch: &mut epoch,
                         target_pts,
-                        epoch,
-                    )
-                });
-                prime_video_seek(client, &video_track, target_pts);
-                local_audio = None;
+                        metadata: pending_seek_metadata.take(),
+                        audio: SeekAudio::Drained(
+                            audio_to_drain.take(),
+                            info.audio
+                                .as_ref()
+                                .map_or(1, |audio| audio.maximum_records_per_second),
+                        ),
+                        recovery: audio_recovery.clone(),
+                        local_audio: &mut local_audio,
+                    },
+                )?;
                 awaiting_keyframe = true;
                 recovery_rebase_pending = false;
                 recovery_start_pts_us = None;
@@ -1317,6 +1368,8 @@ fn wait_for_playback_end(
         .checked_add(overall_timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "playback wait is too long"))?;
     let mut paused_at = timeline.is_paused().then(Instant::now);
+    let mut video_ended = false;
+    let mut audio_ended = audio.is_none();
     loop {
         if let Some(ui) = ui {
             let current = timeline.current_us();
@@ -1410,11 +1463,13 @@ fn wait_for_playback_end(
             }
             ui.redraw()?;
         }
-        let remaining = if timeline.is_paused() {
-            Duration::from_millis(50)
-        } else {
-            deadline.saturating_duration_since(Instant::now())
-        };
+        // Decoder EOS can be reached while its last picture and linked audio are paused.
+        // Keep servicing controls; a synchronous DRAIN here would wait forever for resume.
+        if timeline.is_paused() {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1429,13 +1484,27 @@ fn wait_for_playback_end(
                 Duration::MAX
             });
         let request_timeout_us = timeout_us(request_timeout).max(1);
+        let pending_track = if !video_ended {
+            track
+        } else if !audio_ended {
+            audio.expect("pending audio has a track")
+        } else if local_audio
+            .as_ref()
+            .is_some_and(|audio| !audio.is_finished())
+        {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        } else {
+            return Ok(WaitOutcome::Ended);
+        };
         match client.wait_track(
-            track,
+            pending_track,
             TrackWaitCondition::PlaybackEnded,
             None,
             request_timeout_us,
         ) {
-            Ok(_) => return Ok(WaitOutcome::Ended),
+            Ok(_) if !video_ended => video_ended = true,
+            Ok(_) => audio_ended = true,
             Err(error)
                 if presenter_code(&error) == Some(ERROR_TIMEOUT) && Instant::now() < deadline => {}
             Err(error) => return Err(error),
@@ -1512,6 +1581,7 @@ fn create_presenter_audio(
         Ok(channel) => Arc::new(channel),
         Err(error) => {
             client.verbose(format_args!("presenter audio channel unavailable: {error}"));
+            client.destroy_track(&track, &RequestMetadata::default())?;
             return Ok(None);
         }
     };
@@ -1576,6 +1646,12 @@ fn spawn_presenter_audio(
             },
         }
     });
+    let worker = AudioWorker {
+        thread: Some(worker),
+        stop: stop.clone(),
+        pause: pause.clone(),
+        channel: channel.clone(),
+    };
     PresenterAudio {
         track,
         channel,
@@ -1586,6 +1662,91 @@ fn spawn_presenter_audio(
         records_per_second,
         worker,
     }
+}
+
+enum SeekAudio {
+    Running(Option<PresenterAudio>),
+    Drained(Option<DrainedPresenterAudio>, u64),
+}
+struct SeekTransition<'a> {
+    path: &'a Path,
+    surface: &'a vivid_sdk::Surface,
+    video: &'a Track,
+    channel: &'a mut Arc<TrackChannel>,
+    demuxer: &'a mut VideoDemuxer,
+    epoch: &'a mut u32,
+    target_pts: i64,
+    audio: SeekAudio,
+    metadata: Option<RequestMetadata>,
+    recovery: Arc<AudioRecoveryTarget>,
+    local_audio: &'a mut Option<audio_player::AudioPlayback>,
+}
+fn seek_video_generation(
+    client: &mut VividClient,
+    transition: SeekTransition<'_>,
+) -> io::Result<Option<PresenterAudio>> {
+    let SeekTransition {
+        path,
+        surface,
+        video,
+        channel,
+        demuxer,
+        epoch,
+        target_pts,
+        audio,
+        metadata,
+        recovery,
+        local_audio,
+    } = transition;
+    client.pause(video)?;
+    let restart_local = local_audio.is_some();
+    // Stop the old local worker before opening the replacement device.
+    local_audio.take();
+    *epoch = epoch
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("video epoch exhausted"))?;
+    let metadata = match metadata {
+        Some(metadata) => metadata,
+        None => seek_request_metadata()?,
+    };
+    let advanced = match audio {
+        SeekAudio::Running(Some(audio)) => {
+            clear_audio_slot(client, surface)?;
+            advance_presenter_audio_for_seek(client, audio, &metadata)
+        }
+        SeekAudio::Drained(Some(audio), rate) => {
+            clear_audio_slot(client, surface)?;
+            advance_drained_presenter_audio_for_seek(client, audio, rate, &metadata)
+        }
+        _ => None,
+    };
+    replace_video_channel(
+        client,
+        video,
+        channel,
+        *epoch,
+        false,
+        vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY,
+        &metadata,
+    )?;
+    demuxer.seek_to_us(target_pts)?;
+    let _ = recovery.take();
+    let audio = advanced.and_then(|audio| {
+        open_presenter_audio_after_seek(client, path, recovery, audio, target_pts, *epoch)
+    });
+    // Startup may not yet have activated the surface. Publish its exact PLAY during activation.
+    if client
+        .query_surface(surface)?
+        .active_slots
+        .iter()
+        .any(|(slot, value)| *slot == SLOT_VIDEO && value.as_u64() == Some(video.id()))
+    {
+        prime_video_seek(client, video, target_pts)?;
+    }
+    if restart_local && crate::client::local_audio_allowed() {
+        *local_audio = Some(audio_player::prepare_video(path, Some(target_pts))?);
+    }
+    Ok(audio)
 }
 
 fn advance_presenter_audio_for_seek(
@@ -1717,6 +1878,7 @@ fn stream_audio(
     records_per_second: u64,
 ) -> io::Result<u64> {
     let mut demuxer = AudioDemuxer::open(path)?;
+    demuxer.set_cancel(state.stop.clone());
     let mut delivery = DeliveryPacer::new(records_per_second);
     if let Some(start_pts_us) = start_pts_us {
         demuxer.seek_to_us(start_pts_us)?;
@@ -1947,7 +2109,9 @@ struct PausedSeekPreRoll {
     /// Access units delivered at or after the target, draining the decoder's reorder buffer.
     drained: u32,
     /// When the channel first ran out of credit after the target was reached.
-    starved_since: Option<Instant>,
+    observed: bool,
+    started_at: Instant,
+    last_query: Option<Instant>,
 }
 
 /// What a paused seek should do with the access unit the demuxer just produced.
@@ -1966,7 +2130,9 @@ impl PausedSeekPreRoll {
         Self {
             target_pts_us,
             drained: 0,
-            starved_since: None,
+            observed: false,
+            started_at: Instant::now(),
+            last_query: None,
         }
     }
 
@@ -1990,29 +2156,16 @@ impl PausedSeekPreRoll {
     ) -> PreRollStep {
         let before_target =
             last_delivered_pts_us.is_none_or(|delivered| delivered < self.target_pts_us);
-        if !before_target && self.drained >= reorder_depth {
+        if self.observed {
             return PreRollStep::Done;
         }
-        if channel_has_credit {
-            self.starved_since = None;
-            return PreRollStep::Deliver;
-        }
-        if before_target {
-            // The presenter discards every picture before the target, so it is still reading and
-            // its credit is still coming back. A shortfall here is pacing, not an end.
+        if !before_target && self.drained >= reorder_depth {
             return PreRollStep::Wait;
         }
-        // Past the target the presenter holds what it decodes and stops reading once the picture
-        // at the frozen clock is out, so sustained starvation is that stop. It has to be
-        // sustained: a nested relay forwards pre-roll one record at a time and empties this
-        // window routinely.
-        match self.starved_since {
-            Some(since) if since.elapsed() >= PAUSED_PRE_ROLL_GRACE => PreRollStep::Done,
-            Some(_) => PreRollStep::Wait,
-            None => {
-                self.starved_since = Some(Instant::now());
-                PreRollStep::Wait
-            }
+        if channel_has_credit {
+            PreRollStep::Deliver
+        } else {
+            PreRollStep::Wait
         }
     }
 }
@@ -2042,7 +2195,7 @@ fn video_delivery_kind(
 }
 
 /// How often target-or-later startup traffic asks whether decoded output exists yet.
-const READINESS_POLL: Duration = Duration::from_millis(4);
+const READINESS_POLL: Duration = Duration::from_millis(25);
 
 /// Rate limiter for the `OUTPUT_READY` question asked while a startup record is in flight.
 ///
@@ -2097,13 +2250,13 @@ fn video_output_ready(
 ///
 /// The target is an optimization, not a requirement: a presenter that refuses it — a surface whose
 /// video slot was never activated, for instance — still gets the same PLAY at activation.
-fn prime_video_seek(client: &mut vivid_sdk::Session, video: &Track, start_pts_us: i64) {
-    if client
-        .play(video, start_pts_us, 0, MAXIMUM_LATENCY_US)
-        .is_ok()
-    {
-        let _ = client.pause(video);
-    }
+fn prime_video_seek(
+    client: &mut vivid_sdk::Session,
+    video: &Track,
+    start_pts_us: i64,
+) -> io::Result<()> {
+    client.play(video, start_pts_us, 0, MAXIMUM_LATENCY_US)?;
+    client.pause(video)
 }
 
 fn pause_video_outputs(
@@ -2170,6 +2323,22 @@ fn toggle_video_pause(
             pause_video_outputs(client, video, presenter_audio, local_audio)?;
         }
         timeline.pause();
+        if started && let Some(audio) = local_audio {
+            timeline.seek(
+                audio
+                    .position_pts_us()
+                    .saturating_sub(timeline_origin_us)
+                    .max(0) as u64,
+            );
+        }
+        if started && local_audio.is_none() && client.track_query_handle().is_some() {
+            let position = crate::playback_ui::paused_position(
+                client,
+                presenter_audio.map_or(video, |audio| audio.track),
+                timeline_origin_us,
+            )?;
+            timeline.seek(position);
+        }
     }
     // A paused seek may still be streaming decoder pre-roll when the user resumes. Its target
     // re-prime publishes PLAY followed by PAUSE on the first access unit at or after the target.
@@ -2249,36 +2418,6 @@ fn cancel_presenter_audio(client: &mut VividClient, presenter_audio: &mut Option
     }
 }
 
-fn finish_send_while_observing_start<T, F>(
-    sender: thread::JoinHandle<io::Result<T>>,
-    mut observe_start: F,
-) -> io::Result<(io::Result<T>, bool)>
-where
-    T: Send + 'static,
-    F: FnMut() -> io::Result<bool>,
-{
-    let mut started = false;
-    let deadline = Instant::now()
-        .checked_add(PLAYBACK_START_TIMEOUT)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "startup wait is too long"))?;
-    while !sender.is_finished() {
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out while a priming video write was blocked",
-            ));
-        }
-        if !started && observe_start()? {
-            started = true;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    let result = sender
-        .join()
-        .map_err(|_| io::Error::other("video sender thread panicked"))?;
-    Ok((result, started))
-}
-
 fn wait_for_worker_or_event<T, E, F>(
     worker: &thread::JoinHandle<T>,
     mut take_event: F,
@@ -2345,7 +2484,9 @@ fn replace_video_channel(
             // lets such a record close that current channel and lose the whole track.
             RecoveryControl::Pause => client.pause(video_track)?,
             RecoveryControl::Advance => {
-                client.advance_channel(video_track, reason, metadata)?;
+                if video_channel.generation() == video_track.channel_generation() {
+                    client.advance_channel(video_track, reason, metadata)?;
+                }
                 let _ = video_channel.close();
             }
             RecoveryControl::Flush => client.flush(video_track, epoch)?,
@@ -2565,6 +2706,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn end_seek_clamps_to_the_last_picture_in_the_original_timestamp_domain() {
+        assert_eq!(
+            clamp_video_seek(224_560_000, 0, Some(224_520_000)),
+            224_520_000
+        );
+        assert_eq!(clamp_video_seek(u64::MAX, -7_000, Some(10_000)), 17_000);
+        assert_eq!(clamp_video_seek(5_000, -7_000, Some(10_000)), 5_000);
+    }
+
+    #[test]
     fn repeated_relative_seeks_fold_into_one_cumulative_target() {
         let current_us = 18_000_000;
         let mut target = None;
@@ -2671,8 +2822,8 @@ mod tests {
         pre_roll.drained = 4;
         assert_eq!(
             pre_roll.step(Some(TARGET), 4, true),
-            PreRollStep::Done,
-            "the drain ran past the reorder depth the track declared"
+            PreRollStep::Wait,
+            "submission count must not claim presentation"
         );
     }
 
@@ -2680,7 +2831,7 @@ mod tests {
     /// picture at that clock is out. Sustained starvation is that stop - but only sustained: a
     /// nested relay forwards pre-roll one record at a time and empties this window routinely.
     #[test]
-    fn a_paused_drain_ends_on_sustained_starvation_not_on_relay_pacing() {
+    fn a_paused_drain_requires_presentation_even_after_sustained_starvation() {
         const TARGET: i64 = 5_000_000;
         let mut pre_roll = PausedSeekPreRoll::new(TARGET);
         pre_roll.drained = 1;
@@ -2691,16 +2842,12 @@ mod tests {
             "credit returning after a shortfall did not resume the drain"
         );
         assert_eq!(
-            pre_roll.starved_since, None,
-            "a resumed drain kept counting the shortfall it recovered from"
-        );
-
-        pre_roll.starved_since = Some(Instant::now() - PAUSED_PRE_ROLL_GRACE);
-        assert_eq!(
             pre_roll.step(Some(TARGET), 8, false),
-            PreRollStep::Done,
-            "the drain waited out a presenter that had stopped reading"
+            PreRollStep::Wait,
+            "starvation must not claim successful presentation"
         );
+        pre_roll.observed = true;
+        assert_eq!(pre_roll.step(Some(TARGET), 8, false), PreRollStep::Done);
     }
 
     /// A seek's target stays authoritative until its pre-roll reaches it. A nested presenter
@@ -2886,12 +3033,14 @@ mod tests {
             .unwrap();
         let channel = session.open_track_channel(&audio).unwrap();
         let generation_before = audio.channel_generation();
-        let origin_us = 4_000_000;
+        let origin_us = 4_000_000_i64;
         let mut timeline = PlaybackTimeline::new(2_000_000);
         let audio_pause = AudioPause::default();
         timeline.started();
 
-        toggle_video_pause(
+        // This transport fixture does not implement physical clock observations. Seed a frozen
+        // presenter observation here; the Vivido/virtual-presenter tests cover its source.
+        pause_video_outputs(
             &mut session,
             &audio,
             Some(PresenterAudioControl {
@@ -2899,14 +3048,10 @@ mod tests {
                 producer_pause: Some(&audio_pause),
             }),
             None,
-            VideoPauseState {
-                timeline: &mut timeline,
-                paused_seek: None,
-            },
-            origin_us,
-            true,
         )
         .unwrap();
+        timeline.pause();
+        timeline.seek(1_750_000);
         assert!(
             *audio_pause
                 .paused
@@ -3129,7 +3274,7 @@ mod tests {
             &RequestMetadata::default(),
         )
         .unwrap();
-        prime_video_seek(&mut session, &video, 7_000_000);
+        prime_video_seek(&mut session, &video, 7_000_000).unwrap();
 
         let observed = presenter.observed();
         assert_eq!(
@@ -3240,30 +3385,6 @@ mod tests {
         *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
         changed.notify_all();
         worker.join().unwrap();
-    }
-
-    #[test]
-    fn blocked_priming_send_can_be_released_by_control_plane_start() {
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let sender_gate = gate.clone();
-        let sender = thread::spawn(move || {
-            let (lock, changed) = &*sender_gate;
-            let started = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _started = changed
-                .wait_while(started, |started| !*started)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Ok(7_u64)
-        });
-        let observer_gate = gate.clone();
-        let (result, started) = finish_send_while_observing_start(sender, move || {
-            let (lock, changed) = &*observer_gate;
-            *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-            changed.notify_all();
-            Ok(true)
-        })
-        .unwrap();
-        assert!(started);
-        assert_eq!(result.unwrap(), 7);
     }
 
     #[test]

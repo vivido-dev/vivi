@@ -23,7 +23,7 @@ mod platform {
 
     struct SharedState {
         enabled: AtomicBool,
-        stop: AtomicBool,
+        stop: Arc<AtomicBool>,
         decode_done: AtomicBool,
         queued_samples: AtomicU64,
         played_samples: AtomicU64,
@@ -35,7 +35,7 @@ mod platform {
         fn new() -> Self {
             Self {
                 enabled: AtomicBool::new(false),
-                stop: AtomicBool::new(false),
+                stop: Arc::new(AtomicBool::new(false)),
                 decode_done: AtomicBool::new(false),
                 queued_samples: AtomicU64::new(0),
                 played_samples: AtomicU64::new(0),
@@ -71,6 +71,8 @@ mod platform {
         shared: Arc<SharedState>,
         worker: Option<JoinHandle<()>>,
         prebuffer_samples: u64,
+        samples_per_second: u64,
+        origin_pts_us: i64,
     }
 
     impl AudioPlayback {
@@ -103,6 +105,8 @@ mod platform {
                 shared,
                 worker: Some(worker),
                 prebuffer_samples,
+                samples_per_second: u64::from(ready.sample_rate) * u64::from(ready.channels),
+                origin_pts_us: video_origin_us.unwrap_or(0),
             })
             .and_then(|playback| {
                 playback.wait_for_prebuffer()?;
@@ -130,6 +134,14 @@ mod platform {
             self.wait_for_prebuffer()?;
             self.shared.enabled.store(true, Ordering::SeqCst);
             Ok(())
+        }
+
+        pub fn position_pts_us(&self) -> i64 {
+            let samples = self.shared.played_samples.load(Ordering::SeqCst);
+            self.origin_pts_us.saturating_add(
+                i64::try_from(samples.saturating_mul(1_000_000) / self.samples_per_second.max(1))
+                    .unwrap_or(i64::MAX),
+            )
         }
 
         pub fn pause(&self) {
@@ -211,6 +223,12 @@ mod platform {
         let sample_rate = output_config.sample_rate;
         let channels = output_config.channels;
         let mut decoder = AudioDecoder::open(path, sample_rate, channels)?;
+        decoder.set_cancel(shared.stop.clone());
+        if let Some(origin) = video_origin_us
+            && origin > decoder.first_pts_us().unwrap_or(0)
+        {
+            decoder.seek_to_us(origin)?;
+        }
 
         let capacity = sample_rate as usize * channels as usize * RING_BUFFER_SECONDS;
         let ring = HeapRb::<f32>::new(capacity.max(1));
@@ -423,6 +441,9 @@ mod platform_stub {
             Ok(())
         }
 
+        pub fn position_pts_us(&self) -> i64 {
+            0
+        }
         pub fn pause(&self) {}
 
         pub fn resume(&self) -> io::Result<()> {
@@ -464,7 +485,7 @@ pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
         use crate::playback_ui::{Command, PlaybackTimeline, PlaybackUi};
 
         let info = AudioDemuxer::inspect(path)?;
-        let ui = PlaybackUi::enter(config, path, info.duration_us, true, true)?;
+        let ui = PlaybackUi::enter(config, path, info.duration_us, true, true, None)?;
         let mut playback = AudioPlayback::open(path, None)?;
         playback.start()?;
         let mut timeline = PlaybackTimeline::new(0);
@@ -619,6 +640,17 @@ mod tests {
             while let Some(frame) = decoder.next_frame()? {
                 samples += frame.samples.len();
             }
+            decoder.seek_to_us(5_000)?;
+            let mut after_seek = 0;
+            while let Some(frame) = decoder.next_frame()? {
+                after_seek += frame.samples.len();
+            }
+            assert!(after_seek > 0 && after_seek < samples);
+            assert!(
+                decoder.first_pts_us().is_some_and(|pts| pts >= 5_000),
+                "seek frame PTS: {:?}",
+                decoder.first_pts_us()
+            );
             io::Result::Ok(samples)
         })();
         let _ = fs::remove_file(&path);

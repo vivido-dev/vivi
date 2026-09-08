@@ -37,9 +37,11 @@ and `observability-v1`. Visual surfaces use `generic-content-v1`.
 
 ## Traces and automation
 
-Dry-run traces now contain one 1.5 control trace and separate authenticated track traces. Record
+Dry-run traces now contain bounded control/media metadata without payload or capability bytes. Record
 names and diagnostics use surfaces, tracks, channels, absolute flow, activation, and milestones.
 Tools that decoded 1.1 sources, tickets, feature IDs, credit records, or marker v2 must be updated;
 there are no compatibility projections.
 
-`vvmux` cannot carry this Vivi version until its separate Vivid 1.5 migration is complete.
+Current Vivid 1.5 `vvmux` carries Vivi locally and through `vvssh`. Use matching current SDK,
+gateway, vvmux and Vivido builds for physical playback-position feedback. Persistent vvmux panes
+set `VIVID_AUDIO_FALLBACK=deny` independently of their attaching client’s inherited environment.

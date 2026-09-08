@@ -1,5 +1,4 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 #[path = "build/windows.rs"]
@@ -8,9 +7,6 @@ mod windows;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build/windows.rs");
-    println!("cargo:rustc-check-cfg=cfg(ffmpeg_old_channel_layout)");
-    println!("cargo:rustc-check-cfg=cfg(ffmpeg_codecpar_has_framerate)");
-
     for variable in [
         "PKG_CONFIG_PATH",
         "VCPKG_ROOT",
@@ -22,43 +18,6 @@ fn main() {
 
     let target = std::env::var("TARGET").unwrap_or_default();
     let windows = target.contains("windows");
-    let versions = if windows {
-        vcpkg_layout().map(|(include, _)| {
-            (
-                header_major(
-                    &include.join("libavutil/version.h"),
-                    "LIBAVUTIL_VERSION_MAJOR",
-                ),
-                header_major(
-                    &include.join("libavcodec/version_major.h"),
-                    "LIBAVCODEC_VERSION_MAJOR",
-                ),
-            )
-        })
-    } else {
-        Some((
-            pkg_config_major("libavutil"),
-            pkg_config_major("libavcodec"),
-        ))
-    };
-    if versions
-        .as_ref()
-        .and_then(|versions| versions.0)
-        .is_some_and(|major| major < 59)
-    {
-        println!("cargo:rustc-cfg=ffmpeg_old_channel_layout");
-    }
-    // libavcodec 62 (FFmpeg 8) inserted `framerate` between
-    // `sample_aspect_ratio` and `field_order` in AVCodecParameters. Keep the
-    // hand-written ABI binding aligned with the headers selected by pkg-config.
-    if versions
-        .as_ref()
-        .and_then(|versions| versions.1)
-        .is_some_and(|major| major >= 62)
-    {
-        println!("cargo:rustc-cfg=ffmpeg_codecpar_has_framerate");
-    }
-
     let macos = target.contains("apple-darwin");
     let audio_output = macos || target.contains("linux") || windows;
 
@@ -143,15 +102,6 @@ fn default_windows_triplet() -> String {
     .to_owned()
 }
 
-fn header_major(path: &Path, name: &str) -> Option<u32> {
-    fs::read_to_string(path).ok()?.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        (fields.next() == Some("#define") && fields.next() == Some(name))
-            .then(|| fields.next()?.parse().ok())
-            .flatten()
-    })
-}
-
 fn emit_pkg_config_libs(audio_output: bool) -> Option<Vec<PathBuf>> {
     let mut libraries = vec!["--libs", "libavformat", "libavcodec", "libavutil"];
     if audio_output {
@@ -174,21 +124,4 @@ fn emit_pkg_config_libs(audio_output: bool) -> Option<Vec<PathBuf>> {
     }
 
     Some(link_paths)
-}
-
-fn pkg_config_major(library: &str) -> Option<u32> {
-    let output = Command::new("pkg-config")
-        .args(["--modversion", library])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .split('.')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
 }

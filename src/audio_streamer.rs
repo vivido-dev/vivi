@@ -3,6 +3,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
 use vivid_protocol::media::AudioPacket;
 use vivid_protocol::messages::{ERROR_TIMEOUT, LaneClass};
 use vivid_protocol::track::{KindConfiguration, TrackConfiguration, TrackMode};
@@ -40,7 +41,14 @@ pub fn play(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = AudioDemuxer::inspect(path)?;
     let gain_available = client.supports(vivid_protocol::registry::AUDIO_GAIN);
-    let ui = PlaybackUi::enter(config, path, info.duration_us, gain_available, true)?;
+    let ui = PlaybackUi::enter(
+        config,
+        path,
+        info.duration_us,
+        gain_available,
+        true,
+        Some(client.cancel_handle()),
+    )?;
 
     let geometry = TerminalGeometry::settled_presenter(client);
     let layout = media_geometry(geometry, ui.is_some());
@@ -227,6 +235,19 @@ fn teardown_audio_surface(
     let _ = client.destroy_surface(surface, &RequestMetadata::default());
 }
 
+pub(crate) fn retire_audio_for_seek(
+    client: &mut vivid_sdk::Session,
+    track: &Track,
+) -> io::Result<()> {
+    client.pause(track)?;
+    client.advance_channel(
+        track,
+        vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY,
+        &RequestMetadata::default(),
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_with_controls(
     config: &Config,
@@ -246,20 +267,17 @@ fn stream_with_controls(
     let mut volume_percent = 100_u32;
     let mut generation = 0_u64;
 
+    let mut media_sender = crate::media_sender::MediaSender::new()?;
     'generation: loop {
         if generation != 0 {
             epoch = epoch
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("audio epoch exhausted"))?;
-            client.pause(track)?;
-            // Control and media use independent transports. Retire the old generation before
-            // publishing the replacement epoch so a delayed old packet cannot arrive after
-            // FLUSH while it still names the current generation and lose the track.
-            client.advance_channel(track, 1, &RequestMetadata::default())?;
+            // The previous iteration retired its generation before cancelling or dropping it.
             client.flush(track, epoch)?;
         }
         generation = generation.saturating_add(1);
-        let channel = client.open_track_channel(track)?;
+        let channel = std::sync::Arc::new(client.open_track_channel(track)?);
         let target_pts_us =
             origin_us.saturating_add(i64::try_from(timeline.current_us()).unwrap_or(i64::MAX));
         let mut demuxer = AudioDemuxer::open(path)?;
@@ -287,9 +305,10 @@ fn stream_with_controls(
                     started,
                     info.duration_us,
                 )? {
-                    channel.close()?;
                     match action {
                         ControlAction::Seek(target) => {
+                            retire_audio_for_seek(client, track)?;
+                            channel.close()?;
                             timeline.seek(target);
                             continue 'generation;
                         }
@@ -313,17 +332,45 @@ fn stream_with_controls(
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("audio packet ID space exhausted"))?;
             packets_this_generation += 1;
-            channel.send_audio(AudioPacket {
-                epoch,
-                packet_id,
-                pts_us: packet.pts_us,
-                dts_us: packet.dts_us,
-                duration_us: packet.duration_us,
-                trim_start_samples: packet.trim_start_samples,
-                trim_end_samples: packet.trim_end_samples,
-                data: &packet.data,
-            })?;
-            buffered_us = buffered_us.saturating_add(packet.duration_us);
+            let packet_duration_us = packet.duration_us;
+            media_sender.audio(channel.clone(), epoch, packet_id, packet)?;
+            let mut transition = None;
+            let result = media_sender.wait(|| {
+                let action = handle_commands(
+                    client,
+                    track,
+                    ui,
+                    pane,
+                    config.zoom,
+                    &mut volume_percent,
+                    &mut timeline,
+                    origin_us,
+                    started,
+                    info.duration_us,
+                )?;
+                if matches!(action, Some(ControlAction::Seek(_))) {
+                    retire_audio_for_seek(client, track)?;
+                }
+                transition = action;
+                if transition.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "playback transition requested",
+                    ));
+                }
+                Ok(timeline.is_paused())
+            });
+            if let Some(action) = transition {
+                match action {
+                    ControlAction::Seek(target) => {
+                        timeline.seek(target);
+                        continue 'generation;
+                    }
+                    ControlAction::Quit => return Ok(()),
+                }
+            }
+            result??;
+            buffered_us = buffered_us.saturating_add(packet_duration_us);
             if !started && buffered_us >= INITIAL_BUFFER_US {
                 start_playback(
                     client,
@@ -396,11 +443,16 @@ fn stream_with_controls(
             )? {
                 match action {
                     ControlAction::Seek(target) => {
+                        retire_audio_for_seek(client, track)?;
                         timeline.seek(target);
                         continue 'generation;
                     }
                     ControlAction::Quit => return Ok(()),
                 }
+            }
+            if timeline.is_paused() {
+                thread::sleep(Duration::from_micros(UI_POLL_TIMEOUT_US));
+                continue;
             }
             match client.wait_track(
                 track,
@@ -466,6 +518,11 @@ fn handle_commands(
                         client.pause(track)?;
                     }
                     timeline.pause();
+                    if started {
+                        timeline.seek(crate::playback_ui::paused_position(
+                            client, track, origin_us,
+                        )?);
+                    }
                     ui.set_paused(true);
                     ui.set_message("Paused");
                 }

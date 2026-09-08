@@ -42,12 +42,27 @@ impl VividClient {
 
     pub fn verbose(&self, message: fmt::Arguments<'_>) {
         if self.verbose {
-            eprintln!("vivi: {message}");
+            eprintln!(
+                "vivi: {}",
+                crate::playback_ui::safe_text(&message.to_string())
+            );
         }
     }
 
     pub fn close(self) -> io::Result<()> {
-        self.session.close()
+        let cancel = self.session.cancel_handle();
+        let (done, finished) = std::sync::mpsc::channel();
+        let watchdog = thread::Builder::new()
+            .name("vivi-shutdown".into())
+            .spawn(move || {
+                if finished.recv_timeout(Duration::from_secs(2)).is_err() {
+                    cancel();
+                }
+            })?;
+        let result = self.session.close();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        result
     }
 
     pub fn is_offline(&self) -> bool {
@@ -244,5 +259,37 @@ mod tests {
             no_wait: false,
         };
         producer_config(&config).validate().unwrap();
+    }
+}
+
+/// A persistent gateway may be reattached from another host. Its process environment cannot
+/// establish output locality; an explicit user override is required to open a local device there.
+pub fn local_audio_allowed() -> bool {
+    audio_fallback_policy(
+        std::env::var("VIVID_AUDIO_FALLBACK").ok().as_deref(),
+        std::env::var_os("VIVID_REMOTE").is_some(),
+        std::env::var_os("VVMUX_SESSION").is_some(),
+    )
+}
+
+fn audio_fallback_policy(policy: Option<&str>, remote: bool, gateway: bool) -> bool {
+    match policy {
+        Some("allow") => true,
+        Some(_) => false,
+        None => !remote && !gateway,
+    }
+}
+
+#[cfg(test)]
+mod audio_policy_tests {
+    use super::*;
+    #[test]
+    fn fallback_requires_explicit_locality_in_persistent_gateways() {
+        assert!(audio_fallback_policy(None, false, false));
+        assert!(!audio_fallback_policy(None, true, false));
+        assert!(!audio_fallback_policy(None, false, true));
+        assert!(!audio_fallback_policy(Some("deny"), false, false));
+        assert!(!audio_fallback_policy(Some("typo"), false, false));
+        assert!(audio_fallback_policy(Some("allow"), true, true));
     }
 }

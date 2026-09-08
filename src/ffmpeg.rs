@@ -1,280 +1,135 @@
-//! Minimal libavformat bindings for Vivid's encoded-packet fast path.
+//! Header-derived libavformat bindings for Vivid's encoded-packet fast path.
 //!
 //! Unlike Kitim, Vivi does not decode video into RGBA frames. It demultiplexes the selected video
 //! track and forwards encoded access units, timestamps, codec configuration, and keyframe flags.
 
 use std::collections::VecDeque;
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, CString, c_int};
 use std::io;
 use std::path::Path;
 use std::ptr;
 
-const AVMEDIA_TYPE_VIDEO: c_int = 0;
-const AVMEDIA_TYPE_AUDIO: c_int = 1;
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-const AV_SAMPLE_FMT_FLT: c_int = 3;
-const AV_LOG_QUIET: c_int = -8;
-const AV_NOPTS_VALUE: i64 = i64::MIN;
-const AV_PKT_DATA_SKIP_SAMPLES: c_int = 11;
-const AVSEEK_FLAG_BACKWARD: c_int = 1;
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-const AVERROR_EOF: c_int = -541_478_725;
-const AVCOL_RANGE_UNSPECIFIED: c_int = 0;
-const AVCOL_PRI_UNSPECIFIED: c_int = 2;
-const AVCOL_TRC_UNSPECIFIED: c_int = 2;
-const AVCOL_SPC_UNSPECIFIED: c_int = 2;
+use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO};
+use ffmpeg_sys_next::AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES;
+use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_FLT;
+use ffmpeg_sys_next::*;
 const MAX_EXTRADATA: usize = 16 * 1024 * 1024;
+const MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
+const MAX_INSPECTION_WINDOW: usize = 100_000;
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct AVChannelLayout {
-    order: c_int,
-    nb_channels: c_int,
-    mask: u64,
-    opaque: *mut c_void,
+static CANCEL_NATIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Called between files, after the previous file has joined all of its workers.
+pub fn reset_native_cancellation() {
+    CANCEL_NATIVE.store(false, std::sync::atomic::Ordering::Relaxed);
 }
-
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-impl Default for AVChannelLayout {
-    fn default() -> Self {
-        Self {
-            order: 0,
-            nb_channels: 0,
-            mask: 0,
-            opaque: ptr::null_mut(),
+pub fn cancel_native_io() {
+    CANCEL_NATIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn native_io_cancelled() -> bool {
+    CANCEL_NATIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+struct NativeInput {
+    context: *mut AVFormatContext,
+    interrupt: Box<NativeInterrupt>,
+}
+struct NativeInterrupt {
+    deadline: std::time::Instant,
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+unsafe extern "C" fn interrupt_input(opaque: *mut std::ffi::c_void) -> c_int {
+    // SAFETY: NativeInput owns this stable Box until after avformat_close_input returns.
+    let interrupt = unsafe { &*opaque.cast::<NativeInterrupt>() };
+    c_int::from(
+        CANCEL_NATIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || interrupt
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+            || std::time::Instant::now() >= interrupt.deadline,
+    )
+}
+impl NativeInput {
+    fn open(path: &CStr) -> io::Result<Self> {
+        // SAFETY: version functions take no pointers and run before any ABI-dependent access.
+        let compatible = unsafe {
+            i64::from(avformat_version() >> 16) == i64::from(LIBAVFORMAT_VERSION_MAJOR)
+                && i64::from(avcodec_version() >> 16) == i64::from(LIBAVCODEC_VERSION_MAJOR)
+                && i64::from(avutil_version() >> 16) == i64::from(LIBAVUTIL_VERSION_MAJOR)
+                && i64::from(swresample_version() >> 16) == i64::from(LIBSWRESAMPLE_VERSION_MAJOR)
+        };
+        if !compatible {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "FFmpeg runtime majors differ from the build headers; rebuild vivi for this installation",
+            ));
         }
+        // SAFETY: allocation returns an owned context or null; generated bindings match headers.
+        let context = unsafe { avformat_alloc_context() };
+        if context.is_null() {
+            return Err(io::Error::other("could not allocate media input"));
+        }
+        let mut input = Self {
+            context,
+            interrupt: Box::new(NativeInterrupt {
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                stop: None,
+            }),
+        };
+        // SAFETY: the context is uniquely owned and the callback pointer remains stable.
+        unsafe {
+            (*input.context).interrupt_callback = AVIOInterruptCB {
+                callback: Some(interrupt_input),
+                opaque: (&mut *input.interrupt as *mut NativeInterrupt).cast(),
+            };
+        }
+        // SAFETY: both path and callback outlive the native call; failure updates context to null.
+        let result = unsafe {
+            avformat_open_input(
+                &mut input.context,
+                path.as_ptr(),
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        };
+        if result < 0 {
+            return Err(ffmpeg_error("could not open media", result));
+        }
+        Ok(input)
+    }
+    fn arm(&mut self) {
+        self.interrupt.deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     }
 }
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct AVRational {
-    num: c_int,
-    den: c_int,
+impl NativeInput {
+    fn check(&self) -> io::Result<()> {
+        if CANCEL_NATIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .interrupt
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "media input cancelled",
+            ));
+        }
+        if std::time::Instant::now() >= self.interrupt.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "media input stalled for 30 seconds",
+            ));
+        }
+        Ok(())
+    }
 }
-
-#[cfg(not(ffmpeg_old_channel_layout))]
-#[repr(C)]
-struct AVCodecParameters {
-    codec_type: c_int,
-    codec_id: u32,
-    codec_tag: u32,
-    _pad1: u32,
-    extradata: *mut u8,
-    extradata_size: c_int,
-    _pad2: u32,
-    coded_side_data: *mut c_void,
-    nb_coded_side_data: c_int,
-    format: c_int,
-    bit_rate: i64,
-    bits_per_coded_sample: c_int,
-    bits_per_raw_sample: c_int,
-    profile: c_int,
-    level: c_int,
-    width: c_int,
-    height: c_int,
-    sample_aspect_ratio: AVRational,
-    #[cfg(ffmpeg_codecpar_has_framerate)]
-    framerate: AVRational,
-    field_order: c_int,
-    color_range: c_int,
-    color_primaries: c_int,
-    color_trc: c_int,
-    color_space: c_int,
-    chroma_location: c_int,
-    video_delay: c_int,
-    ch_layout: AVChannelLayout,
-    sample_rate: c_int,
-}
-
-#[cfg(ffmpeg_old_channel_layout)]
-#[repr(C)]
-struct AVCodecParameters {
-    codec_type: c_int,
-    codec_id: u32,
-    codec_tag: u32,
-    extradata: *mut u8,
-    extradata_size: c_int,
-    format: c_int,
-    bit_rate: i64,
-    bits_per_coded_sample: c_int,
-    bits_per_raw_sample: c_int,
-    profile: c_int,
-    level: c_int,
-    width: c_int,
-    height: c_int,
-    sample_aspect_ratio: AVRational,
-    field_order: c_int,
-    color_range: c_int,
-    color_primaries: c_int,
-    color_trc: c_int,
-    color_space: c_int,
-    chroma_location: c_int,
-    video_delay: c_int,
-    channel_layout: u64,
-    channels: c_int,
-    sample_rate: c_int,
-    block_align: c_int,
-    frame_size: c_int,
-    initial_padding: c_int,
-    trailing_padding: c_int,
-    seek_preroll: c_int,
-    ch_layout: AVChannelLayout,
-    framerate: AVRational,
-    coded_side_data: *mut c_void,
-    nb_coded_side_data: c_int,
-}
-
-#[repr(C)]
-struct AVStream {
-    av_class: *const c_void,
-    index: c_int,
-    id: c_int,
-    codecpar: *mut AVCodecParameters,
-    priv_data: *mut c_void,
-    time_base: AVRational,
-    start_time: i64,
-    duration: i64,
-    nb_frames: i64,
-    disposition: c_int,
-    discard: c_int,
-    sample_aspect_ratio: AVRational,
-    metadata: *mut c_void,
-    avg_frame_rate: AVRational,
-}
-
-#[repr(C)]
-struct AVFormatContext {
-    av_class: *const c_void,
-    iformat: *mut c_void,
-    oformat: *mut c_void,
-    priv_data: *mut c_void,
-    pb: *mut c_void,
-    ctx_flags: c_int,
-    nb_streams: c_uint,
-    streams: *mut *mut AVStream,
-}
-
-#[repr(C)]
-struct AVPacket {
-    buf: *mut c_void,
-    pts: i64,
-    dts: i64,
-    data: *mut u8,
-    size: c_int,
-    stream_index: c_int,
-    flags: c_int,
-    side_data: *mut c_void,
-    side_data_elems: c_int,
-    duration: i64,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-#[repr(C)]
-struct AVFrame {
-    data: [*mut u8; 8],
-    linesize: [c_int; 8],
-    extended_data: *mut *mut u8,
-    width: c_int,
-    height: c_int,
-    nb_samples: c_int,
-    format: c_int,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-enum AVCodecContext {}
-
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-enum SwrContext {}
-
-unsafe extern "C" {
-    fn av_log_set_level(level: c_int);
-    fn avformat_open_input(
-        context: *mut *mut AVFormatContext,
-        url: *const c_char,
-        format: *mut c_void,
-        options: *mut *mut c_void,
-    ) -> c_int;
-    fn avformat_find_stream_info(context: *mut AVFormatContext, options: *mut *mut c_void)
-    -> c_int;
-    fn avformat_close_input(context: *mut *mut AVFormatContext);
-    fn av_read_frame(context: *mut AVFormatContext, packet: *mut AVPacket) -> c_int;
-    fn av_seek_frame(
-        context: *mut AVFormatContext,
-        stream_index: c_int,
-        timestamp: i64,
-        flags: c_int,
-    ) -> c_int;
-    fn avformat_flush(context: *mut AVFormatContext);
-    fn av_packet_alloc() -> *mut AVPacket;
-    fn av_packet_unref(packet: *mut AVPacket);
-    fn av_packet_get_side_data(
-        packet: *const AVPacket,
-        side_data_type: c_int,
-        size: *mut usize,
-    ) -> *mut u8;
-    fn av_packet_free(packet: *mut *mut AVPacket);
-    fn avcodec_get_name(codec_id: u32) -> *const c_char;
-    fn av_strerror(error: c_int, buffer: *mut c_char, buffer_size: usize) -> c_int;
-
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn avcodec_find_decoder(codec_id: u32) -> *const c_void;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn avcodec_alloc_context3(codec: *const c_void) -> *mut AVCodecContext;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn avcodec_parameters_to_context(
-        codec: *mut AVCodecContext,
-        parameters: *const AVCodecParameters,
-    ) -> c_int;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn avcodec_open2(
-        codec: *mut AVCodecContext,
-        decoder: *const c_void,
-        options: *mut *mut c_void,
-    ) -> c_int;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn avcodec_free_context(codec: *mut *mut AVCodecContext);
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn avcodec_send_packet(codec: *mut AVCodecContext, packet: *const AVPacket) -> c_int;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn avcodec_receive_frame(codec: *mut AVCodecContext, frame: *mut AVFrame) -> c_int;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn av_frame_alloc() -> *mut AVFrame;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn av_frame_free(frame: *mut *mut AVFrame);
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn av_channel_layout_default(layout: *mut AVChannelLayout, channels: c_int);
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn av_channel_layout_copy(
-        destination: *mut AVChannelLayout,
-        source: *const AVChannelLayout,
-    ) -> c_int;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn av_channel_layout_uninit(layout: *mut AVChannelLayout);
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn swr_alloc_set_opts2(
-        context: *mut *mut SwrContext,
-        output_layout: *const AVChannelLayout,
-        output_format: c_int,
-        output_rate: c_int,
-        input_layout: *const AVChannelLayout,
-        input_format: c_int,
-        input_rate: c_int,
-        log_offset: c_int,
-        log_context: *mut c_void,
-    ) -> c_int;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn swr_init(context: *mut SwrContext) -> c_int;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn swr_convert(
-        context: *mut SwrContext,
-        output: *mut *mut u8,
-        output_count: c_int,
-        input: *const *const u8,
-        input_count: c_int,
-    ) -> c_int;
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn swr_free(context: *mut *mut SwrContext);
+impl Drop for NativeInput {
+    fn drop(&mut self) {
+        // SAFETY: this is the sole owner; FFmpeg accepts a null context after an open failure.
+        unsafe {
+            avformat_close_input(&mut self.context);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +155,7 @@ pub struct VideoInfo {
     pub maximum_records_per_second: u64,
     pub first_pts_us: Option<i64>,
     pub duration_us: Option<u64>,
+    pub last_pts_us: Option<i64>,
     pub has_audio: bool,
     pub audio: Option<AudioInfo>,
     /// RFC 6381 codec string derived from the container decoder configuration
@@ -386,6 +242,12 @@ impl RateClaims {
                     "packet rate accounting underflow",
                 )
             })?;
+        }
+        if self.window.len() >= MAX_INSPECTION_WINDOW {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inspection packet window exceeds limit",
+            ));
         }
         self.window.push_back((timestamp_us, encoded_bytes));
         self.window_bytes = self
@@ -479,6 +341,7 @@ impl std::fmt::Display for NoVideoStream {
 impl std::error::Error for NoVideoStream {}
 
 pub struct VideoDemuxer {
+    _input: NativeInput,
     context: *mut AVFormatContext,
     packet: *mut AVPacket,
     stream_index: c_int,
@@ -499,22 +362,11 @@ impl VideoDemuxer {
         })?;
 
         unsafe { av_log_set_level(AV_LOG_QUIET) };
-        let mut context = ptr::null_mut();
-        let result = unsafe {
-            avformat_open_input(
-                &mut context,
-                path.as_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        if result < 0 {
-            return Err(ffmpeg_error("could not open media", result));
-        }
+        let input = NativeInput::open(&path)?;
+        let context = input.context;
 
         let stream_result = unsafe { avformat_find_stream_info(context, ptr::null_mut()) };
         if stream_result < 0 {
-            unsafe { avformat_close_input(&mut context) };
             return Err(ffmpeg_error(
                 "could not inspect media streams",
                 stream_result,
@@ -525,16 +377,9 @@ impl VideoDemuxer {
         let (stream_index, stream, parameters) = match selected {
             Some(selected) => selected,
             None => {
-                unsafe { avformat_close_input(&mut context) };
                 return Err(io::Error::new(io::ErrorKind::InvalidData, NoVideoStream));
             }
         };
-
-        let packet = unsafe { av_packet_alloc() };
-        if packet.is_null() {
-            unsafe { avformat_close_input(&mut context) };
-            return Err(io::Error::other("FFmpeg could not allocate a packet"));
-        }
 
         let (mut info, nal_length_size) = unsafe { video_info(parameters)? };
         let selected_audio = unsafe { find_audio_stream(context) };
@@ -553,18 +398,19 @@ impl VideoDemuxer {
         info.audio = audio;
         let time_base = unsafe { (*stream).time_base };
         if time_base.num <= 0 || time_base.den <= 0 {
-            let mut packet = packet;
-            unsafe {
-                av_packet_free(&mut packet);
-                avformat_close_input(&mut context);
-            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid video time base",
             ));
         }
 
+        let packet = unsafe { av_packet_alloc() };
+        if packet.is_null() {
+            return Err(io::Error::other("FFmpeg could not allocate a packet"));
+        }
+
         Ok(Self {
+            _input: input,
             context,
             packet,
             stream_index,
@@ -578,6 +424,7 @@ impl VideoDemuxer {
 
     pub fn inspect(path: &Path) -> io::Result<VideoInfo> {
         let mut demuxer = Self::open(path)?;
+        let inspection_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut maximum = 0_usize;
         let mut audio_maximum = 0_usize;
         let mut video_rate = RateClaims::default();
@@ -585,6 +432,7 @@ impl VideoDemuxer {
         let mut video_end_pts = None;
         let mut audio_end_pts = None;
         while let Some(packet) = demuxer.next_media_packet()? {
+            check_inspection_deadline(inspection_deadline)?;
             match packet {
                 EncodedMediaPacket::Video(packet) => {
                     maximum = maximum.max(packet.data.len());
@@ -603,6 +451,12 @@ impl VideoDemuxer {
                     )?;
                     if packet.pts_us != AV_NOPTS_VALUE {
                         demuxer.info.first_pts_us.get_or_insert(packet.pts_us);
+                        demuxer.info.last_pts_us = Some(
+                            demuxer
+                                .info
+                                .last_pts_us
+                                .map_or(packet.pts_us, |pts| pts.max(packet.pts_us)),
+                        );
                         video_end_pts = Some(video_end_pts.map_or(
                             packet_end_pts(packet.pts_us, packet.duration_us),
                             |end: i64| end.max(packet_end_pts(packet.pts_us, packet.duration_us)),
@@ -660,12 +514,25 @@ impl VideoDemuxer {
         Ok(demuxer.info.clone())
     }
 
+    pub fn skip_audio(&mut self) {
+        self.audio_stream_index = None;
+        self.audio_time_base = None;
+    }
+
     pub fn next_media_packet(&mut self) -> io::Result<Option<EncodedMediaPacket>> {
+        self._input.arm();
         loop {
             unsafe { av_packet_unref(self.packet) };
+            self._input.check()?;
             let result = unsafe { av_read_frame(self.context, self.packet) };
-            if result < 0 {
+            if result == AVERROR_EOF {
                 return Ok(None);
+            }
+            if result == AVERROR(libc::EAGAIN) {
+                continue;
+            }
+            if result < 0 {
+                return Err(ffmpeg_error("could not read media packet", result));
             }
 
             let packet = unsafe { &*self.packet };
@@ -674,22 +541,27 @@ impl VideoDemuxer {
             {
                 continue;
             }
-            if packet.size < 0 || (packet.size > 0 && packet.data.is_null()) {
+            if packet.size < 0
+                || packet.size as usize > MAX_PACKET_BYTES
+                || (packet.size > 0 && packet.data.is_null())
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid FFmpeg packet",
                 ));
             }
 
-            let mut data = if packet.size == 0 {
-                Vec::new()
+            // SAFETY: the checked packet remains referenced until the next native read.
+            let bytes = if packet.size == 0 {
+                &[]
             } else {
-                unsafe { std::slice::from_raw_parts(packet.data, packet.size as usize) }.to_vec()
+                unsafe { std::slice::from_raw_parts(packet.data, packet.size as usize) }
             };
             if packet.stream_index == self.stream_index {
-                if let Some(length_size) = self.nal_length_size {
-                    data = length_prefixed_to_annex_b(&data, length_size)?;
-                }
+                let data = match self.nal_length_size {
+                    Some(length_size) => length_prefixed_to_annex_b(bytes, length_size)?,
+                    None => bytes.to_vec(),
+                };
                 return Ok(Some(EncodedMediaPacket::Video(EncodedPacket {
                     key: vivid_protocol::media::access_unit_is_key(&self.info.codec, &data)?,
                     data,
@@ -713,7 +585,7 @@ impl VideoDemuxer {
                 trim_start_samples = 0;
             }
             return Ok(Some(EncodedMediaPacket::Audio(EncodedAudioPacket {
-                data,
+                data: bytes.to_vec(),
                 pts_us: timestamp_us(packet.pts, time_base),
                 dts_us: timestamp_us(packet.dts, time_base),
                 duration_us: timestamp_duration_us(packet.duration, time_base),
@@ -724,6 +596,7 @@ impl VideoDemuxer {
     }
 
     pub fn seek_to_us(&mut self, target_pts_us: i64) -> io::Result<()> {
+        self._input.arm();
         seek_context(
             self.context,
             self.packet,
@@ -738,12 +611,12 @@ impl Drop for VideoDemuxer {
     fn drop(&mut self) {
         unsafe {
             av_packet_free(&mut self.packet);
-            avformat_close_input(&mut self.context);
         }
     }
 }
 
 pub struct AudioDemuxer {
+    _input: NativeInput,
     context: *mut AVFormatContext,
     packet: *mut AVPacket,
     stream_index: c_int,
@@ -752,6 +625,10 @@ pub struct AudioDemuxer {
 }
 
 impl AudioDemuxer {
+    pub fn set_cancel(&mut self, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self._input.interrupt.stop = Some(stop);
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         let path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
             io::Error::new(
@@ -760,26 +637,14 @@ impl AudioDemuxer {
             )
         })?;
         unsafe { av_log_set_level(AV_LOG_QUIET) };
-        let mut context = ptr::null_mut();
-        let result = unsafe {
-            avformat_open_input(
-                &mut context,
-                path.as_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        if result < 0 {
-            return Err(ffmpeg_error("could not open audio media", result));
-        }
+        let input = NativeInput::open(&path)?;
+        let context = input.context;
         let result = unsafe { avformat_find_stream_info(context, ptr::null_mut()) };
         if result < 0 {
-            unsafe { avformat_close_input(&mut context) };
             return Err(ffmpeg_error("could not inspect audio streams", result));
         }
         let Some((stream_index, stream, parameters)) = (unsafe { find_audio_stream(context) })
         else {
-            unsafe { avformat_close_input(&mut context) };
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "media has no audio stream",
@@ -787,7 +652,6 @@ impl AudioDemuxer {
         };
         let time_base = unsafe { (*stream).time_base };
         if time_base.num <= 0 || time_base.den <= 0 {
-            unsafe { avformat_close_input(&mut context) };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid audio time base",
@@ -796,12 +660,12 @@ impl AudioDemuxer {
         let info = unsafe { audio_info(parameters, stream)? };
         let packet = unsafe { av_packet_alloc() };
         if packet.is_null() {
-            unsafe { avformat_close_input(&mut context) };
             return Err(io::Error::other(
                 "FFmpeg could not allocate an audio packet",
             ));
         }
         Ok(Self {
+            _input: input,
             context,
             packet,
             stream_index,
@@ -812,10 +676,12 @@ impl AudioDemuxer {
 
     pub fn inspect(path: &Path) -> io::Result<AudioInfo> {
         let mut demuxer = Self::open(path)?;
+        let inspection_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut maximum = 0_usize;
         let mut rate = RateClaims::default();
         let mut end_pts = None;
         while let Some(packet) = demuxer.next_packet()? {
+            check_inspection_deadline(inspection_deadline)?;
             maximum = maximum.max(packet.data.len());
             let body_length =
                 vivid_protocol::media::audio_body_len(u32::try_from(packet.data.len()).map_err(
@@ -849,6 +715,7 @@ impl AudioDemuxer {
     }
 
     pub fn seek_to_us(&mut self, target_pts_us: i64) -> io::Result<()> {
+        self._input.arm();
         seek_context(
             self.context,
             self.packet,
@@ -859,17 +726,28 @@ impl AudioDemuxer {
     }
 
     pub fn next_packet(&mut self) -> io::Result<Option<EncodedAudioPacket>> {
+        self._input.arm();
         loop {
             unsafe { av_packet_unref(self.packet) };
+            self._input.check()?;
             let result = unsafe { av_read_frame(self.context, self.packet) };
-            if result < 0 {
+            if result == AVERROR_EOF {
                 return Ok(None);
+            }
+            if result == AVERROR(libc::EAGAIN) {
+                continue;
+            }
+            if result < 0 {
+                return Err(ffmpeg_error("could not read media packet", result));
             }
             let packet = unsafe { &*self.packet };
             if packet.stream_index != self.stream_index {
                 continue;
             }
-            if packet.size < 0 || (packet.size > 0 && packet.data.is_null()) {
+            if packet.size < 0
+                || packet.size as usize > MAX_PACKET_BYTES
+                || (packet.size > 0 && packet.data.is_null())
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid audio packet",
@@ -900,7 +778,6 @@ impl Drop for AudioDemuxer {
     fn drop(&mut self) {
         unsafe {
             av_packet_free(&mut self.packet);
-            avformat_close_input(&mut self.context);
         }
     }
 }
@@ -934,6 +811,7 @@ pub struct DecodedAudio {
 /// cross the thread boundary.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub struct AudioDecoder {
+    _input: NativeInput,
     context: *mut AVFormatContext,
     codec: *mut AVCodecContext,
     packet: *mut AVPacket,
@@ -952,6 +830,10 @@ pub struct AudioDecoder {
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl AudioDecoder {
+    pub fn set_cancel(&mut self, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self._input.interrupt.stop = Some(stop);
+    }
+
     pub fn open(path: &Path, output_sample_rate: u32, output_channels: u16) -> io::Result<Self> {
         let path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
             io::Error::new(
@@ -974,22 +856,10 @@ impl AudioDecoder {
         }
 
         unsafe { av_log_set_level(AV_LOG_QUIET) };
-        let mut context = ptr::null_mut();
-        let open_result = unsafe {
-            avformat_open_input(
-                &mut context,
-                path.as_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        if open_result < 0 {
-            return Err(ffmpeg_error("could not open audio media", open_result));
-        }
-
+        let input = NativeInput::open(&path)?;
+        let context = input.context;
         let stream_result = unsafe { avformat_find_stream_info(context, ptr::null_mut()) };
         if stream_result < 0 {
-            unsafe { avformat_close_input(&mut context) };
             return Err(ffmpeg_error(
                 "could not inspect audio streams",
                 stream_result,
@@ -998,7 +868,6 @@ impl AudioDecoder {
 
         let Some((stream_index, stream, parameters)) = (unsafe { find_audio_stream(context) })
         else {
-            unsafe { avformat_close_input(&mut context) };
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "media has no audio stream",
@@ -1006,7 +875,6 @@ impl AudioDecoder {
         };
         let input_sample_rate = unsafe { (*parameters).sample_rate };
         if input_sample_rate <= 0 {
-            unsafe { avformat_close_input(&mut context) };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "audio stream has no sample rate",
@@ -1020,7 +888,6 @@ impl AudioDecoder {
 
         let decoder = unsafe { avcodec_find_decoder((*parameters).codec_id) };
         if decoder.is_null() {
-            unsafe { avformat_close_input(&mut context) };
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "FFmpeg has no decoder for the audio stream",
@@ -1028,7 +895,6 @@ impl AudioDecoder {
         }
         let mut codec = unsafe { avcodec_alloc_context3(decoder) };
         if codec.is_null() {
-            unsafe { avformat_close_input(&mut context) };
             return Err(io::Error::other(
                 "FFmpeg could not allocate an audio decoder context",
             ));
@@ -1037,18 +903,20 @@ impl AudioDecoder {
         if parameters_result < 0 {
             unsafe {
                 avcodec_free_context(&mut codec);
-                avformat_close_input(&mut context);
             }
             return Err(ffmpeg_error(
                 "could not configure the audio decoder",
                 parameters_result,
             ));
         }
+        // SAFETY: codec is uniquely owned; decoded frame timestamps retain stream units.
+        unsafe {
+            (*codec).pkt_timebase = time_base;
+        }
         let decoder_result = unsafe { avcodec_open2(codec, decoder, ptr::null_mut()) };
         if decoder_result < 0 {
             unsafe {
                 avcodec_free_context(&mut codec);
-                avformat_close_input(&mut context);
             }
             return Err(ffmpeg_error(
                 "could not open the audio decoder",
@@ -1060,7 +928,6 @@ impl AudioDecoder {
         if packet.is_null() {
             unsafe {
                 avcodec_free_context(&mut codec);
-                avformat_close_input(&mut context);
             }
             return Err(io::Error::other(
                 "FFmpeg could not allocate an audio packet",
@@ -1071,12 +938,12 @@ impl AudioDecoder {
             unsafe {
                 av_packet_free(&mut packet);
                 avcodec_free_context(&mut codec);
-                avformat_close_input(&mut context);
             }
             return Err(io::Error::other("FFmpeg could not allocate an audio frame"));
         }
 
         Ok(Self {
+            _input: input,
             context,
             codec,
             packet,
@@ -1094,14 +961,43 @@ impl AudioDecoder {
         })
     }
 
+    pub fn seek_to_us(&mut self, target_pts_us: i64) -> io::Result<()> {
+        self._input.arm();
+        seek_context(
+            self.context,
+            self.packet,
+            self.stream_index,
+            self.time_base,
+            target_pts_us,
+        )?;
+        // SAFETY: decoder, frame, and optional resampler are uniquely owned by this decoder.
+        unsafe {
+            avcodec_flush_buffers(self.codec);
+            av_frame_unref(self.frame);
+            swr_free(&mut self.resampler);
+        }
+        self.first_pts_us = None;
+        self.input_eof = false;
+        self.resampler_drained = false;
+        Ok(())
+    }
+
     pub fn first_pts_us(&self) -> Option<i64> {
         self.first_pts_us
     }
 
     pub fn next_frame(&mut self) -> io::Result<Option<DecodedAudio>> {
+        self._input.arm();
         loop {
             let receive_result = unsafe { avcodec_receive_frame(self.codec, self.frame) };
             if receive_result == 0 {
+                if self.first_pts_us.is_none() {
+                    // SAFETY: avcodec_receive_frame initialized this owned frame.
+                    let pts = unsafe { (*self.frame).best_effort_timestamp };
+                    if pts != AV_NOPTS_VALUE {
+                        self.first_pts_us = Some(timestamp_us(pts, self.time_base));
+                    }
+                }
                 if let Some(frame) = self.convert_frame()? {
                     return Ok(Some(frame));
                 }
@@ -1121,8 +1017,15 @@ impl AudioDecoder {
             let mut found_audio = false;
             loop {
                 unsafe { av_packet_unref(self.packet) };
+                self._input.check()?;
                 let read_result = unsafe { av_read_frame(self.context, self.packet) };
-                if read_result < 0 {
+                if read_result == -libc::EAGAIN {
+                    continue;
+                }
+                if read_result < 0 && read_result != AVERROR_EOF {
+                    return Err(ffmpeg_error("could not read audio packet", read_result));
+                }
+                if read_result == AVERROR_EOF {
                     let flush_result = unsafe { avcodec_send_packet(self.codec, ptr::null()) };
                     if flush_result < 0 && flush_result != AVERROR_EOF {
                         return Err(ffmpeg_error(
@@ -1136,9 +1039,6 @@ impl AudioDecoder {
                 let packet = unsafe { &*self.packet };
                 if packet.stream_index != self.stream_index {
                     continue;
-                }
-                if self.first_pts_us.is_none() && packet.pts != AV_NOPTS_VALUE {
-                    self.first_pts_us = Some(timestamp_us(packet.pts, self.time_base));
                 }
                 found_audio = true;
                 break;
@@ -1175,6 +1075,12 @@ impl AudioDecoder {
             .ok()
             .and_then(|samples| samples.checked_mul(self.output_channels as usize))
             .ok_or_else(|| io::Error::other("resampled audio frame is too large"))?;
+        if sample_count > 16 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded audio frame exceeds sample budget",
+            ));
+        }
         let mut samples = vec![0.0_f32; sample_count];
         let mut output = [ptr::null_mut(); 8];
         output[0] = samples.as_mut_ptr().cast();
@@ -1200,7 +1106,7 @@ impl AudioDecoder {
     }
 
     fn initialize_resampler(&mut self, input_format: c_int) -> io::Result<()> {
-        let mut input_layout = AVChannelLayout::default();
+        let mut input_layout = empty_channel_layout();
         let parameters = unsafe { &*self.parameters };
         if parameters.ch_layout.nb_channels > 0 {
             let copy_result =
@@ -1215,7 +1121,7 @@ impl AudioDecoder {
             unsafe { av_channel_layout_default(&mut input_layout, 2) };
         }
 
-        let mut output_layout = AVChannelLayout::default();
+        let mut output_layout = empty_channel_layout();
         unsafe { av_channel_layout_default(&mut output_layout, self.output_channels) };
         let result = unsafe {
             swr_alloc_set_opts2(
@@ -1224,7 +1130,7 @@ impl AudioDecoder {
                 AV_SAMPLE_FMT_FLT,
                 self.output_sample_rate,
                 &input_layout,
-                input_format,
+                sample_format(input_format)?,
                 self.input_sample_rate,
                 0,
                 ptr::null_mut(),
@@ -1288,7 +1194,6 @@ impl Drop for AudioDecoder {
             av_frame_free(&mut self.frame);
             av_packet_free(&mut self.packet);
             avcodec_free_context(&mut self.codec);
-            avformat_close_input(&mut self.context);
         }
     }
 }
@@ -1323,7 +1228,7 @@ unsafe fn video_info(parameters: *mut AVCodecParameters) -> io::Result<(VideoInf
 
     let codec_pointer = unsafe { avcodec_get_name(parameters.codec_id) };
     let codec = if codec_pointer.is_null() {
-        format!("ffmpeg-codec-{}", parameters.codec_id)
+        format!("ffmpeg-codec-{}", parameters.codec_id as u32)
     } else {
         unsafe { CStr::from_ptr(codec_pointer) }
             .to_string_lossy()
@@ -1380,14 +1285,16 @@ unsafe fn video_info(parameters: *mut AVCodecParameters) -> io::Result<(VideoInf
         parameters.level,
         parameters.bits_per_raw_sample,
     );
-    let colorimetry_inferred = parameters.color_primaries == AVCOL_PRI_UNSPECIFIED
-        || parameters.color_trc == AVCOL_TRC_UNSPECIFIED
-        || parameters.color_space == AVCOL_SPC_UNSPECIFIED
-        || parameters.color_range == AVCOL_RANGE_UNSPECIFIED;
-    let color_primaries = map_primaries(parameters.color_primaries, height)?;
-    let transfer = map_transfer(parameters.color_trc)?;
-    let matrix = map_matrix(parameters.color_space, height)?;
-    let range = map_range(parameters.color_range)?;
+    let colorimetry_inferred = parameters.color_primaries as c_int
+        == AVColorPrimaries::AVCOL_PRI_UNSPECIFIED as c_int
+        || parameters.color_trc as c_int
+            == AVColorTransferCharacteristic::AVCOL_TRC_UNSPECIFIED as c_int
+        || parameters.color_space as c_int == AVColorSpace::AVCOL_SPC_UNSPECIFIED as c_int
+        || parameters.color_range as c_int == AVColorRange::AVCOL_RANGE_UNSPECIFIED as c_int;
+    let color_primaries = map_primaries(parameters.color_primaries as c_int, height)?;
+    let transfer = map_transfer(parameters.color_trc as c_int)?;
+    let matrix = map_matrix(parameters.color_space as c_int, height)?;
+    let range = map_range(parameters.color_range as c_int)?;
     let sar = parameters.sample_aspect_ratio;
     let (sar_num, sar_den) = if sar.num > 0 && sar.den > 0 {
         (sar.num as u32, sar.den as u32)
@@ -1418,6 +1325,7 @@ unsafe fn video_info(parameters: *mut AVCodecParameters) -> io::Result<(VideoInf
             maximum_records_per_second: 0,
             first_pts_us: None,
             duration_us: None,
+            last_pts_us: None,
             has_audio: false,
             audio: None,
             codec_string,
@@ -1560,7 +1468,7 @@ unsafe fn audio_info(
     let parameters = unsafe { &*parameters };
     let codec_pointer = unsafe { avcodec_get_name(parameters.codec_id) };
     let codec = if codec_pointer.is_null() {
-        format!("ffmpeg-codec-{}", parameters.codec_id)
+        format!("ffmpeg-codec-{}", parameters.codec_id as u32)
     } else {
         unsafe { CStr::from_ptr(codec_pointer) }
             .to_string_lossy()
@@ -1575,7 +1483,12 @@ unsafe fn audio_info(
         "flac" => vivid_protocol::media::AUDIO_PACKETIZATION_FLAC,
         "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" | "pcm_f64le"
         | "pcm_mulaw" | "pcm_alaw" => "pcm-packet-v1",
-        _ => "unsupported-audio-packetization",
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("audio codec {codec} has no Vivid packetization"),
+            ));
+        }
     };
     let extradata_size = usize::try_from(parameters.extradata_size)
         .ok()
@@ -1603,8 +1516,8 @@ unsafe fn audio_info(
             channels,
         )?;
     }
-    let channel_mask = if matches!(parameters.ch_layout.order, 0 | 1) {
-        parameters.ch_layout.mask
+    let channel_mask = if matches!(parameters.ch_layout.order as u32, 0 | 1) {
+        unsafe { parameters.ch_layout.u.mask }
     } else {
         u64::MAX
     };
@@ -1873,6 +1786,16 @@ fn length_prefixed_to_annex_b(data: &[u8], length_size: usize) -> io::Result<Vec
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "access-unit NAL exceeds packet")
             })?;
+        let next_size = output
+            .len()
+            .checked_add(4)
+            .and_then(|size| size.checked_add(length));
+        if next_size.is_none_or(|size| size > MAX_PACKET_BYTES) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "converted access unit exceeds packet budget",
+            ));
+        }
         output.extend_from_slice(&[0, 0, 0, 1]);
         output.extend_from_slice(&data[offset..end]);
         offset = end;
@@ -1886,7 +1809,7 @@ fn map_primaries(value: c_int, height: u32) -> io::Result<u64> {
         5 => Ok(2),
         6 => Ok(3),
         9 => Ok(4),
-        AVCOL_PRI_UNSPECIFIED => Ok(if height > 576 {
+        value if value == AVColorPrimaries::AVCOL_PRI_UNSPECIFIED as c_int => Ok(if height > 576 {
             1 // BT.709 for HD video.
         } else if height > 480 {
             2 // BT.601 625-line family.
@@ -1903,7 +1826,7 @@ fn map_transfer(value: c_int) -> io::Result<u64> {
     match value {
         1 => Ok(1),
         13 => Ok(2),
-        AVCOL_TRC_UNSPECIFIED => Ok(1),
+        value if value == AVColorTransferCharacteristic::AVCOL_TRC_UNSPECIFIED as c_int => Ok(1),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "video transfer characteristic is missing or unsupported",
@@ -1916,7 +1839,9 @@ fn map_matrix(value: c_int, height: u32) -> io::Result<u64> {
         1 => Ok(1),
         5 | 6 => Ok(2),
         9 => Ok(3),
-        AVCOL_SPC_UNSPECIFIED => Ok(if height > 576 { 1 } else { 2 }),
+        value if value == AVColorSpace::AVCOL_SPC_UNSPECIFIED as c_int => {
+            Ok(if height > 576 { 1 } else { 2 })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "video matrix coefficients are missing or unsupported",
@@ -1927,7 +1852,7 @@ fn map_range(value: c_int) -> io::Result<u64> {
     match value {
         1 => Ok(1),
         2 => Ok(2),
-        AVCOL_RANGE_UNSPECIFIED => Ok(1),
+        value if value == AVColorRange::AVCOL_RANGE_UNSPECIFIED as c_int => Ok(1),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "video signal range is missing or unsupported",
@@ -1983,7 +1908,6 @@ fn seek_context(
     }
     unsafe {
         av_packet_unref(packet);
-        avformat_flush(context);
     }
     Ok(())
 }
@@ -2013,22 +1937,73 @@ fn ffmpeg_error(context: &str, code: c_int) -> io::Error {
     io::Error::other(format!("{context}: {description}"))
 }
 
+fn sample_format(value: c_int) -> io::Result<AVSampleFormat> {
+    use AVSampleFormat::*;
+    [
+        AV_SAMPLE_FMT_U8,
+        AV_SAMPLE_FMT_S16,
+        AV_SAMPLE_FMT_S32,
+        AV_SAMPLE_FMT_FLT,
+        AV_SAMPLE_FMT_DBL,
+        AV_SAMPLE_FMT_U8P,
+        AV_SAMPLE_FMT_S16P,
+        AV_SAMPLE_FMT_S32P,
+        AV_SAMPLE_FMT_FLTP,
+        AV_SAMPLE_FMT_DBLP,
+        AV_SAMPLE_FMT_S64,
+        AV_SAMPLE_FMT_S64P,
+    ]
+    .into_iter()
+    .find(|format| *format as c_int == value)
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported audio sample format",
+        )
+    })
+}
+
+fn empty_channel_layout() -> AVChannelLayout {
+    // SAFETY: all-zero is FFmpeg's uninitialized layout: UNSPEC order, no channels, null opaque.
+    unsafe { std::mem::zeroed() }
+}
+
+fn check_inspection_deadline(deadline: std::time::Instant) -> io::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "media inspection exceeded 120 seconds",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(all(
-        target_pointer_width = "64",
-        not(ffmpeg_old_channel_layout),
-        ffmpeg_codecpar_has_framerate
-    ))]
     #[test]
-    fn ffmpeg_8_codec_parameters_color_layout_matches_abi() {
-        assert_eq!(std::mem::offset_of!(AVCodecParameters, framerate), 88);
-        assert_eq!(
-            std::mem::offset_of!(AVCodecParameters, color_primaries),
-            104
-        );
+    fn native_interrupt_observes_deadline_and_worker_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::{Duration, Instant};
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut state = NativeInterrupt {
+            deadline: Instant::now() + Duration::from_secs(30),
+            stop: Some(stop.clone()),
+        };
+        let pointer = (&mut state as *mut NativeInterrupt).cast();
+        // SAFETY: the callback borrows the live, aligned state only for each synchronous call.
+        assert_eq!(unsafe { interrupt_input(pointer) }, 0);
+        stop.store(true, Ordering::Relaxed);
+        // SAFETY: same live state as above, with only its atomic stop flag changed.
+        assert_eq!(unsafe { interrupt_input(pointer) }, 1);
+        stop.store(false, Ordering::Relaxed);
+        state.deadline = Instant::now();
+        // SAFETY: pointer still refers to state and no other thread accesses its deadline.
+        assert_eq!(unsafe { interrupt_input(pointer) }, 1);
     }
 
     #[test]
@@ -2051,13 +2026,34 @@ mod tests {
 
     #[test]
     fn unspecified_colorimetry_uses_sd_and_hd_defaults() {
-        assert_eq!(map_primaries(AVCOL_PRI_UNSPECIFIED, 480).unwrap(), 3);
-        assert_eq!(map_primaries(AVCOL_PRI_UNSPECIFIED, 576).unwrap(), 2);
-        assert_eq!(map_primaries(AVCOL_PRI_UNSPECIFIED, 720).unwrap(), 1);
-        assert_eq!(map_transfer(AVCOL_TRC_UNSPECIFIED).unwrap(), 1);
-        assert_eq!(map_matrix(AVCOL_SPC_UNSPECIFIED, 480).unwrap(), 2);
-        assert_eq!(map_matrix(AVCOL_SPC_UNSPECIFIED, 720).unwrap(), 1);
-        assert_eq!(map_range(AVCOL_RANGE_UNSPECIFIED).unwrap(), 1);
+        assert_eq!(
+            map_primaries(AVColorPrimaries::AVCOL_PRI_UNSPECIFIED as c_int, 480).unwrap(),
+            3
+        );
+        assert_eq!(
+            map_primaries(AVColorPrimaries::AVCOL_PRI_UNSPECIFIED as c_int, 576).unwrap(),
+            2
+        );
+        assert_eq!(
+            map_primaries(AVColorPrimaries::AVCOL_PRI_UNSPECIFIED as c_int, 720).unwrap(),
+            1
+        );
+        assert_eq!(
+            map_transfer(AVColorTransferCharacteristic::AVCOL_TRC_UNSPECIFIED as c_int).unwrap(),
+            1
+        );
+        assert_eq!(
+            map_matrix(AVColorSpace::AVCOL_SPC_UNSPECIFIED as c_int, 480).unwrap(),
+            2
+        );
+        assert_eq!(
+            map_matrix(AVColorSpace::AVCOL_SPC_UNSPECIFIED as c_int, 720).unwrap(),
+            1
+        );
+        assert_eq!(
+            map_range(AVColorRange::AVCOL_RANGE_UNSPECIFIED as c_int).unwrap(),
+            1
+        );
     }
 
     #[test]

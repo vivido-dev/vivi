@@ -39,3 +39,20 @@ or its scene node.
 Use `vivi --verbose` to inspect profile, track, channel, and playback diagnostics. Also verify that
 local Vivido can open its default output device and that its FFmpeg runtime libraries are
 discoverable.
+
+Current Vivid 1.5 vvmux is also supported in the remote shell:
+
+```sh
+vvmux new --session media
+# In its pane:
+printf 'Local fallback policy: %s\n' "$VIVID_AUDIO_FALLBACK"
+vivi clip.mp4
+```
+
+The pane policy is `deny`; vvmux deliberately reissues it after scrubbing inherited Vivid
+credentials and endpoints. It remains in effect after detach/reattach. Only an explicit
+`VIVID_AUDIO_FALLBACK=allow` override enables a local device in this context.
+
+Use matching current vivi, SDK/gateway, vvmux and Vivido builds. Physical pause/seek feedback must
+reach vivi through the gateway; an older presenter without the playback clock map produces an
+explicit observation timeout instead of guessing a resume position from packet admission.

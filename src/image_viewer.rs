@@ -1,5 +1,6 @@
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -28,6 +29,62 @@ const SLOT_POSTER: u64 = 4;
 const IMAGE_PNG: u64 = 1;
 const IMAGE_JPEG: u64 = 2;
 const MAX_NESTED_SVG_DEPTH: u8 = 8;
+const MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SVG_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ASSET_PIXELS: u64 = 16 * 1024 * 1024;
+
+fn bounded_read(reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "image input exceeds byte budget",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn expand_svg(encoded: &[u8]) -> io::Result<Vec<u8>> {
+    if encoded.starts_with(&[0x1f, 0x8b]) {
+        bounded_read(flate2::read::GzDecoder::new(encoded), MAX_SVG_BYTES)
+    } else {
+        bounded_read(encoded, MAX_SVG_BYTES)
+    }
+}
+
+#[derive(Default)]
+struct AssetBudget {
+    bytes: AtomicU64,
+    pixels: AtomicU64,
+}
+impl AssetBudget {
+    fn charge(counter: &AtomicU64, value: u64, limit: u64) -> Option<()> {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(value).filter(|next| *next <= limit)
+            })
+            .ok()
+            .map(|_| ())
+    }
+    fn encoded(&self, data: &[u8]) -> Option<()> {
+        Self::charge(&self.bytes, data.len() as u64, MAX_ENCODED_BYTES)?;
+        if image::guess_format(data).is_ok() {
+            let (width, height) = image::ImageReader::new(io::Cursor::new(data))
+                .with_guessed_format()
+                .ok()?
+                .into_dimensions()
+                .ok()?;
+            raster_limits(width, height).ok()?;
+            Self::charge(
+                &self.pixels,
+                u64::from(width).checked_mul(u64::from(height))?,
+                MAX_ASSET_PIXELS,
+            )?;
+        }
+        Some(())
+    }
+}
 
 static SVG_FONT_DATABASE: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
 
@@ -49,7 +106,7 @@ pub fn view(
     client: &mut VividClient,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let encoded = std::fs::read(path)?;
+    let encoded = bounded_read(std::fs::File::open(path)?, MAX_ENCODED_BYTES)?;
     let format = image::guess_format(&encoded).ok();
     let svg = if format.is_none() {
         Some(render_svg(path, &encoded)?)
@@ -58,7 +115,7 @@ pub fn view(
     };
     let (width, height) = match &svg {
         Some(svg) => (svg.width, svg.height),
-        None => image::ImageReader::open(path)?
+        None => image::ImageReader::new(io::Cursor::new(&encoded))
             .with_guessed_format()?
             .into_dimensions()?,
     };
@@ -272,9 +329,10 @@ pub(crate) fn send_full_raster_frame(
     track: &vivid_sdk::Track,
     rgba: &[u8],
 ) -> io::Result<()> {
-    session
-        .open_track_channel(track)?
-        .send_raster(1, 1, rgba, false)?;
+    let channel = session.open_track_channel(track)?;
+    channel.send_raster(1, 1, rgba, false)?;
+    // A still image is retained after clean EOS; bare socket EOF would lose the live track.
+    channel.eos()?;
     Ok(())
 }
 
@@ -331,12 +389,14 @@ fn render_svg(path: &Path, encoded: &[u8]) -> io::Result<RasterImage> {
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SVG has no parent directory"))?
         .to_path_buf();
-    let tree = parse_svg_tree(encoded, &root, &root, 0).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("could not parse SVG: {error}"),
-        )
-    })?;
+    let tree = parse_svg_tree(encoded, &root, &root, 0, Arc::new(AssetBudget::default())).map_err(
+        |error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("could not parse SVG: {error}"),
+            )
+        },
+    )?;
     let size = tree.size().to_int_size();
     let width = size.width();
     let height = size.height();
@@ -357,20 +417,32 @@ fn parse_svg_tree(
     root: &Path,
     resource_directory: &Path,
     depth: u8,
-) -> Result<Tree, resvg::usvg::Error> {
-    let options = svg_options(root, resource_directory, depth);
-    Tree::from_data(encoded, &options)
+    budget: Arc<AssetBudget>,
+) -> io::Result<Tree> {
+    let expanded = expand_svg(encoded)?;
+    AssetBudget::charge(&budget.bytes, expanded.len() as u64, MAX_ENCODED_BYTES)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SVG asset budget exhausted"))?;
+    let options = svg_options(root, resource_directory, depth, budget);
+    Tree::from_data(&expanded, &options).map_err(io::Error::other)
 }
 
-fn svg_options(root: &Path, resource_directory: &Path, depth: u8) -> Options<'static> {
+fn svg_options(
+    root: &Path,
+    resource_directory: &Path,
+    depth: u8,
+    budget: Arc<AssetBudget>,
+) -> Options<'static> {
     let confined_root = root.to_path_buf();
     let current_directory = resource_directory.to_path_buf();
+    let string_budget = budget.clone();
     let resolve_string = Box::new(move |href: &str, _options: &Options| {
         if depth >= MAX_NESTED_SVG_DEPTH {
             return None;
         }
         let path = confined_resource_path(&confined_root, &current_directory, href)?;
-        let data = Arc::new(std::fs::read(&path).ok()?);
+        let data =
+            Arc::new(bounded_read(std::fs::File::open(&path).ok()?, MAX_ENCODED_BYTES).ok()?);
+        string_budget.encoded(&data)?;
         match image::guess_format(&data).ok() {
             Some(image::ImageFormat::Jpeg) => Some(ImageKind::JPEG(data)),
             Some(image::ImageFormat::Png) => Some(ImageKind::PNG(data)),
@@ -378,16 +450,41 @@ fn svg_options(root: &Path, resource_directory: &Path, depth: u8) -> Options<'st
             Some(image::ImageFormat::WebP) => Some(ImageKind::WEBP(data)),
             _ => {
                 let directory = path.parent()?;
-                parse_svg_tree(&data, &confined_root, directory, depth + 1)
-                    .ok()
-                    .map(ImageKind::SVG)
+                parse_svg_tree(
+                    &data,
+                    &confined_root,
+                    directory,
+                    depth + 1,
+                    string_budget.clone(),
+                )
+                .ok()
+                .map(ImageKind::SVG)
             }
         }
     });
+    let data_root = root.to_path_buf();
+    let data_directory = resource_directory.to_path_buf();
     Options {
         resources_dir: Some(resource_directory.to_path_buf()),
         image_href_resolver: ImageHrefResolver {
-            resolve_data: ImageHrefResolver::default_data_resolver(),
+            resolve_data: Box::new(move |mime, data, options| {
+                budget.encoded(&data)?;
+                if mime == "image/svg+xml" {
+                    if depth >= MAX_NESTED_SVG_DEPTH {
+                        return None;
+                    }
+                    return parse_svg_tree(
+                        &data,
+                        &data_root,
+                        &data_directory,
+                        depth + 1,
+                        budget.clone(),
+                    )
+                    .ok()
+                    .map(ImageKind::SVG);
+                }
+                ImageHrefResolver::default_data_resolver()(mime, data, options)
+            }),
             resolve_string,
         },
         fontdb: svg_font_database(),
@@ -477,6 +574,27 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
+
+    #[test]
+    fn input_and_asset_budgets_reject_before_unbounded_growth() {
+        assert!(bounded_read(&b"12345"[..], 4).is_err());
+        assert_eq!(bounded_read(&b"1234"[..], 4).unwrap(), b"1234");
+        let counter = AtomicU64::new(MAX_ASSET_PIXELS - 1);
+        assert!(AssetBudget::charge(&counter, 2, MAX_ASSET_PIXELS).is_none());
+        assert_eq!(counter.load(Ordering::Relaxed), MAX_ASSET_PIXELS - 1);
+    }
+
+    #[test]
+    fn compressed_svg_expansion_is_bounded() {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        for _ in 0..=MAX_SVG_BYTES / 8192 {
+            encoder.write_all(&[b' '; 8192]).unwrap();
+        }
+        let encoded = encoder.finish().unwrap();
+        assert!(encoded.len() < 100_000);
+        assert!(expand_svg(&encoded).is_err());
+    }
 
     static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

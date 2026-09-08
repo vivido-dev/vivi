@@ -1,9 +1,12 @@
 mod audio_player;
 mod audio_streamer;
+#[cfg(test)]
+mod benchmark;
 mod cli;
 mod client;
 mod ffmpeg;
 mod image_viewer;
+mod media_sender;
 mod playback_ui;
 mod terminal_geometry;
 mod video_player;
@@ -29,7 +32,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("vivi: {error}");
+            eprintln!("vivi: {}", playback_ui::safe_text(&error.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -41,6 +44,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = VividClient::connect(&config)?;
     for file in &config.files {
+        ffmpeg::reset_native_cancellation();
         let result = match media_hint(file) {
             MediaHint::Video => {
                 match video_player::play(&config, &mut client, file) {
@@ -72,6 +76,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
         };
 
+        // A user's quit may interrupt a native read or an SDK operation before the coordinator
+        // consumes its queued command. Worker guards have already joined; this is a clean stop.
+        if result.is_err() && ffmpeg::native_io_cancelled() {
+            return Ok(());
+        }
         result?;
     }
 
@@ -97,7 +106,7 @@ fn play_audio(
     if client.supports(crate::protocol::registry::TIMED_MEDIA) {
         match audio_streamer::play(config, client, path) {
             Ok(()) => return Ok(()),
-            Err(error) if std::env::var_os("VIVID_REMOTE").is_some() => {
+            Err(error) if !crate::client::local_audio_allowed() => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     format!("remote audio negotiation failed: {error}"),
@@ -111,7 +120,7 @@ fn play_audio(
             )),
         }
     }
-    if std::env::var_os("VIVID_REMOTE").is_some() {
+    if !crate::client::local_audio_allowed() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "remote audio requires a presenter supporting timed-media-v1",
