@@ -2527,7 +2527,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_protocol"
-version = "1.5.8"
+version = "1.5.9"
 dependencies = [
  "base64",
  "hmac",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.7"
+version = "1.5.8"
 dependencies = [
  "crossterm",
  "getrandom 0.4.3",
