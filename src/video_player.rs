@@ -516,6 +516,7 @@ pub fn play(
     let mut last_pts = None;
     let mut recovery_rebase_pending = false;
     let mut recovery_start_pts_us = None;
+    let mut seek_target_primed = false;
     let timeline_origin_us = info.first_pts_us.unwrap_or(0);
     let mut timeline = PlaybackTimeline::new(0);
     let mut play_start_override = None;
@@ -701,7 +702,7 @@ pub fn play(
                     let target = clamp_video_seek(target, timeline_origin_us, info.last_pts_us);
                     let target_pts = timeline_origin_us
                         .saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
-                    presenter_audio = seek_video_generation(
+                    (presenter_audio, seek_target_primed) = seek_video_generation(
                         client,
                         SeekTransition {
                             path,
@@ -781,7 +782,12 @@ pub fn play(
                 .ok_or_else(|| io::Error::other("video packet ID space exhausted"))?;
             let first_pts_before_send = first_pts;
             first_pts.get_or_insert(packet.pts_us);
-            let delivery_kind = video_delivery_kind(play_start_override, started, packet.pts_us);
+            let delivery_kind = video_delivery_kind(
+                play_start_override,
+                started,
+                packet.pts_us,
+                seek_target_primed,
+            );
             match delivery_kind {
                 VideoDeliveryKind::Timeline => video_delivery.admit_record(),
                 _ => video_catchup.admit_record(),
@@ -1184,7 +1190,7 @@ pub fn play(
                 let target = clamp_video_seek(target, timeline_origin_us, info.last_pts_us);
                 let target_pts =
                     timeline_origin_us.saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
-                presenter_audio = seek_video_generation(
+                (presenter_audio, seek_target_primed) = seek_video_generation(
                     client,
                     SeekTransition {
                         path,
@@ -1312,7 +1318,7 @@ pub fn play(
                 let target = clamp_video_seek(target, timeline_origin_us, info.last_pts_us);
                 let target_pts =
                     timeline_origin_us.saturating_add(i64::try_from(target).unwrap_or(i64::MAX));
-                presenter_audio = seek_video_generation(
+                (presenter_audio, seek_target_primed) = seek_video_generation(
                     client,
                     SeekTransition {
                         path,
@@ -1703,7 +1709,7 @@ struct SeekTransition<'a> {
 fn seek_video_generation(
     client: &mut VividClient,
     transition: SeekTransition<'_>,
-) -> io::Result<Option<PresenterAudio>> {
+) -> io::Result<(Option<PresenterAudio>, bool)> {
     let SeekTransition {
         path,
         surface,
@@ -1754,18 +1760,18 @@ fn seek_video_generation(
         open_presenter_audio_after_seek(client, path, recovery, audio, target_pts, *epoch)
     });
     // Startup may not yet have activated the surface. Publish its exact PLAY during activation.
-    if client
+    let target_primed = client
         .query_surface(surface)?
         .active_slots
         .iter()
-        .any(|(slot, value)| *slot == SLOT_VIDEO && value.as_u64() == Some(video.id()))
-    {
+        .any(|(slot, value)| *slot == SLOT_VIDEO && value.as_u64() == Some(video.id()));
+    if target_primed {
         prime_video_seek(client, video, target_pts)?;
     }
     if restart_local && crate::client::local_audio_allowed() {
         *local_audio = Some(audio_player::prepare_video(path, Some(target_pts))?);
     }
-    Ok(audio)
+    Ok((audio, target_primed))
 }
 
 fn advance_presenter_audio_for_seek(
@@ -2203,8 +2209,14 @@ fn video_delivery_kind(
     play_start_override: Option<i64>,
     started: bool,
     pts_us: i64,
+    seek_target_primed: bool,
 ) -> VideoDeliveryKind {
-    if !started {
+    // Once PLAY(target) has been published, pictures before it are decoder references only.
+    // Asking OUTPUT_READY for each of them serializes fast pre-roll on SSH round trips.
+    // An unactivated surface still needs the original readiness path to publish its first PLAY.
+    if seek_target_primed && is_seek_pre_roll(play_start_override, pts_us) {
+        VideoDeliveryKind::CatchUp
+    } else if !started {
         VideoDeliveryKind::ObserveStart
     } else if is_seek_pre_roll(play_start_override, pts_us) {
         VideoDeliveryKind::CatchUp
@@ -2787,27 +2799,34 @@ mod tests {
             "initial playback publishes no target and has no pre-roll to discard"
         );
         assert_eq!(
-            video_delivery_kind(Some(target), false, target - 1),
+            video_delivery_kind(Some(target), false, target - 1, false),
             VideoDeliveryKind::ObserveStart,
             "the replacement keyframe must be able to publish PLAY before bounded pre-roll fills"
         );
         assert_eq!(
-            video_delivery_kind(Some(target), true, target - 1),
+            video_delivery_kind(Some(target), true, target - 1, false),
             VideoDeliveryKind::CatchUp,
             "a relay's early readiness must not pace the rest of pre-roll"
         );
         assert_eq!(
-            video_delivery_kind(Some(target), false, target),
+            video_delivery_kind(Some(target), false, target, true),
             VideoDeliveryKind::ObserveStart
         );
         assert_eq!(
-            video_delivery_kind(None, false, 0),
+            video_delivery_kind(None, false, 0, false),
             VideoDeliveryKind::ObserveStart
         );
         assert_eq!(
-            video_delivery_kind(Some(target), true, target + 40_000),
+            video_delivery_kind(Some(target), true, target + 40_000, true),
             VideoDeliveryKind::Timeline
         );
+        for pts in (target - 5_000_000..target).step_by(40_000) {
+            assert_eq!(
+                video_delivery_kind(Some(target), false, pts, true),
+                VideoDeliveryKind::CatchUp,
+                "primed seek references must not issue per-packet readiness queries"
+            );
+        }
     }
 
     /// Pausing, then seeking, then holding the pause.
