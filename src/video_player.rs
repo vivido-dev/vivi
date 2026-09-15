@@ -236,6 +236,25 @@ impl<'a> PresenterAudioControl<'a> {
 struct DrainedPresenterAudio {
     track: Track,
     packet_ids: Arc<AtomicU64>,
+    // EOS is a queued media record, not a receipt from the presenter. Keep the reverse reader
+    // and socket alive until playback drains (or this generation is retired by a seek).
+    // Dropping it here can reset an SSH-forwarded connection before the final packets arrive.
+    _channel: Arc<TrackChannel>,
+}
+
+impl DrainedPresenterAudio {
+    fn finish(
+        track: Track,
+        packet_ids: Arc<AtomicU64>,
+        channel: Arc<TrackChannel>,
+    ) -> io::Result<Self> {
+        channel.eos()?;
+        Ok(Self {
+            track,
+            packet_ids,
+            _channel: channel,
+        })
+    }
 }
 
 /// A linked audio generation that has been advanced and fully quiesced, but is deliberately not
@@ -1207,11 +1226,11 @@ pub fn play(
         if let Some(audio) = presenter_audio.take() {
             match audio.worker.join() {
                 Ok(outcome) if outcome.error.is_none() => {
-                    outcome.channel.eos()?;
-                    audio_to_drain = Some(DrainedPresenterAudio {
-                        track: audio.track,
-                        packet_ids: audio.packet_ids,
-                    });
+                    audio_to_drain = Some(DrainedPresenterAudio::finish(
+                        audio.track,
+                        audio.packet_ids,
+                        outcome.channel,
+                    )?);
                     client.verbose(format_args!(
                         "audio track completed after {} packets",
                         outcome.packet_id
@@ -2971,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn pause_resume_keeps_audio_generation_and_retires_paused_seek() {
+    fn pause_resume_and_completion_keep_the_audio_channel_alive() {
         use vivid_protocol::messages;
         use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
 
@@ -3109,7 +3128,16 @@ mod tests {
             Some(origin_us.saturating_add(i64::try_from(held_us).unwrap()))
         );
         assert_eq!(audio.channel_generation(), generation_before);
-        drop(channel);
+        let channel = Arc::new(channel);
+        let channel_lifetime = Arc::downgrade(&channel);
+        let draining =
+            DrainedPresenterAudio::finish(audio, Arc::new(AtomicU64::new(0)), channel).unwrap();
+        assert!(
+            channel_lifetime.upgrade().is_some(),
+            "sending EOS must not close the channel before playback drains"
+        );
+        drop(draining);
+        assert!(channel_lifetime.upgrade().is_none());
     }
 
     #[test]
