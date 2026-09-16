@@ -317,10 +317,28 @@ impl AudioPause {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VideoRecovery {
     minimum_epoch: u32,
     advance_epoch: bool,
+}
+
+#[derive(Debug)]
+enum VideoSendFailure {
+    Recover(VideoRecovery),
+    Fatal(io::Error),
+}
+
+/// Prefer a presenter recovery instruction over the local error it deliberately caused.
+///
+/// `NEED_KEYFRAME` makes the SDK reject further interframes. The reverse-channel event and the
+/// writer result arrive on different threads, so the error may win the race into this loop even
+/// though recovery is already queued.
+fn classify_video_send_failure(
+    error: io::Error,
+    recovery: Option<VideoRecovery>,
+) -> VideoSendFailure {
+    recovery.map_or(VideoSendFailure::Fatal(error), VideoSendFailure::Recover)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,6 +942,39 @@ pub fn play(
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue 'playback;
                 }
+                // A reverse-channel NEED_KEYFRAME can arrive after the pre-send event poll and
+                // before the background writer validates this packet. The SDK then correctly
+                // rejects an interframe because the generation needs recovery. Consume that
+                // instruction before classifying the InvalidInput error: it is a recoverable
+                // decoder transition, not malformed media.
+                let error = match classify_video_send_failure(
+                    error,
+                    take_video_recovery(&video_channel)?,
+                ) {
+                    VideoSendFailure::Recover(recovery) => {
+                        let recovery_plan = streaming_recovery_plan(
+                            packet.pts_us,
+                            started,
+                            paused_seek.is_some()
+                                || seek_target_outstanding(play_start_override, last_pts),
+                        );
+                        apply_video_recovery(
+                            client,
+                            &video_track,
+                            &mut video_channel,
+                            recovery,
+                            &mut epoch,
+                            started,
+                        )?;
+                        demuxer.seek_to_us(recovery_plan.resume_pts_us)?;
+                        awaiting_keyframe = true;
+                        recovery_rebase_pending = recovery_plan.rebase_playback;
+                        recovery_start_pts_us = Some(recovery_plan.resume_pts_us);
+                        consecutive_send_failures = 0;
+                        continue 'playback;
+                    }
+                    VideoSendFailure::Fatal(error) => error,
+                };
                 consecutive_send_failures += 1;
                 if consecutive_send_failures > 3 {
                     return Err(io::Error::other(format!(
@@ -2906,6 +2957,35 @@ mod tests {
             streaming_recovery_plan(43_320_000, true, false).rebase_playback,
             "ordinary streaming recovery stopped rebasing its clock"
         );
+    }
+
+    #[test]
+    fn a_queued_keyframe_request_outranks_its_interframe_validation_error() {
+        let recovery = VideoRecovery {
+            minimum_epoch: 7,
+            advance_epoch: true,
+        };
+        let error = io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "channel generation must begin with a recovery unit",
+        );
+
+        match classify_video_send_failure(error, Some(recovery)) {
+            VideoSendFailure::Recover(actual) => assert_eq!(actual, recovery),
+            VideoSendFailure::Fatal(error) => {
+                panic!("queued recovery was misclassified as fatal: {error}")
+            }
+        }
+
+        let error = io::Error::new(io::ErrorKind::InvalidInput, "malformed video packet");
+        match classify_video_send_failure(error, None) {
+            VideoSendFailure::Fatal(error) => {
+                assert_eq!(error.to_string(), "malformed video packet")
+            }
+            VideoSendFailure::Recover(recovery) => {
+                panic!("unrequested recovery was invented: {recovery:?}")
+            }
+        }
     }
 
     #[test]
