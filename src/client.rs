@@ -70,6 +70,35 @@ impl VividClient {
     }
 }
 
+pub fn play(
+    client: &mut Session,
+    track: &vivid_sdk::Track,
+    start_pts_us: i64,
+    minimum_buffer_us: u64,
+    maximum_latency_us: u64,
+) -> io::Result<()> {
+    client.play_with(
+        track,
+        vivid_sdk::PlayOptions {
+            start_pts_us,
+            minimum_buffer_us,
+            maximum_latency_us,
+            start_policy: vivid_sdk::StartPolicy::Synchronized,
+            hold_serial: track.playback_hold().map(|hold| hold.serial),
+        },
+    )
+}
+
+pub fn require_timed_sync(client: &Session) -> io::Result<()> {
+    if client.supports(vivid_protocol::registry::TIMED_MEDIA_SYNC) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "timed playback requires timed-media-sync-v1 on every terminating presenter",
+    ))
+}
+
 impl Deref for VividClient {
     type Target = Session;
 
@@ -191,7 +220,10 @@ pub fn producer_config(config: &Config) -> ProducerConfig {
             TIMED_MEDIA.into(),
             CORE_CONTROL.into(),
         ],
-        optional_profiles: vec![AUDIO_GAIN.into()],
+        optional_profiles: vec![
+            AUDIO_GAIN.into(),
+            vivid_protocol::registry::TIMED_MEDIA_SYNC.into(),
+        ],
         dry_run: config.dry_run,
         trace_dir: config.trace_dir.clone(),
         ..ProducerConfig::default()

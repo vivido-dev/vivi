@@ -353,6 +353,9 @@ pub struct VideoDemuxer {
 }
 
 impl VideoDemuxer {
+    pub fn set_cancel(&mut self, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self._input.interrupt.stop = Some(stop);
+    }
     pub fn open(path: &Path) -> io::Result<Self> {
         let path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
             io::Error::new(
@@ -1084,10 +1087,12 @@ impl AudioDecoder {
         let mut samples = vec![0.0_f32; sample_count];
         let mut output = [ptr::null_mut(); 8];
         output[0] = samples.as_mut_ptr().cast();
+        // Older libswresample headers use `const uint8_t **`, while newer headers
+        // additionally const-qualify the pointer array. Neither mutates the input.
         let input = if frame.extended_data.is_null() {
-            frame.data.as_ptr() as *const *const u8
+            frame.data.as_ptr() as *mut *const u8
         } else {
-            frame.extended_data as *const *const u8
+            frame.extended_data as *mut *const u8
         };
         let converted = unsafe {
             swr_convert(
@@ -1170,7 +1175,7 @@ impl AudioDecoder {
                 self.resampler,
                 output.as_mut_ptr(),
                 maximum_samples,
-                ptr::null(),
+                ptr::null_mut(),
                 0,
             )
         };

@@ -3,11 +3,12 @@ use crate::ffmpeg::{EncodedAudioPacket, EncodedPacket};
 use std::io;
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 use vivid_protocol::media::{AudioPacket, VideoPacket};
 use vivid_sdk::TrackChannel;
 
-const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 enum Payload {
     Video(EncodedPacket),
     Audio(EncodedAudioPacket),
@@ -124,19 +125,17 @@ impl MediaSender {
             .try_send(job)
             .map_err(|_| io::Error::other("media writer unavailable"))
     }
-    /// The callback services control while a write waits for flow or transport. True suspends the
-    /// media deadline during an intentional pause. An error cancels and consumes this receipt.
+    /// The callback services control while a write waits for flow or transport. Withheld credit
+    /// is not a deadline: the SDK monitors control liveness. An error cancels this receipt.
     /// A seek callback must retire the channel generation before returning its interruption, so
     /// a presenter cannot interpret the cancelled write as loss of the live track.
     pub fn wait(
         &mut self,
         mut control: impl FnMut() -> io::Result<bool>,
     ) -> io::Result<io::Result<u64>> {
-        let mut deadline = Instant::now() + SEND_TIMEOUT;
         loop {
             match control() {
-                Ok(true) => deadline = Instant::now() + SEND_TIMEOUT,
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => {
                     self.cancel_pending();
                     return Err(error);
@@ -151,13 +150,6 @@ impl MediaSender {
                     return Err(io::Error::other("media writer stopped"));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            if Instant::now() >= deadline {
-                self.cancel_pending();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "media write stalled for 30 seconds; retry playback or check the presenter",
-                ));
             }
         }
     }

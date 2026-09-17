@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use vivid_protocol::media::AudioPacket;
@@ -39,6 +39,7 @@ pub fn play(
     client: &mut VividClient,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    crate::client::require_timed_sync(client)?;
     let info = AudioDemuxer::inspect(path)?;
     let gain_available = client.supports(vivid_protocol::registry::AUDIO_GAIN);
     let ui = PlaybackUi::enter(
@@ -262,6 +263,8 @@ fn stream_with_controls(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let origin_us = info.first_pts_us.unwrap_or(0);
     let mut timeline = PlaybackTimeline::new(0);
+    let mut hold_serial = 0;
+    let mut next_clock_poll = Instant::now();
     let mut epoch = 1_u32;
     let mut packet_id = 0_u64;
     let mut volume_percent = 100_u32;
@@ -301,6 +304,8 @@ fn stream_with_controls(
                     config.zoom,
                     &mut volume_percent,
                     &mut timeline,
+                    &mut hold_serial,
+                    &mut next_clock_poll,
                     origin_us,
                     started,
                     info.duration_us,
@@ -335,7 +340,20 @@ fn stream_with_controls(
             let packet_duration_us = packet.duration_us;
             media_sender.audio(channel.clone(), epoch, packet_id, packet)?;
             let mut transition = None;
+            let send_started = Instant::now();
+            let mut waiting_shown = false;
             let result = media_sender.wait(|| {
+                if !waiting_shown && send_started.elapsed() >= Duration::from_secs(3) {
+                    waiting_shown = true;
+                    if let Some(ui) = ui {
+                        ui.set_message(if track.playback_hold().is_some_and(|hold| hold.held) {
+                            "Held — pane not visible"
+                        } else {
+                            "Waiting for presenter"
+                        });
+                        ui.redraw()?;
+                    }
+                }
                 let action = handle_commands(
                     client,
                     track,
@@ -344,6 +362,8 @@ fn stream_with_controls(
                     config.zoom,
                     &mut volume_percent,
                     &mut timeline,
+                    &mut hold_serial,
+                    &mut next_clock_poll,
                     origin_us,
                     started,
                     info.duration_us,
@@ -381,6 +401,7 @@ fn stream_with_controls(
                     INITIAL_BUFFER_US,
                 )?;
                 started = true;
+                timeline.hold(true, None);
                 if timeline.is_paused() {
                     client.pause(track)?;
                 } else {
@@ -410,6 +431,7 @@ fn stream_with_controls(
                 buffered_us.max(1),
             )?;
             started = true;
+            timeline.hold(true, None);
             if timeline.is_paused() {
                 client.pause(track)?;
             } else {
@@ -419,9 +441,6 @@ fn stream_with_controls(
         channel.eos()?;
         if config.no_wait {
             break;
-        }
-        if ui.is_none() {
-            client.drain(track)?;
         }
         loop {
             let current = timeline.current_us();
@@ -437,6 +456,8 @@ fn stream_with_controls(
                 config.zoom,
                 &mut volume_percent,
                 &mut timeline,
+                &mut hold_serial,
+                &mut next_clock_poll,
                 origin_us,
                 started,
                 info.duration_us,
@@ -461,12 +482,17 @@ fn stream_with_controls(
                 UI_POLL_TIMEOUT_US,
             ) {
                 Ok(_) => {
-                    if ui.is_some() {
-                        client.drain(track)?;
-                    }
+                    client.drain(track)?;
                     break 'generation;
                 }
-                Err(error) if presenter_code(&error) == Some(ERROR_TIMEOUT) => {}
+                Err(error)
+                    if matches!(
+                        presenter_code(&error),
+                        Some(ERROR_TIMEOUT | vivid_protocol::messages::ERROR_NOT_VISIBLE)
+                    ) =>
+                {
+                    thread::sleep(Duration::from_micros(UI_POLL_TIMEOUT_US));
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -493,11 +519,56 @@ fn handle_commands(
     zoom: f32,
     volume_percent: &mut u32,
     timeline: &mut PlaybackTimeline,
+    hold_serial: &mut u64,
+    next_clock_poll: &mut Instant,
     origin_us: i64,
     started: bool,
     duration_us: Option<u64>,
 ) -> io::Result<Option<ControlAction>> {
-    let Some(ui) = ui else { return Ok(None) };
+    let mut resume = None;
+    if let Some(hold) = track.playback_hold()
+        && hold.serial > *hold_serial
+    {
+        *hold_serial = hold.serial;
+        let position = hold
+            .position
+            .map(|p| p.pts_us.saturating_sub(origin_us).max(0) as u64);
+        timeline.hold(hold.held || hold.recovery_required, position);
+        if let Some(ui) = ui {
+            ui.set_message(if hold.held {
+                "Held — pane not visible"
+            } else {
+                "Buffering"
+            });
+        }
+        if !hold.held && hold.recovery_required {
+            resume = Some(ControlAction::Seek(
+                position.unwrap_or_else(|| timeline.current_us()),
+            ));
+        }
+    }
+    if started
+        && resume.is_none()
+        && !timeline.is_paused()
+        && track.playback_hold().is_none_or(|hold| !hold.held)
+        && Instant::now() >= *next_clock_poll
+    {
+        *next_clock_poll = Instant::now() + Duration::from_millis(100);
+        let status = client.query_track(track)?;
+        if let Some(fields) = status.playback_state.as_ref()
+            && fields
+                .iter()
+                .any(|(key, value)| *key == 3 && value.as_u64() == Some(2))
+        {
+            let position = fields
+                .iter()
+                .find_map(|(key, value)| (*key == 4).then(|| value.as_i64()).flatten())
+                .map(|pts| pts.saturating_sub(origin_us).max(0) as u64);
+            timeline.hold(false, position);
+            timeline.started();
+        }
+    }
+    let Some(ui) = ui else { return Ok(resume) };
     while let Some(command) = ui.try_command() {
         match command {
             Command::TogglePause => {
@@ -506,7 +577,8 @@ fn handle_commands(
                         let resume_pts_us = origin_us.saturating_add(
                             i64::try_from(timeline.current_us()).unwrap_or(i64::MAX),
                         );
-                        client.play(track, resume_pts_us, 1, MAXIMUM_LATENCY_US)?;
+                        crate::client::play(client, track, resume_pts_us, 1, MAXIMUM_LATENCY_US)?;
+                        timeline.hold(true, None);
                         timeline.resume();
                     } else {
                         timeline.unpause_before_start();
@@ -518,10 +590,11 @@ fn handle_commands(
                         client.pause(track)?;
                     }
                     timeline.pause();
-                    if started {
-                        timeline.seek(crate::playback_ui::paused_position(
-                            client, track, origin_us,
-                        )?);
+                    if started
+                        && let Some(position) =
+                            crate::playback_ui::paused_position(client, track, origin_us)?
+                    {
+                        timeline.seek(position);
                     }
                     ui.set_paused(true);
                     ui.set_message("Paused");
@@ -568,7 +641,7 @@ fn handle_commands(
             Command::Quit => return Ok(Some(ControlAction::Quit)),
         }
     }
-    Ok(None)
+    Ok(resume)
 }
 
 /// Drains presenter events, applying target changes and failing on connection or audio-track
@@ -584,10 +657,14 @@ fn take_target_geometry(
                 client.apply_target_changed(&payload)?;
                 changed = true;
             }
-            SessionEvent::TrackLost { object_id, .. } if object_id == audio_track_id => {
+            SessionEvent::TrackLost { object_id, payload } if object_id == audio_track_id => {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "presenter reported the audio track lost",
+                    payload
+                        .iter()
+                        .find_map(|(key, value)| (*key == 6).then(|| value.as_text()).flatten())
+                        .unwrap_or("presenter reported the audio track lost")
+                        .to_owned(),
                 ));
             }
             SessionEvent::ConnectionClosed { diagnostic } => {
@@ -662,13 +739,14 @@ fn start_playback(
     } else {
         client.activate_tracks(surface, &[audio_binding()], &RequestMetadata::default())?;
     }
-    client.play(track, start_pts_us, minimum_buffer_us, MAXIMUM_LATENCY_US)?;
-    client.wait_track(
+    crate::client::play(
+        client,
         track,
-        TrackWaitCondition::PlaybackStarted,
-        None,
-        timeout_us(PLAYBACK_TIMEOUT),
+        start_pts_us,
+        minimum_buffer_us,
+        MAXIMUM_LATENCY_US,
     )?;
+    // Admission leaves the physical clock buffering; keep the writer and UI serviced.
     Ok(())
 }
 

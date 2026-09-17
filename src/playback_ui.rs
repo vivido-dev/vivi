@@ -47,6 +47,7 @@ struct Status {
 
 #[derive(Debug, Clone)]
 pub struct PlaybackTimeline {
+    held: bool,
     position_us: u64,
     started_at: Option<Instant>,
     paused: bool,
@@ -55,6 +56,7 @@ pub struct PlaybackTimeline {
 impl PlaybackTimeline {
     pub fn new(position_us: u64) -> Self {
         Self {
+            held: false,
             position_us,
             started_at: None,
             paused: false,
@@ -74,7 +76,7 @@ impl PlaybackTimeline {
     }
 
     pub fn started(&mut self) {
-        if !self.paused && self.started_at.is_none() {
+        if !self.paused && !self.held && self.started_at.is_none() {
             self.started_at = Some(Instant::now());
         }
     }
@@ -88,7 +90,7 @@ impl PlaybackTimeline {
 
     pub fn resume(&mut self) -> u64 {
         self.paused = false;
-        self.started_at = Some(Instant::now());
+        self.started_at = (!self.held).then(Instant::now);
         self.position_us
     }
 
@@ -99,6 +101,18 @@ impl PlaybackTimeline {
     pub fn seek(&mut self, position_us: u64) {
         self.position_us = position_us;
         self.started_at = None;
+    }
+
+    pub fn hold(&mut self, held: bool, position_us: Option<u64>) {
+        if held && !self.held {
+            self.position_us = self.current_us();
+            self.started_at = None;
+        }
+        self.held = held;
+        if let Some(position) = position_us {
+            self.position_us = position;
+            self.started_at = None;
+        }
     }
 }
 
@@ -580,14 +594,22 @@ fn truncate(value: &str, columns: u16) -> String {
         .collect()
 }
 
-/// Freeze the UI estimate at the current generation's observed presenter clock.
+/// Read the current generation's frozen presenter clock. A projection transition can
+/// retire that clock while PAUSE is in flight. Leave reconciliation to the hold/recovery
+/// loop in that case; waiting here would prevent the producer from rebuilding the clock.
 pub fn paused_position(
     session: &vivid_sdk::Session,
     track: &vivid_sdk::Track,
     origin_us: i64,
-) -> io::Result<u64> {
+) -> io::Result<Option<u64>> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        if track
+            .playback_hold()
+            .is_some_and(|hold| hold.held || hold.recovery_required)
+        {
+            return Ok(None);
+        }
         let status = session.query_track(track)?;
         if status.channel_generation == track.channel_generation()
             && let Some(map) = &status.playback_state
@@ -598,7 +620,7 @@ pub fn paused_position(
                     == Some(u64::from(status.media_epoch))
                 && let Some(pts) = value(4).and_then(vivid_protocol::cbor::Value::as_i64)
             {
-                return Ok(pts.saturating_sub(origin_us).max(0) as u64);
+                return Ok(Some(pts.saturating_sub(origin_us).max(0) as u64));
             }
         }
         if Instant::now() >= deadline {
