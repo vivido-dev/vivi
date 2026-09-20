@@ -142,7 +142,7 @@ pub fn view(
         Some(image::ImageFormat::Jpeg) => Some(IMAGE_JPEG),
         _ => None,
     };
-    let (track, _channel) = if let Some(encoding) = encoded_kind {
+    let (track, channel) = if let Some(encoding) = encoded_kind {
         let configuration =
             encoded_image_track(client, &surface, encoding, width, height, &encoded)?;
         if client
@@ -170,14 +170,31 @@ pub fn view(
         create_raster_track(client, &surface, width, height, &rgba)?
     };
 
-    client.wait_track(
-        &track,
+    activate_and_finish_still_track(client, &surface, &track, channel.as_ref(), !config.no_wait)?;
+    client.verbose(format_args!(
+        "image surface {surface_id}: {} is {width}x{height}, presented at {}x{} cells",
+        path.display(),
+        display.columns,
+        display.rows
+    ));
+    Ok(())
+}
+
+fn activate_and_finish_still_track(
+    session: &mut vivid_sdk::Session,
+    surface: &vivid_sdk::Surface,
+    track: &Track,
+    channel: Option<&TrackChannel>,
+    wait_for_presentation: bool,
+) -> io::Result<()> {
+    session.wait_track(
+        track,
         TrackWaitCondition::MilestoneSet,
         Some(MILESTONE_OUTPUT_READY),
         timeout_us(PRESENTATION_TIMEOUT),
     )?;
-    client.activate_tracks(
-        &surface,
+    session.activate_tracks(
+        surface,
         &[SlotBinding {
             slot: track.configuration()?.slot,
             track_id: track.id(),
@@ -186,20 +203,19 @@ pub fn view(
         }],
         &RequestMetadata::default(),
     )?;
-    if !config.no_wait {
-        client.wait_track(
-            &track,
+    if let Some(channel) = channel {
+        // Retained stills finish with protocol EOS. Dropping this live channel as bare socket EOF
+        // marks the track lost at a terminating gateway, so its next projection goes blank.
+        channel.eos()?;
+    }
+    if wait_for_presentation {
+        session.wait_track(
+            track,
             TrackWaitCondition::MilestoneSet,
             Some(MILESTONE_PRESENTED),
             timeout_us(PRESENTATION_TIMEOUT),
         )?;
     }
-    client.verbose(format_args!(
-        "image surface {surface_id}: {} is {width}x{height}, presented at {}x{} cells",
-        path.display(),
-        display.columns,
-        display.rows
-    ));
     Ok(())
 }
 
@@ -570,9 +586,12 @@ fn display_size(width: u32, height: u32, zoom: f32, geometry: TerminalGeometry) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::io::Cursor;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+    use vivid_sdk::presenter::{MediaConfig, PresenterListener, SocketListener, VirtualVivid};
     use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
 
     #[test]
@@ -660,32 +679,98 @@ mod tests {
 
         let (track, channel) =
             create_encoded_image_track(&mut session, configuration, &encoded).unwrap();
-        session
-            .wait_track(
-                &track,
-                TrackWaitCondition::MilestoneSet,
-                Some(MILESTONE_OUTPUT_READY),
-                timeout_us(PRESENTATION_TIMEOUT),
+        activate_and_finish_still_track(&mut session, &surface, &track, channel.as_ref(), true)
+            .unwrap();
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn clean_close_retains_encoded_image_through_nested_presenter() {
+        let listener = SocketListener::bind("tcp:127.0.0.1:0").unwrap();
+        let endpoint = listener.endpoint();
+        let presenter = VirtualVivid::start_eventless(listener, MediaConfig::default()).unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut producer = test_producer_endpoint(endpoint, &secret);
+        producer.producer_name = "vivi-image-retention-test".into();
+        let mut session = vivid_sdk::Session::connect(producer).unwrap();
+        let session_id = session.info().session_id;
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                image_surface(context_id, 41, Path::new("image.png"), 1, 1),
+                &RequestMetadata::default(),
             )
             .unwrap();
+        let marker = session.anchor_marker(context_id, 43).unwrap();
+        presenter.observe_marker(7, &marker[2..marker.len() - 2], 2, 3, false);
         session
-            .activate_tracks(
-                &surface,
-                &[SlotBinding {
-                    slot: track.configuration().unwrap().slot,
-                    track_id: track.id(),
-                    expected_channel_generation: track.channel_generation(),
-                    required_milestone: MILESTONE_OUTPUT_READY,
-                }],
+            .create_node(
+                &vivid_sdk::SceneNode {
+                    owning_context_id: context_id,
+                    node_id: 42,
+                    surface_context_id: surface.context_id(),
+                    surface_id: surface.id(),
+                    geometry: vec![
+                        (0, vivid_protocol::cbor::Value::Unsigned(2)),
+                        (1, vivid_protocol::cbor::Value::Unsigned(0)),
+                        (2, vivid_protocol::cbor::Value::Unsigned(0)),
+                        (3, vivid_protocol::cbor::Value::Unsigned(1_u64 << 32)),
+                        (4, vivid_protocol::cbor::Value::Unsigned(1_u64 << 32)),
+                        (5, vivid_protocol::cbor::Value::Unsigned(1)),
+                        (6, vivid_protocol::cbor::Value::Unsigned(context_id)),
+                        (7, vivid_protocol::cbor::Value::Unsigned(43)),
+                    ],
+                    fit: vivid_sdk::Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 0,
+                    visible: true,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
                 &RequestMetadata::default(),
             )
             .unwrap();
 
-        channel
-            .expect("an uncached encoded image retains its track channel")
-            .eos()
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        let configuration =
+            encoded_image_track(&session, &surface, IMAGE_PNG, 1, 1, &encoded).unwrap();
+        let (track, channel) =
+            create_encoded_image_track(&mut session, configuration, &encoded).unwrap();
+        // A real vvmux actor publishes the newly created source before awaiting decoder output.
+        presenter.projection_snapshot(&HashSet::from([7]));
+        activate_and_finish_still_track(&mut session, &surface, &track, channel.as_ref(), true)
             .unwrap();
         session.close().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+            if snapshot.sources.len() == 1 && snapshot.nodes.len() == 1 {
+                assert_eq!(snapshot.sources[0].key.producer, session_id);
+                assert!(snapshot.sources[0].retained.is_some());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "clean image completion disappeared from the nested projection"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn test_producer_endpoint(endpoint: String, secret: &str) -> vivid_sdk::ProducerConfig {
+        vivid_sdk::ProducerConfig {
+            endpoint_control: Some(endpoint.clone()),
+            endpoint_realtime: Some(endpoint.clone()),
+            endpoint_bulk: Some(endpoint),
+            authentication: vivid_sdk::ProducerAuthentication::root_hex(secret).unwrap(),
+            ..Default::default()
+        }
     }
 
     #[test]
