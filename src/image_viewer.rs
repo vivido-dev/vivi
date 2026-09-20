@@ -133,9 +133,6 @@ pub fn view(
         &RequestMetadata::default(),
     )?;
     place_surface(client, &surface, node_id, display.columns, display.rows)?;
-    if !config.is_dry_run() {
-        reserve_rows(display.rows)?;
-    }
 
     let encoded_kind = match format {
         Some(image::ImageFormat::Png) => Some(IMAGE_PNG),
@@ -170,7 +167,19 @@ pub fn view(
         create_raster_track(client, &surface, width, height, &rgba)?
     };
 
-    activate_and_finish_still_track(client, &surface, &track, channel.as_ref(), !config.no_wait)?;
+    activate_and_finish_still_track(
+        client,
+        &surface,
+        &track,
+        channel.as_ref(),
+        !config.no_wait,
+        || {
+            if !config.is_dry_run() {
+                reserve_rows(display.rows)?;
+            }
+            Ok(())
+        },
+    )?;
     client.verbose(format_args!(
         "image surface {surface_id}: {} is {width}x{height}, presented at {}x{} cells",
         path.display(),
@@ -186,6 +195,7 @@ fn activate_and_finish_still_track(
     track: &Track,
     channel: Option<&TrackChannel>,
     wait_for_presentation: bool,
+    after_presentation: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     session.wait_track(
         track,
@@ -216,7 +226,9 @@ fn activate_and_finish_still_track(
             timeout_us(PRESENTATION_TIMEOUT),
         )?;
     }
-    Ok(())
+    // Terminal bytes and Vivid media can use independent transports (notably under vvssh). Do
+    // not clear the rows first and expose a blank rectangle while the image is still in flight.
+    after_presentation()
 }
 
 fn create_encoded_image_track(
@@ -592,7 +604,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
     use vivid_sdk::presenter::{MediaConfig, PresenterListener, SocketListener, VirtualVivid};
-    use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
+    use vivid_sdk::testing::{ROOT_SECRET_HEX, Script, TargetKind, TestPresenter};
 
     #[test]
     fn input_and_asset_budgets_reject_before_unbounded_growth() {
@@ -659,8 +671,20 @@ mod tests {
     }
 
     #[test]
-    fn encoded_image_channel_survives_readiness_and_activation() {
-        let presenter = TestPresenter::start(80, 24).unwrap();
+    fn encoded_image_channel_survives_activation_before_rows_are_reserved() {
+        let script = Script::new();
+        script.delay(
+            vivid_protocol::messages::WAIT_SATISFIED,
+            Duration::from_millis(50),
+        );
+        let presenter = TestPresenter::start_with(
+            TargetKind::Terminal {
+                columns: 80,
+                rows: 24,
+            },
+            script,
+        )
+        .unwrap();
         let mut session = vivid_sdk::Session::connect(test_producer(&presenter)).unwrap();
         let context_id = session.info().root_context_id;
         let surface = session
@@ -679,8 +703,24 @@ mod tests {
 
         let (track, channel) =
             create_encoded_image_track(&mut session, configuration, &encoded).unwrap();
-        activate_and_finish_still_track(&mut session, &surface, &track, channel.as_ref(), true)
-            .unwrap();
+        let started = Instant::now();
+        let mut rows_reserved_after = None;
+        activate_and_finish_still_track(
+            &mut session,
+            &surface,
+            &track,
+            channel.as_ref(),
+            true,
+            || {
+                rows_reserved_after = Some(started.elapsed());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            rows_reserved_after.unwrap() >= Duration::from_millis(80),
+            "row reservation ran before the delayed presentation acknowledgement"
+        );
         session.close().unwrap();
     }
 
@@ -743,8 +783,15 @@ mod tests {
             create_encoded_image_track(&mut session, configuration, &encoded).unwrap();
         // A real vvmux actor publishes the newly created source before awaiting decoder output.
         presenter.projection_snapshot(&HashSet::from([7]));
-        activate_and_finish_still_track(&mut session, &surface, &track, channel.as_ref(), true)
-            .unwrap();
+        activate_and_finish_still_track(
+            &mut session,
+            &surface,
+            &track,
+            channel.as_ref(),
+            true,
+            || Ok(()),
+        )
+        .unwrap();
         session.close().unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
