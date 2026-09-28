@@ -22,7 +22,7 @@ use crate::terminal_geometry::{
     TerminalGeometry, place_full_window_surface, place_surface, reserve_rows,
     resize_placed_surface, update_full_window_surface,
 };
-use crate::video_player::{centered_origin, display_size, media_geometry};
+use crate::video_player::{centered_origin, display_size, effective_audio_gain, media_geometry};
 
 const INITIAL_BUFFER_US: u64 = 100_000;
 const MAXIMUM_LATENCY_US: u64 = 2_000_000;
@@ -268,6 +268,7 @@ fn stream_with_controls(
     let mut epoch = 1_u32;
     let mut packet_id = 0_u64;
     let mut volume_percent = 100_u32;
+    let mut muted = false;
     let mut generation = 0_u64;
 
     let mut media_sender = crate::media_sender::MediaSender::new()?;
@@ -303,6 +304,7 @@ fn stream_with_controls(
                     pane,
                     config.zoom,
                     &mut volume_percent,
+                    &mut muted,
                     &mut timeline,
                     &mut hold_serial,
                     &mut next_clock_poll,
@@ -361,6 +363,7 @@ fn stream_with_controls(
                     pane,
                     config.zoom,
                     &mut volume_percent,
+                    &mut muted,
                     &mut timeline,
                     &mut hold_serial,
                     &mut next_clock_poll,
@@ -455,6 +458,7 @@ fn stream_with_controls(
                 pane,
                 config.zoom,
                 &mut volume_percent,
+                &mut muted,
                 &mut timeline,
                 &mut hold_serial,
                 &mut next_clock_poll,
@@ -518,6 +522,7 @@ fn handle_commands(
     pane: &mut BlankPane,
     zoom: f32,
     volume_percent: &mut u32,
+    muted: &mut bool,
     timeline: &mut PlaybackTimeline,
     hold_serial: &mut u64,
     next_clock_poll: &mut Instant,
@@ -621,16 +626,24 @@ fn handle_commands(
             Command::VolumeBy(delta) => {
                 let next = (*volume_percent as i32 + delta).clamp(0, 200) as u32;
                 if client.supports(vivid_protocol::registry::AUDIO_GAIN) {
-                    let gain = vivid_sdk::AudioGain::from_percent(next).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "invalid volume")
-                    })?;
-                    client.set_audio_gain(track, gain)?;
+                    client.set_audio_gain(track, effective_audio_gain(next, *muted))?;
                     *volume_percent = next;
                     ui.set_volume_percent(Some(next));
                     ui.set_message(format!("Volume {next}%"));
                 } else {
                     ui.set_volume_percent(None);
                     ui.set_message("Volume unavailable on this presenter");
+                }
+                ui.redraw()?;
+            }
+            Command::ToggleMute => {
+                if client.supports(vivid_protocol::registry::AUDIO_GAIN) {
+                    *muted = !*muted;
+                    client.set_audio_gain(track, effective_audio_gain(*volume_percent, *muted))?;
+                    ui.set_muted(*muted);
+                    ui.set_message(if *muted { "Muted" } else { "Unmuted" });
+                } else {
+                    ui.set_message("Mute unavailable on this presenter");
                 }
                 ui.redraw()?;
             }

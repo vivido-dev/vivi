@@ -491,6 +491,7 @@ pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
         let mut timeline = PlaybackTimeline::new(0);
         timeline.started();
         let mut volume_percent = 100_u32;
+        let mut muted = false;
         while !playback.is_finished() {
             if let Some(ui) = ui.as_ref() {
                 ui.set_position_us(
@@ -516,9 +517,15 @@ pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
                         }
                         Command::VolumeBy(delta) => {
                             volume_percent = (volume_percent as i32 + delta).clamp(0, 200) as u32;
-                            playback.set_volume_percent(volume_percent);
+                            playback.set_volume_percent(if muted { 0 } else { volume_percent });
                             ui.set_volume_percent(Some(volume_percent));
                             ui.set_message(format!("Volume {volume_percent}%"));
+                        }
+                        Command::ToggleMute => {
+                            muted = !muted;
+                            playback.set_volume_percent(if muted { 0 } else { volume_percent });
+                            ui.set_muted(muted);
+                            ui.set_message(if muted { "Muted" } else { "Unmuted" });
                         }
                         Command::SeekBy(_) | Command::SeekTo(_) => {
                             ui.set_message("Seek requires presenter audio");

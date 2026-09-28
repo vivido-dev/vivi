@@ -557,6 +557,7 @@ pub fn play(
     let remote = !crate::client::local_audio_allowed();
     let audio_recovery = Arc::new(AudioRecoveryTarget::default());
     let mut volume_percent = 100_u32;
+    let mut muted = false;
     let mut presenter_audio = create_presenter_audio(
         client,
         &surface,
@@ -790,14 +791,13 @@ pub fn play(
                                 {
                                     client.set_audio_gain(
                                         &audio.track,
-                                        vivid_sdk::AudioGain::from_percent(next)
-                                            .expect("clamped volume is valid"),
+                                        effective_audio_gain(next, muted),
                                     )?;
                                     volume_percent = next;
                                     ui.set_volume_percent(Some(next));
                                     ui.set_message(format!("Volume {next}%"));
                                 } else if let Some(audio) = local_audio.as_ref() {
-                                    audio.set_volume_percent(next);
+                                    audio.set_volume_percent(if muted { 0 } else { next });
                                     volume_percent = next;
                                     ui.set_volume_percent(Some(next));
                                     ui.set_message(format!("Volume {next}%"));
@@ -806,6 +806,16 @@ pub fn play(
                                     ui.set_message("Volume unavailable");
                                 }
                                 ui.redraw()?;
+                            }
+                            Command::ToggleMute => {
+                                toggle_mute(
+                                    client,
+                                    presenter_audio.as_ref().map(|audio| &audio.track),
+                                    local_audio.as_ref(),
+                                    volume_percent,
+                                    &mut muted,
+                                    ui,
+                                )?;
                             }
                             Command::SeekBy(delta) => {
                                 accumulate_seek_by(&mut seek_target, current_us, delta);
@@ -1104,14 +1114,13 @@ pub fn play(
                                 {
                                     client.set_audio_gain(
                                         &audio.track,
-                                        vivid_sdk::AudioGain::from_percent(next)
-                                            .expect("clamped volume is valid"),
+                                        effective_audio_gain(next, muted),
                                     )?;
                                     volume_percent = next;
                                     ui.set_volume_percent(Some(next));
                                     ui.set_message(format!("Volume {next}%"));
                                 } else if let Some(audio) = local_audio.as_ref() {
-                                    audio.set_volume_percent(next);
+                                    audio.set_volume_percent(if muted { 0 } else { next });
                                     volume_percent = next;
                                     ui.set_volume_percent(Some(next));
                                     ui.set_message(format!("Volume {next}%"));
@@ -1120,6 +1129,16 @@ pub fn play(
                                     ui.set_message("Volume unavailable");
                                 }
                                 ui.redraw()?;
+                            }
+                            Command::ToggleMute => {
+                                toggle_mute(
+                                    client,
+                                    presenter_audio.as_ref().map(|audio| &audio.track),
+                                    local_audio.as_ref(),
+                                    volume_percent,
+                                    &mut muted,
+                                    ui,
+                                )?;
                             }
                         }
                     }
@@ -1466,8 +1485,7 @@ pub fn play(
                             if client.supports(vivid_protocol::registry::AUDIO_GAIN) {
                                 client.set_audio_gain(
                                     &audio_track,
-                                    vivid_sdk::AudioGain::from_percent(next)
-                                        .expect("clamped volume is valid"),
+                                    effective_audio_gain(next, muted),
                                 )?;
                                 volume_percent = next;
                                 ui.set_volume_percent(Some(next));
@@ -1477,6 +1495,16 @@ pub fn play(
                                 ui.set_message("Volume unavailable");
                             }
                             ui.redraw()?;
+                        }
+                        Command::ToggleMute => {
+                            toggle_mute(
+                                client,
+                                Some(&audio_track),
+                                None,
+                                volume_percent,
+                                &mut muted,
+                                ui,
+                            )?;
                         }
                     }
                 }
@@ -1627,6 +1655,7 @@ pub fn play(
             audio_to_drain.as_ref().map(|audio| &audio.track),
             ui.as_ref(),
             &mut volume_percent,
+            &mut muted,
             &mut timeline,
             &mut local_audio,
             timeline_origin_us,
@@ -1725,6 +1754,7 @@ fn wait_for_playback_end(
     audio: Option<&Track>,
     ui: Option<&PlaybackUi>,
     volume_percent: &mut u32,
+    muted: &mut bool,
     timeline: &mut PlaybackTimeline,
     local_audio: &mut Option<audio_player::AudioPlayback>,
     timeline_origin_us: i64,
@@ -1830,11 +1860,7 @@ fn wait_for_playback_end(
                         if let Some(audio) = audio
                             && client.supports(vivid_protocol::registry::AUDIO_GAIN)
                         {
-                            client.set_audio_gain(
-                                audio,
-                                vivid_sdk::AudioGain::from_percent(next)
-                                    .expect("clamped volume is valid"),
-                            )?;
+                            client.set_audio_gain(audio, effective_audio_gain(next, *muted))?;
                             *volume_percent = next;
                             ui.set_volume_percent(Some(next));
                             ui.set_message(format!("Volume {next}%"));
@@ -1842,6 +1868,16 @@ fn wait_for_playback_end(
                             ui.set_volume_percent(None);
                             ui.set_message("Volume unavailable");
                         }
+                    }
+                    Command::ToggleMute => {
+                        toggle_mute(
+                            client,
+                            audio,
+                            local_audio.as_ref(),
+                            *volume_percent,
+                            muted,
+                            ui,
+                        )?;
                     }
                     Command::SeekBy(delta) => {
                         accumulate_seek_by(&mut seek_target, current, delta);
@@ -2718,6 +2754,45 @@ fn pause_video_outputs(
     Ok(())
 }
 
+/// Presenter gain for the current volume/mute state. Muting silences the audio
+/// track without touching the stored volume, so unmuting restores the exact level.
+pub(crate) fn effective_audio_gain(volume_percent: u32, muted: bool) -> vivid_sdk::AudioGain {
+    if muted {
+        vivid_sdk::AudioGain::SILENT
+    } else {
+        vivid_sdk::AudioGain::from_percent(volume_percent).expect("clamped volume is valid")
+    }
+}
+
+/// Flip the mute state on whichever audio output is active. Video is untouched:
+/// only the audio gain changes, and the stored volume survives for unmute.
+fn toggle_mute(
+    client: &mut VividClient,
+    presenter_audio: Option<&Track>,
+    local_audio: Option<&audio_player::AudioPlayback>,
+    volume_percent: u32,
+    muted: &mut bool,
+    ui: &PlaybackUi,
+) -> io::Result<()> {
+    if let Some(track) = presenter_audio
+        && client.supports(vivid_protocol::registry::AUDIO_GAIN)
+    {
+        *muted = !*muted;
+        client.set_audio_gain(track, effective_audio_gain(volume_percent, *muted))?;
+        ui.set_muted(*muted);
+        ui.set_message(if *muted { "Muted" } else { "Unmuted" });
+    } else if let Some(audio) = local_audio {
+        *muted = !*muted;
+        audio.set_volume_percent(if *muted { 0 } else { volume_percent });
+        ui.set_muted(*muted);
+        ui.set_message(if *muted { "Muted" } else { "Unmuted" });
+    } else {
+        ui.set_message("Mute unavailable");
+    }
+    ui.redraw()?;
+    Ok(())
+}
+
 struct VideoPauseState<'a> {
     timeline: &'a mut PlaybackTimeline,
     paused_seek: Option<&'a mut Option<PausedSeekPreRoll>>,
@@ -3162,6 +3237,24 @@ fn timeout_us(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mute_silences_audio_gain_and_unmute_restores_the_stored_volume() {
+        assert_eq!(
+            effective_audio_gain(100, true),
+            vivid_sdk::AudioGain::SILENT
+        );
+        assert_eq!(
+            effective_audio_gain(150, true),
+            vivid_sdk::AudioGain::SILENT,
+            "mute silences regardless of the stored level"
+        );
+        assert_eq!(
+            effective_audio_gain(150, false),
+            vivid_sdk::AudioGain::from_percent(150).unwrap()
+        );
+        assert_eq!(effective_audio_gain(0, false), vivid_sdk::AudioGain::SILENT);
+    }
 
     #[test]
     fn end_seek_clamps_to_the_last_picture_in_the_original_timestamp_domain() {

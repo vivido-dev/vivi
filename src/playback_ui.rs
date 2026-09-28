@@ -22,7 +22,7 @@ use crate::terminal_geometry::TerminalGeometry;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STATUS_SHORTCUTS: &str =
-    "Space pause/resume f +10s b -10s Left -5s Right +5s Up/Down vol g goto q quit";
+    "Space pause/resume f +10s b -10s Left -5s Right +5s Up/Down vol m mute g goto q quit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -30,6 +30,7 @@ pub enum Command {
     SeekBy(i64),
     SeekTo(u64),
     VolumeBy(i32),
+    ToggleMute,
     Resize(TerminalGeometry),
     Quit,
 }
@@ -39,6 +40,7 @@ struct Status {
     current_us: u64,
     duration_us: Option<u64>,
     volume_percent: Option<u32>,
+    muted: bool,
     paused: bool,
     message: String,
     audio_unavailable: bool,
@@ -209,6 +211,7 @@ impl PlaybackUi {
             current_us: 0,
             duration_us,
             volume_percent: volume_available.then_some(100),
+            muted: false,
             paused: false,
             message: String::new(),
             audio_unavailable: false,
@@ -260,6 +263,10 @@ impl PlaybackUi {
 
     pub fn set_volume_percent(&self, volume_percent: Option<u32>) {
         self.update(|status| status.volume_percent = volume_percent);
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.update(|status| status.muted = muted);
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -459,6 +466,7 @@ fn handle_key(key: KeyEvent, state: &mut InputState) -> (Option<Command>, Option
         KeyCode::Right => (Some(Command::SeekBy(5_000_000)), None, false),
         KeyCode::Up => (Some(Command::VolumeBy(5)), None, false),
         KeyCode::Down => (Some(Command::VolumeBy(-5)), None, false),
+        KeyCode::Char('m') => (Some(Command::ToggleMute), None, false),
         KeyCode::Char('g') => {
             state.goto_buffer = Some(String::new());
             (None, Some("Enter timestamp".into()), true)
@@ -502,10 +510,14 @@ fn status_text(status: &Status) -> String {
         .duration_us
         .map(format_time)
         .unwrap_or_else(|| "--:--".into());
-    let volume = status
-        .volume_percent
-        .map(|value| format!("Vol {value}%"))
-        .unwrap_or_else(|| "Vol --".into());
+    let volume = if status.muted {
+        "Muted".into()
+    } else {
+        status
+            .volume_percent
+            .map(|value| format!("Vol {value}%"))
+            .unwrap_or_else(|| "Vol --".into())
+    };
     let middle = if let Some(input) = &status.goto_buffer {
         format!("Goto> {input}  Enter seek Esc cancel")
     } else if status.paused {
@@ -763,12 +775,47 @@ mod tests {
             current_us: 0,
             duration_us: None,
             volume_percent: Some(100),
+            muted: false,
             paused: false,
             message: String::new(),
             audio_unavailable: false,
             goto_buffer: None,
         };
         assert!(status_text(&status).contains("f +10s"));
+    }
+
+    #[test]
+    fn mute_key_toggles_outside_a_timestamp_and_is_ignored_inside_one() {
+        let mut state = InputState::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            handle_key(key(KeyCode::Char('m')), &mut state).0,
+            Some(Command::ToggleMute)
+        );
+
+        // A timestamp only accepts digits and colons; `m` must not toggle mid-entry.
+        state.goto_buffer = Some("1".into());
+        assert_eq!(handle_key(key(KeyCode::Char('m')), &mut state).0, None);
+        assert_eq!(state.goto_buffer.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn muted_status_replaces_the_volume_reading_until_unmute() {
+        let mut status = Status {
+            current_us: 0,
+            duration_us: None,
+            volume_percent: Some(100),
+            muted: true,
+            paused: false,
+            message: String::new(),
+            audio_unavailable: false,
+            goto_buffer: None,
+        };
+        assert!(status_text(&status).contains("Muted"));
+        assert!(!status_text(&status).contains("Vol 100%"));
+        status.muted = false;
+        assert!(status_text(&status).contains("Vol 100%"));
+        assert!(status_text(&status).contains("m mute"));
     }
 
     #[test]
