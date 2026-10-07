@@ -2409,7 +2409,7 @@ fn stream_audio(
 
 fn next_audio_packet_id(packet_ids: &AtomicU64) -> io::Result<u64> {
     packet_ids
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             last.checked_add(1)
         })
         .map(|last| last + 1)

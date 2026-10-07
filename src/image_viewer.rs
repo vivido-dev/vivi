@@ -61,7 +61,7 @@ struct AssetBudget {
 impl AssetBudget {
     fn charge(counter: &AtomicU64, value: u64, limit: u64) -> Option<()> {
         counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(value).filter(|next| *next <= limit)
             })
             .ok()
