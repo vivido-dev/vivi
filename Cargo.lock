@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "vvreceive"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cap-std",
  "getrandom 0.4.3",
