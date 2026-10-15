@@ -32,6 +32,8 @@ pub enum Command {
     VolumeBy(i32),
     ToggleMute,
     Resize(TerminalGeometry),
+    /// A file manager covered (`false`) or uncovered (`true`) the preview pane.
+    SetVisible(bool),
     Quit,
 }
 
@@ -45,6 +47,21 @@ struct Status {
     message: String,
     audio_unavailable: bool,
     goto_buffer: Option<String>,
+}
+
+impl Status {
+    fn new(duration_us: Option<u64>, volume_available: bool) -> Self {
+        Self {
+            current_us: 0,
+            duration_us,
+            volume_percent: volume_available.then_some(100),
+            muted: false,
+            paused: false,
+            message: String::new(),
+            audio_unavailable: false,
+            goto_buffer: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +175,10 @@ impl CommandQueue {
                     *old = old.saturating_add(new);
                     return true;
                 }
+                (Command::SetVisible(old), Command::SetVisible(new)) => {
+                    *old = new;
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -169,13 +190,94 @@ impl CommandQueue {
     }
 }
 
+/// Commands a file manager sends a `--preview` run on stdin, one per line.
+///
+/// One reader serves the whole process: a looping video builds a new [`PlaybackUi`] per pass,
+/// and a thread blocked reading stdin could not be joined by each of them. `hide` and `show`
+/// become [`Command::SetVisible`]; other lines (page turns meant for document previewers) are
+/// ignored. End of input is a quit that every later pass sees too.
+pub struct PaneInput {
+    commands: Arc<CommandQueue>,
+    visible: Arc<AtomicBool>,
+}
+
+impl PaneInput {
+    /// Starts the stdin reader thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from spawning the thread.
+    pub fn spawn() -> io::Result<Self> {
+        let commands = Arc::new(CommandQueue::default());
+        let visible = Arc::new(AtomicBool::new(true));
+        let (queue, shown) = (commands.clone(), visible.clone());
+        thread::Builder::new()
+            .name("vivi-pane-input".into())
+            .spawn(move || {
+                pane_input_loop(io::stdin().lock(), &queue, &shown);
+                // Unblock a demuxer read so the coordinator sees the quit promptly.
+                crate::ffmpeg::cancel_native_io();
+            })?;
+        Ok(Self { commands, visible })
+    }
+
+    /// Input that never sends a command, for tests.
+    #[cfg(test)]
+    pub fn idle() -> Self {
+        Self {
+            commands: Arc::new(CommandQueue::default()),
+            visible: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Input whose stdin already closed, with the pane covered if not `visible`, for tests.
+    #[cfg(test)]
+    pub fn ended(visible: bool) -> Self {
+        let input = Self::idle();
+        input.visible.store(visible, Ordering::SeqCst);
+        input.commands.quit.store(true, Ordering::SeqCst);
+        input
+    }
+
+    /// Whether stdin closed: the file manager moved on, so the preview ends.
+    pub fn closed(&self) -> bool {
+        self.commands.quit.load(Ordering::SeqCst)
+    }
+
+    /// Whether media placed now should start visible.
+    pub fn visible(&self) -> bool {
+        self.visible.load(Ordering::SeqCst)
+    }
+
+    /// The next queued command, or [`Command::Quit`] once stdin closed.
+    pub fn try_command(&self) -> Option<Command> {
+        self.commands.pop()
+    }
+}
+
+fn pane_input_loop(input: impl io::BufRead, commands: &CommandQueue, visible: &AtomicBool) {
+    for line in input.lines() {
+        let Ok(line) = line else { break };
+        let shown = match line.trim() {
+            "hide" => false,
+            "show" => true,
+            _ => continue,
+        };
+        visible.store(shown, Ordering::SeqCst);
+        // A full queue already holds a visibility change, and this one replaces it.
+        commands.push(Command::SetVisible(shown));
+    }
+    commands.quit.store(true, Ordering::SeqCst);
+}
+
 pub struct PlaybackUi {
     commands: Arc<CommandQueue>,
     running: Arc<AtomicBool>,
     input: Option<thread::JoinHandle<()>>,
     status: Arc<Mutex<Status>>,
     title: Option<String>,
-    _terminal: TerminalSession,
+    /// `None` in a preview pane, which draws nothing in the terminal.
+    terminal: Option<TerminalSession>,
 }
 
 impl PlaybackUi {
@@ -198,7 +300,7 @@ impl PlaybackUi {
         if !Self::enabled(config) {
             return Ok(None);
         }
-        let terminal = TerminalSession::enter()?;
+        let terminal = Some(TerminalSession::enter()?);
         let title = audio_only.then(|| {
             format!(
                 "Audio — {}",
@@ -207,16 +309,7 @@ impl PlaybackUi {
                     .unwrap_or("audio")
             )
         });
-        let status = Arc::new(Mutex::new(Status {
-            current_us: 0,
-            duration_us,
-            volume_percent: volume_available.then_some(100),
-            muted: false,
-            paused: false,
-            message: String::new(),
-            audio_unavailable: false,
-            goto_buffer: None,
-        }));
+        let status = Arc::new(Mutex::new(Status::new(duration_us, volume_available)));
         draw(&status, title.as_deref())?;
 
         let running = Arc::new(AtomicBool::new(true));
@@ -240,8 +333,20 @@ impl PlaybackUi {
             input: Some(input),
             status,
             title,
-            _terminal: terminal,
+            terminal,
         }))
+    }
+
+    /// A UI for a preview pane: commands come from `input`, and nothing is drawn.
+    pub fn pane(input: &PaneInput, duration_us: Option<u64>) -> Self {
+        Self {
+            commands: input.commands.clone(),
+            running: Arc::new(AtomicBool::new(true)),
+            input: None,
+            status: Arc::new(Mutex::new(Status::new(duration_us, false))),
+            title: None,
+            terminal: None,
+        }
     }
 
     pub fn try_command(&self) -> Option<Command> {
@@ -283,6 +388,9 @@ impl PlaybackUi {
     }
 
     pub fn redraw(&self) -> io::Result<()> {
+        if self.terminal.is_none() {
+            return Ok(());
+        }
         draw(&self.status, self.title.as_deref())
     }
 
@@ -304,10 +412,11 @@ impl Drop for PlaybackUi {
     }
 }
 
-struct TerminalSession;
+/// Raw mode on the alternate screen, restored on drop.
+pub(crate) struct TerminalSession;
 
 impl TerminalSession {
-    fn enter() -> io::Result<Self> {
+    pub(crate) fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         if let Err(error) = enter_terminal(&mut io::stdout()) {
             let _ = disable_raw_mode();
@@ -648,6 +757,26 @@ pub fn paused_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_input_maps_visibility_and_quits_at_end_of_input() {
+        let queue = CommandQueue::default();
+        let visible = AtomicBool::new(true);
+        pane_input_loop(&b"next\nhide\nshow\n  hide \n"[..], &queue, &visible);
+        // Consecutive visibility changes collapse into the latest one.
+        assert_eq!(
+            queue
+                .pending
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [Command::SetVisible(false)]
+        );
+        assert!(!visible.load(Ordering::SeqCst));
+        assert_eq!(queue.pop(), Some(Command::Quit));
+    }
 
     #[test]
     fn controls_are_bounded_and_quit_bypasses_capacity() {

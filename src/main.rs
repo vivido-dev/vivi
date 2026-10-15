@@ -41,6 +41,17 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
     config.validate()?;
+    if config.preview {
+        let (file, pane) = config.preview_target()?;
+        let mut client = VividClient::connect(&config)?;
+        let result = preview(&config, &mut client, &file, pane);
+        // Closing stdin cancels native reads to end the preview promptly; that is a clean stop.
+        if result.is_err() && ffmpeg::native_io_cancelled() {
+            return Ok(());
+        }
+        result?;
+        return client.close().map_err(Into::into);
+    }
 
     let mut client = VividClient::connect(&config)?;
     for file in &config.files {
@@ -85,6 +96,58 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     client.close()?;
+    Ok(())
+}
+
+/// Shows `path` in a file manager's `pane` until stdin closes, looping videos.
+///
+/// Files that are neither video nor image by extension are tried as an image, then as video, so
+/// the error for an unreadable file names both attempts.
+fn preview(
+    config: &Config,
+    client: &mut VividClient,
+    path: &Path,
+    pane: terminal_geometry::Pane,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = playback_ui::PaneInput::spawn()?;
+    let placement = image_viewer::Placement::Pane(&input, pane);
+    match media_hint(path) {
+        MediaHint::Video => {}
+        MediaHint::Audio => {
+            return Err(std::io::Error::other(format!(
+                "{} is audio: there is no picture to preview",
+                path.display()
+            ))
+            .into());
+        }
+        MediaHint::Unknown => match image_viewer::view_in(config, client, path, placement) {
+            Ok(()) => return Ok(()),
+            Err(image_error) if input.closed() => return Err(image_error),
+            Err(image_error) => {
+                return loop_video(config, client, path, &input, pane).map_err(|video_error| {
+                    std::io::Error::other(format!(
+                        "could not read {} as an image ({image_error}) or video ({video_error})",
+                        path.display()
+                    ))
+                    .into()
+                });
+            }
+        },
+    }
+    loop_video(config, client, path, &input, pane)
+}
+
+/// Plays a video in `pane` again and again, until the file manager closes stdin.
+fn loop_video(
+    config: &Config,
+    client: &mut VividClient,
+    path: &Path,
+    input: &playback_ui::PaneInput,
+    pane: terminal_geometry::Pane,
+) -> Result<(), Box<dyn std::error::Error>> {
+    while !input.closed() {
+        video_player::play_in(config, client, path, Some((input, pane)))?;
+    }
     Ok(())
 }
 

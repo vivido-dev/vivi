@@ -40,6 +40,16 @@ impl VividClient {
         })
     }
 
+    /// A client over an already connected session, for tests.
+    #[cfg(test)]
+    pub fn from_session(session: Session) -> Self {
+        Self {
+            session,
+            verbose: false,
+            offline: false,
+        }
+    }
+
     pub fn verbose(&self, message: fmt::Arguments<'_>) {
         if self.verbose {
             eprintln!(
@@ -289,6 +299,9 @@ mod tests {
             trace_dir: None,
             verbose: false,
             no_wait: false,
+            fullscreen: false,
+            preview: false,
+            sound: false,
         };
         producer_config(&config).validate().unwrap();
     }

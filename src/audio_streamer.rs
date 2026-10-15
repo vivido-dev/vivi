@@ -651,6 +651,8 @@ fn handle_commands(
                 pane.resize(client, geometry, zoom)?;
                 ui.redraw()?;
             }
+            // Audio is never previewed in a file manager pane.
+            Command::SetVisible(_) => {}
             Command::Quit => return Ok(Some(ControlAction::Quit)),
         }
     }
@@ -1230,6 +1232,9 @@ mod tests {
             trace_dir: None,
             verbose: false,
             no_wait: false,
+            fullscreen: false,
+            preview: false,
+            sound: false,
         };
         let mut client = VividClient::connect(&config).unwrap();
         play(&config, &mut client, &path).unwrap();

@@ -2,7 +2,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use resvg::{
     tiny_skia::{Pixmap, Transform},
@@ -19,7 +19,11 @@ use vivid_sdk::{
 
 use crate::cli::Config;
 use crate::client::VividClient;
-use crate::terminal_geometry::{TerminalGeometry, cells_for_pixels, place_surface, reserve_rows};
+use crate::playback_ui::{Command, PaneInput, TerminalSession};
+use crate::terminal_geometry::{
+    Pane, TerminalGeometry, cells_for_pixels, place_full_window_surface, place_surface,
+    reserve_rows, set_node_visible, update_full_window_surface,
+};
 
 const FIT_MARGIN_COLS: u16 = 4;
 const FIT_MARGIN_ROWS: u16 = 2;
@@ -32,6 +36,21 @@ const MAX_NESTED_SVG_DEPTH: u8 = 8;
 const MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SVG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ASSET_PIXELS: u64 = 16 * 1024 * 1024;
+/// How often a pane or full-window image checks for commands and presenter events.
+///
+/// Short enough that hiding, closing, and resizing feel immediate; long enough to stay idle.
+const STILL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Where a still image goes.
+#[derive(Clone, Copy)]
+pub enum Placement<'a> {
+    /// At the cursor, scrolling with the text, at natural size or shrunk to fit.
+    Inline,
+    /// Centered on the alternate screen, scaled to fill it, until a key is pressed.
+    FullWindow,
+    /// At the top of a file manager's pane, until its stdin closes.
+    Pane(&'a PaneInput, Pane),
+}
 
 fn bounded_read(reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -106,6 +125,33 @@ pub fn view(
     client: &mut VividClient,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let full_window = config.fullscreen && crate::playback_ui::PlaybackUi::enabled(config);
+    view_in(
+        config,
+        client,
+        path,
+        if full_window {
+            Placement::FullWindow
+        } else {
+            Placement::Inline
+        },
+    )
+}
+
+/// Shows one still image with `placement`.
+///
+/// Inline images return once presented and stay in the terminal. Full-window and pane images
+/// stay until a key or the end of the pane's input, then remove themselves.
+///
+/// # Errors
+///
+/// Returns decoding, presenter, and terminal failures.
+pub fn view_in(
+    config: &Config,
+    client: &mut VividClient,
+    path: &Path,
+    placement: Placement<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let encoded = bounded_read(std::fs::File::open(path)?, MAX_ENCODED_BYTES)?;
     let format = image::guess_format(&encoded).ok();
     let svg = if format.is_none() {
@@ -119,12 +165,12 @@ pub fn view(
             .with_guessed_format()?
             .into_dimensions()?,
     };
-    let display = display_size(
-        width,
-        height,
-        config.zoom,
-        TerminalGeometry::settled_presenter(client),
-    );
+    // The alternate screen comes first: the presenter geometry is the one it shows.
+    let terminal = matches!(placement, Placement::FullWindow)
+        .then(TerminalSession::enter)
+        .transpose()?;
+    let geometry = TerminalGeometry::settled_presenter(client);
+    let display = placed_size(placement, width, height, config.zoom, geometry);
     let surface_id = client.allocate_id()?;
     let node_id = client.allocate_id()?;
     let context_id = client.info().root_context_id;
@@ -132,7 +178,28 @@ pub fn view(
         image_surface(context_id, surface_id, path, width, height),
         &RequestMetadata::default(),
     )?;
-    place_surface(client, &surface, node_id, display.columns, display.rows)?;
+    let mut node = match placement {
+        Placement::Inline => {
+            place_surface(client, &surface, node_id, display.columns, display.rows)?
+        }
+        Placement::FullWindow | Placement::Pane(..) => {
+            let (column, row) = placed_origin(placement, display, geometry);
+            place_full_window_surface(
+                client,
+                &surface,
+                node_id,
+                column,
+                row,
+                display.columns,
+                display.rows,
+            )?
+        }
+    };
+    if let Placement::Pane(input, _) = placement
+        && !input.visible()
+    {
+        set_node_visible(client, &mut node, false)?;
+    }
 
     let encoded_kind = match format {
         Some(image::ImageFormat::Png) => Some(IMAGE_PNG),
@@ -174,7 +241,7 @@ pub fn view(
         channel.as_ref(),
         !config.no_wait,
         || {
-            if !config.is_dry_run() {
+            if !config.is_dry_run() && matches!(placement, Placement::Inline) {
                 reserve_rows(display.rows)?;
             }
             Ok(())
@@ -186,7 +253,127 @@ pub fn view(
         display.columns,
         display.rows
     ));
-    Ok(())
+    if matches!(placement, Placement::Inline) || config.is_dry_run() {
+        return Ok(());
+    }
+    let shown = hold_still(client, placement, &mut node, (width, height), config.zoom);
+    // Grid nodes vanish with the session anyway; deleting them is the polite, prompt way.
+    let _ = client.delete_node(context_id, node_id, &RequestMetadata::default());
+    let _ = client.destroy_track(&track, &RequestMetadata::default());
+    let _ = client.destroy_surface(&surface, &RequestMetadata::default());
+    drop(channel);
+    drop(terminal);
+    shown.map_err(Into::into)
+}
+
+/// The size of an image shown with `placement`.
+fn placed_size(
+    placement: Placement<'_>,
+    width: u32,
+    height: u32,
+    zoom: f32,
+    geometry: TerminalGeometry,
+) -> DisplaySize {
+    match placement {
+        Placement::Inline => display_size(width, height, zoom, geometry, false),
+        Placement::FullWindow => {
+            let screen = Pane {
+                column: 0,
+                row: 0,
+                columns: u32::from(geometry.cols),
+                rows: u32::from(geometry.rows),
+            };
+            let fit = screen.fit_geometry(geometry, FIT_MARGIN_COLS, FIT_MARGIN_ROWS);
+            display_size(width, height, zoom, fit, true)
+        }
+        Placement::Pane(_, pane) => {
+            let fit = pane.fit_geometry(geometry, FIT_MARGIN_COLS, FIT_MARGIN_ROWS);
+            display_size(width, height, zoom, fit, false)
+        }
+    }
+}
+
+/// The grid cell where a full-window or pane image starts.
+fn placed_origin(
+    placement: Placement<'_>,
+    display: DisplaySize,
+    geometry: TerminalGeometry,
+) -> (u32, u32) {
+    match placement {
+        Placement::Pane(_, pane) => pane.origin(display.columns),
+        Placement::Inline | Placement::FullWindow => {
+            crate::video_player::centered_origin(geometry, display.columns, display.rows)
+        }
+    }
+}
+
+/// Keeps a full-window or pane image up until it is dismissed, following resizes.
+///
+/// A full-window image ends at any key; a pane image when its stdin closes, hiding and showing
+/// on the way as the pane is covered and uncovered.
+fn hold_still(
+    client: &mut VividClient,
+    placement: Placement<'_>,
+    node: &mut vivid_sdk::SceneNode,
+    (width, height): (u32, u32),
+    zoom: f32,
+) -> io::Result<()> {
+    loop {
+        match placement {
+            Placement::Pane(input, _) => match input.try_command() {
+                Some(Command::Quit) => return Ok(()),
+                Some(Command::SetVisible(visible)) => set_node_visible(client, node, visible)?,
+                Some(_) => {}
+                None => {}
+            },
+            Placement::FullWindow => {
+                if crossterm::event::poll(Duration::ZERO)? {
+                    match crossterm::event::read()? {
+                        crossterm::event::Event::Key(key)
+                            if key.kind != crossterm::event::KeyEventKind::Release =>
+                        {
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Placement::Inline => return Ok(()),
+        }
+        if take_target_change(client)? {
+            let geometry = TerminalGeometry::settled_presenter(client);
+            let display = placed_size(placement, width, height, zoom, geometry);
+            let (column, row) = placed_origin(placement, display, geometry);
+            update_full_window_surface(client, node, column, row, display.columns, display.rows)?;
+        }
+        std::thread::sleep(STILL_POLL_INTERVAL);
+    }
+}
+
+/// Applies pending target changes, reporting whether there were any.
+///
+/// # Errors
+///
+/// Returns `BrokenPipe` when the presenter closed the session.
+fn take_target_change(client: &mut VividClient) -> io::Result<bool> {
+    let deadline = Instant::now() + STILL_POLL_INTERVAL;
+    let mut changed = false;
+    while let Some(event) = client.take_event()? {
+        match event {
+            vivid_sdk::SessionEvent::TargetChanged(payload) => {
+                client.apply_target_changed(&payload)?;
+                changed = true;
+            }
+            vivid_sdk::SessionEvent::ConnectionClosed { diagnostic } => {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, diagnostic));
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    Ok(changed)
 }
 
 fn activate_and_finish_still_track(
@@ -578,14 +765,21 @@ fn timeout_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
-fn display_size(width: u32, height: u32, zoom: f32, geometry: TerminalGeometry) -> DisplaySize {
+/// The cells an image takes in `geometry`'s drawable area, shrunk to fit and, with `upscale`,
+/// grown to fill it.
+fn display_size(
+    width: u32,
+    height: u32,
+    zoom: f32,
+    geometry: TerminalGeometry,
+    upscale: bool,
+) -> DisplaySize {
     let desired_width = (width as f64 * f64::from(zoom)).round().max(1.0);
     let desired_height = (height as f64 * f64::from(zoom)).round().max(1.0);
     let maximum_width = f64::from(geometry.drawable_width_px(FIT_MARGIN_COLS));
     let maximum_height = f64::from(geometry.drawable_height_px(FIT_MARGIN_ROWS));
-    let scale = (maximum_width / desired_width)
-        .min(maximum_height / desired_height)
-        .min(1.0);
+    let fit = (maximum_width / desired_width).min(maximum_height / desired_height);
+    let scale = if upscale { fit } else { fit.min(1.0) };
     let target_width = (desired_width * scale).round().clamp(1.0, maximum_width) as u32;
     let target_height = (desired_height * scale).round().clamp(1.0, maximum_height) as u32;
 
@@ -821,10 +1015,84 @@ mod tests {
     }
 
     #[test]
+    fn pane_image_is_placed_in_the_pane_starts_hidden_when_covered_and_is_removed() {
+        use vivid_protocol::cbor::Value;
+        use vivid_protocol::messages::{CREATE_NODE, DELETE_NODE, UPDATE_NODE};
+        let directory = TemporaryDirectory::new();
+        let path = directory.path().join("red.png");
+        image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let presenter = TestPresenter::start(100, 30).unwrap();
+        let session = vivid_sdk::Session::connect(test_producer(&presenter)).unwrap();
+        let mut client = VividClient::from_session(session);
+        let config = <Config as clap::Parser>::try_parse_from([
+            "vivi",
+            "--control-endpoint",
+            "unused",
+            "--preview",
+            "red.png",
+            "48",
+            "27",
+        ])
+        .unwrap();
+        let pane = Pane {
+            column: 52,
+            row: 2,
+            columns: 48,
+            rows: 27,
+        };
+        // Stdin already closed while the pane was covered: shown hidden, then removed.
+        let input = PaneInput::ended(false);
+        view_in(&config, &mut client, &path, Placement::Pane(&input, pane)).unwrap();
+        client.close().unwrap();
+
+        let observed = presenter.observed();
+        let geometry = |record: u16| {
+            let request = observed
+                .iter()
+                .find(|request| request.record_type == record)
+                .unwrap_or_else(|| panic!("no record {record}"));
+            let node = request
+                .payload
+                .iter()
+                .find_map(|(key, value)| match value {
+                    Value::Map(fields) if *key == 4 => Some(fields.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let cell = |key| {
+                node.iter()
+                    .find(|(k, _)| *k == key)
+                    .and_then(|(_, v)| v.as_u64())
+            };
+            (
+                cell(1).map(|x| x >> 32),
+                cell(2).map(|y| y >> 32),
+                cell(3).map(|w| w >> 32),
+            )
+        };
+        let (x, y, width) = geometry(CREATE_NODE);
+        let width = width.unwrap();
+        assert!(width < 48, "a small image is not stretched across the pane");
+        assert_eq!((x, y), (Some(52 + (48 - width) / 2), Some(2)));
+        assert!(
+            observed
+                .iter()
+                .any(|request| request.record_type == UPDATE_NODE)
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|request| request.record_type == DELETE_NODE)
+        );
+    }
+
+    #[test]
     fn natural_size_is_preserved_when_it_fits() {
         let geometry = TerminalGeometry::with_cell_size(120, 40, 10, 20);
         assert_eq!(
-            display_size(640, 360, 1.0, geometry),
+            display_size(640, 360, 1.0, geometry, false),
             DisplaySize {
                 columns: 64,
                 rows: 18
@@ -836,10 +1104,52 @@ mod tests {
     fn large_media_shrinks_to_terminal_margin() {
         let geometry = TerminalGeometry::with_cell_size(80, 24, 10, 20);
         assert_eq!(
-            display_size(1280, 720, 1.0, geometry),
+            display_size(1280, 720, 1.0, geometry, false),
             DisplaySize {
                 columns: 76,
                 rows: 22
+            }
+        );
+    }
+
+    #[test]
+    fn full_window_fills_the_screen_and_panes_keep_small_images_small() {
+        let geometry = TerminalGeometry::with_cell_size(80, 24, 10, 20);
+        let full = placed_size(Placement::FullWindow, 64, 36, 1.0, geometry);
+        assert_eq!(
+            full,
+            DisplaySize {
+                columns: 80,
+                rows: 23
+            }
+        );
+        assert_eq!(placed_origin(Placement::FullWindow, full, geometry), (0, 0));
+
+        let input = PaneInput::idle();
+        let pane = Pane {
+            column: 41,
+            row: 2,
+            columns: 38,
+            rows: 20,
+        };
+        let small = placed_size(Placement::Pane(&input, pane), 100, 100, 1.0, geometry);
+        assert_eq!(
+            small,
+            DisplaySize {
+                columns: 10,
+                rows: 5
+            }
+        );
+        assert_eq!(
+            placed_origin(Placement::Pane(&input, pane), small, geometry),
+            (55, 2)
+        );
+        let large = placed_size(Placement::Pane(&input, pane), 4000, 1000, 1.0, geometry);
+        assert_eq!(
+            large,
+            DisplaySize {
+                columns: 38,
+                rows: 5
             }
         );
     }

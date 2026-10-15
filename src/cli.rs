@@ -1,6 +1,9 @@
+use std::io;
 use std::path::PathBuf;
 
 use clap::Parser;
+
+use crate::terminal_geometry::Pane;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -52,6 +55,21 @@ pub struct Config {
     /// Exit after video submission without waiting or starting local audio.
     #[arg(long)]
     pub no_wait: bool,
+
+    /// Show images full window and wait for a key; video and audio already play full window.
+    #[arg(short = 'f', long, conflicts_with = "inline")]
+    pub fullscreen: bool,
+
+    /// Preview in a file manager pane: the arguments are FILE COLUMNS ROWS [COLUMN ROW].
+    ///
+    /// The media stays in that grid rectangle until stdin closes. Stdin lines `hide` and `show`
+    /// toggle it while something covers the pane. Videos loop, muted unless --sound is given.
+    #[arg(long, conflicts_with_all = ["inline", "fullscreen", "no_wait"])]
+    pub preview: bool,
+
+    /// Play the sound of videos shown with --preview.
+    #[arg(long, requires = "preview")]
+    pub sound: bool,
 }
 
 impl Config {
@@ -79,6 +97,43 @@ impl Config {
     pub fn is_dry_run(&self) -> bool {
         self.dry_run || self.trace_dir.is_some()
     }
+
+    /// The file and pane of a `--preview` run.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` unless the arguments are `FILE COLUMNS ROWS [COLUMN ROW]` with a
+    /// nonempty pane.
+    pub fn preview_target(&self) -> io::Result<(PathBuf, Pane)> {
+        let invalid =
+            |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
+        let [file, cells @ ..] = self.files.as_slice() else {
+            return Err(invalid("--preview needs FILE COLUMNS ROWS [COLUMN ROW]"));
+        };
+        if !matches!(cells.len(), 2 | 4) {
+            return Err(invalid("--preview needs FILE COLUMNS ROWS [COLUMN ROW]"));
+        }
+        let mut numbers = [0_u32; 4];
+        for (number, cell) in numbers.iter_mut().zip(cells) {
+            *number = cell
+                .to_str()
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| invalid("--preview pane sizes and positions are cell counts"))?;
+        }
+        let [columns, rows, column, row] = numbers;
+        if columns == 0 || rows == 0 {
+            return Err(invalid("--preview pane must be at least one cell"));
+        }
+        Ok((
+            file.clone(),
+            Pane {
+                column,
+                row,
+                columns,
+                rows,
+            },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +152,9 @@ mod tests {
             trace_dir: None,
             verbose: false,
             no_wait: false,
+            fullscreen: false,
+            preview: false,
+            sound: false,
         }
     }
 
@@ -130,6 +188,34 @@ mod tests {
         assert_eq!(parsed.realtime_endpoint.as_deref(), Some("unix:/realtime"));
         assert!(Config::try_parse_from(["vivi", "--endpoint", "unix:/old", "image.png"]).is_err());
         assert!(Config::try_parse_from(["vivi", "--token", "secret", "image.png"]).is_err());
+    }
+
+    #[test]
+    fn preview_takes_the_pane_vfm_appends_after_the_file() {
+        let parse = |args: &[&str]| {
+            Config::try_parse_from(["vivi", "--preview"].iter().chain(args))
+                .unwrap()
+                .preview_target()
+        };
+        let pane = |column, row, columns, rows| Pane {
+            column,
+            row,
+            columns,
+            rows,
+        };
+        let (file, at) = parse(&["clip.mp4", "48", "20", "51", "2"]).unwrap();
+        assert_eq!((file, at), (PathBuf::from("clip.mp4"), pane(51, 2, 48, 20)));
+        assert_eq!(parse(&["a.png", "10", "5"]).unwrap().1, pane(0, 0, 10, 5));
+        for bad in [
+            &["a.png"][..],
+            &["a.png", "10"],
+            &["a.png", "0", "5"],
+            &["a.png", "x", "5"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(Config::try_parse_from(["vivi", "--preview", "-i", "a.png", "1", "1"]).is_err());
+        assert!(Config::try_parse_from(["vivi", "--sound", "a.mp4"]).is_err());
     }
 
     #[test]
