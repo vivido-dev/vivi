@@ -21,10 +21,10 @@ use crate::audio_streamer::audio_track;
 use crate::cli::Config;
 use crate::client::{DeliveryPacer, VividClient, catchup_delivery_rates};
 use crate::ffmpeg::{AudioDemuxer, EncodedMediaPacket, VideoDemuxer, VideoInfo};
-use crate::playback_ui::{Command, PlaybackTimeline, PlaybackUi};
+use crate::playback_ui::{Command, PaneInput, PlaybackTimeline, PlaybackUi};
 use crate::terminal_geometry::{
-    TerminalGeometry, cells_for_pixels, place_full_window_surface, place_surface, reserve_rows,
-    resize_placed_surface, update_full_window_surface,
+    Pane, TerminalGeometry, cells_for_pixels, place_full_window_surface, place_surface,
+    reserve_rows, resize_placed_surface, set_node_visible, update_full_window_surface,
 };
 
 const FIT_MARGIN_COLS: u16 = 4;
@@ -488,21 +488,78 @@ fn seek_request_metadata() -> io::Result<RequestMetadata> {
     })
 }
 
+/// Where a video is placed: at the cursor, full window, or in a file manager's preview pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layout {
+    Inline,
+    FullWindow,
+    Pane(Pane),
+}
+
+impl Layout {
+    /// The terminal geometry media is sized against, before fit margins.
+    fn fit_geometry(self, terminal: TerminalGeometry) -> TerminalGeometry {
+        match self {
+            Self::Inline => terminal,
+            Self::FullWindow => media_geometry(terminal, true),
+            Self::Pane(pane) => pane.fit_geometry(terminal, FIT_MARGIN_COLS, FIT_MARGIN_ROWS),
+        }
+    }
+
+    /// The grid cell where media of `columns` x `rows` cells starts.
+    fn origin(self, fit: TerminalGeometry, columns: u32, rows: u32) -> (u32, u32) {
+        match self {
+            Self::Pane(pane) => pane.origin(columns),
+            Self::Inline | Self::FullWindow => centered_origin(fit, columns, rows),
+        }
+    }
+}
+
 pub fn play(
     config: &Config,
     client: &mut VividClient,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    play_in(config, client, path, None)
+}
+
+/// Plays one video, in `pane` when a file manager previews it.
+///
+/// A pane takes its commands from the [`PaneInput`] and draws nothing in the terminal. Its video
+/// is muted unless `--sound` was given.
+///
+/// # Errors
+///
+/// Returns demuxing, presenter, and audio-output failures.
+pub fn play_in(
+    config: &Config,
+    client: &mut VividClient,
+    path: &Path,
+    pane: Option<(&PaneInput, Pane)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     crate::client::require_timed_sync(client)?;
-    let info = VideoDemuxer::inspect(path)?;
-    let ui = PlaybackUi::enter(
-        config,
-        path,
-        info.duration_us,
-        info.has_audio && client.supports(vivid_protocol::registry::AUDIO_GAIN),
-        false,
-        Some(client.cancel_handle()),
-    )?;
+    let mut info = VideoDemuxer::inspect(path)?;
+    if pane.is_some() && !config.sound {
+        // A file manager steps through videos as the cursor moves; silent previews by default.
+        info.has_audio = false;
+        info.audio = None;
+    }
+    let ui = match pane {
+        Some((input, _)) => Some(PlaybackUi::pane(input, info.duration_us)),
+        None => PlaybackUi::enter(
+            config,
+            path,
+            info.duration_us,
+            info.has_audio && client.supports(vivid_protocol::registry::AUDIO_GAIN),
+            false,
+            Some(client.cancel_handle()),
+        )?,
+    };
+    let layout = match pane {
+        Some((_, pane)) => Layout::Pane(pane),
+        None if ui.is_some() => Layout::FullWindow,
+        None => Layout::Inline,
+    };
     if info.colorimetry_inferred {
         client.verbose(format_args!(
             "video {}: inferred colorimetry as primaries={}, transfer={}, matrix={}, range={}",
@@ -514,7 +571,7 @@ pub fn play(
         ));
     }
     let geometry = TerminalGeometry::settled_presenter(client);
-    let layout_geometry = media_geometry(geometry, ui.is_some());
+    let layout_geometry = layout.fit_geometry(geometry);
     let (mut columns, mut rows) = display_size(
         info.width,
         info.height,
@@ -530,12 +587,18 @@ pub fn play(
         video_surface(context_id, surface_id, path, info.width, info.height),
         &RequestMetadata::default(),
     )?;
-    let (mut column, mut row) = centered_origin(layout_geometry, columns, rows);
-    let mut placed_node = if ui.is_some() {
-        place_full_window_surface(client, &surface, node_id, column, row, columns, rows)?
-    } else {
+    let (mut column, mut row) = layout.origin(layout_geometry, columns, rows);
+    let mut placed_node = if layout == Layout::Inline {
         place_surface(client, &surface, node_id, columns, rows)?
+    } else {
+        place_full_window_surface(client, &surface, node_id, column, row, columns, rows)?
     };
+    if let Some((input, _)) = pane
+        && !input.visible()
+    {
+        // A loop pass that starts while the pane is covered starts hidden too.
+        set_node_visible(client, &mut placed_node, false)?;
+    }
     if !config.is_dry_run() && ui.is_none() {
         reserve_rows(rows)?;
     }
@@ -676,7 +739,7 @@ pub fn play(
                 continue;
             };
             if let Some(geometry) = take_target_geometry(client, video_track.id())? {
-                let layout_geometry = media_geometry(geometry, ui.is_some());
+                let layout_geometry = layout.fit_geometry(geometry);
                 let size = display_size(
                     info.width,
                     info.height,
@@ -686,8 +749,8 @@ pub fn play(
                     layout_geometry,
                 );
                 if size != (columns, rows) {
-                    if ui.is_some() {
-                        (column, row) = centered_origin(layout_geometry, size.0, size.1);
+                    if layout != Layout::Inline {
+                        (column, row) = layout.origin(layout_geometry, size.0, size.1);
                         update_full_window_surface(
                             client,
                             &mut placed_node,
@@ -730,6 +793,9 @@ pub fn play(
                     ui.set_position_us(current_us.min(info.duration_us.unwrap_or(u64::MAX)));
                     while let Some(command) = ui.try_command() {
                         match command {
+                            Command::SetVisible(visible) => {
+                                set_node_visible(client, &mut placed_node, visible)?
+                            }
                             Command::Quit => {
                                 let _ = video_channel.close();
                                 cancel_presenter_audio(client, &mut presenter_audio);
@@ -1050,6 +1116,7 @@ pub fn play(
                 if let Some(ui) = ui.as_ref() {
                     while let Some(command) = ui.try_command() {
                         match command {
+                            Command::SetVisible(visible) => set_node_visible(client, &mut placed_node, visible)?,
                             command @ (Command::Quit | Command::SeekBy(_) | Command::SeekTo(_)) => {
                                 if !matches!(command, Command::Quit) {
                                     let metadata = seek_request_metadata()?;
@@ -1427,6 +1494,9 @@ pub fn play(
                 let mut seek_target = None;
                 while let Some(command) = ui.try_command() {
                     match command {
+                        Command::SetVisible(visible) => {
+                            set_node_visible(client, &mut placed_node, visible)?
+                        }
                         Command::Quit => return Ok(Some(AudioWaitEvent::Quit)),
                         Command::TogglePause => {
                             toggle_video_pause(
@@ -1823,6 +1893,7 @@ fn wait_for_playback_end(
             let mut seek_target = None;
             while let Some(command) = ui.try_command() {
                 match command {
+                    Command::SetVisible(visible) => set_node_visible(client, placed_node, visible)?,
                     Command::Quit => return Ok(WaitOutcome::Quit),
                     Command::TogglePause => {
                         toggle_video_pause(

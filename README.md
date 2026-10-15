@@ -81,7 +81,24 @@ Video and audio use the full terminal window by default. `-i`/`--inline` preserv
 inline placement and non-interactive playback behavior. Full-window playback uses the same keys as
 Kitim: Space pauses or resumes, `f`/`b` seek 10 seconds, Left/Right seek 5 seconds, Up/Down change
 volume by 5%, `g` opens a timestamp prompt, and `q` or Ctrl-C stops the current file. Seeking while
-paused holds the new position until Space is pressed again. Images always remain inline.
+paused holds the new position until Space is pressed again. Images remain inline unless
+`-f`/`--fullscreen` is given: then each image is centered on the alternate screen, scaled to fill
+it, until a key is pressed.
+
+### File manager previews
+
+`--preview` shows one image or video inside a file manager's preview pane, as
+[vfm](https://github.com/wensheng/vfm) runs it inside Vivido:
+
+```bash
+vivi --preview photo.png 48 27 52 2      # FILE COLUMNS ROWS [COLUMN ROW]
+vivi --sound --preview clip.mp4 48 27 52 2
+```
+
+The media is placed with a grid node at that 0-based cell rectangle of the window, centered across
+it and at its top, never larger than its natural size. Nothing is written to the terminal. Videos
+loop, muted unless `--sound` is given. The preview lasts until stdin closes; stdin lines `hide` and
+`show` toggle it while something covers the pane, and other lines are ignored. Errors go to stderr.
 
 Current Vivid 1.5 vvmux is supported, including a remote vvmux session entered through vvssh.
 For remote use, run `vvssh`; see [Remote Linux audio](docs/ssh-linux-audio.md). A separate media

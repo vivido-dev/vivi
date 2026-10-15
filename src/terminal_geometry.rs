@@ -147,6 +147,53 @@ impl TerminalGeometry {
     }
 }
 
+/// A grid-cell rectangle that a `--preview` run keeps its media inside.
+///
+/// The origin is the upper-left cell of the terminal viewport, as for grid-positioned nodes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Pane {
+    pub column: u32,
+    pub row: u32,
+    pub columns: u32,
+    pub rows: u32,
+}
+
+impl Pane {
+    /// The terminal geometry whose drawable area, less `margin_cols` and `margin_rows`, is
+    /// exactly this pane, with the presenter's cell size.
+    ///
+    /// Media sizing subtracts fit margins from the terminal it is given; adding them back here
+    /// lets a pane reuse that sizing and fill its whole rectangle.
+    pub fn fit_geometry(
+        self,
+        terminal: TerminalGeometry,
+        margin_cols: u16,
+        margin_rows: u16,
+    ) -> TerminalGeometry {
+        let cells = |count: u32, margin: u16| {
+            u16::try_from(count)
+                .unwrap_or(u16::MAX)
+                .saturating_add(margin)
+        };
+        TerminalGeometry::with_cell_size(
+            cells(self.columns, margin_cols),
+            cells(self.rows, margin_rows),
+            terminal.cell_width_px,
+            terminal.cell_height_px,
+        )
+    }
+
+    /// Where media of `columns` x `rows` cells goes: centered across the pane, at its top.
+    ///
+    /// File managers draw the pane's title right above it, so the picture starts under it.
+    pub fn origin(self, columns: u32) -> (u32, u32) {
+        (
+            self.column + self.columns.saturating_sub(columns) / 2,
+            self.row,
+        )
+    }
+}
+
 pub fn cells_for_pixels(pixels: u32, cell_pixels: u32) -> u32 {
     let cell_pixels = cell_pixels.max(1);
     pixels.max(1).saturating_add(cell_pixels - 1) / cell_pixels
@@ -229,6 +276,23 @@ pub fn place_full_window_surface(
     set_node_cell_rect(&mut node, column, row, columns, rows)?;
     create_node_with_target_retry(client, &node)?;
     Ok(node)
+}
+
+/// Show or hide a placed node without changing its geometry.
+///
+/// # Errors
+///
+/// Returns the presenter's error when the node update fails after following a target change.
+pub fn set_node_visible(
+    client: &mut VividClient,
+    node: &mut SceneNode,
+    visible: bool,
+) -> io::Result<()> {
+    if node.visible == visible {
+        return Ok(());
+    }
+    node.visible = visible;
+    update_node_with_target_retry(client, node)
 }
 
 fn terminal_surface_node(
@@ -642,6 +706,23 @@ mod tests {
 
         assert_eq!(node.geometry[3].1.as_u64(), Some(64_u64 << 32));
         assert_eq!(node.geometry[4].1.as_u64(), Some(24_u64 << 32));
+    }
+
+    #[test]
+    fn pane_geometry_fills_the_pane_after_fit_margins() {
+        let pane = Pane {
+            column: 51,
+            row: 2,
+            columns: 48,
+            rows: 20,
+        };
+        let terminal = TerminalGeometry::with_cell_size(100, 24, 9, 18);
+        let fit = pane.fit_geometry(terminal, 4, 2);
+        assert_eq!(fit, TerminalGeometry::with_cell_size(52, 22, 9, 18));
+        assert_eq!(fit.drawable_width_px(4), 48 * 9);
+        assert_eq!(fit.drawable_height_px(2), 20 * 18);
+        assert_eq!(pane.origin(40), (55, 2));
+        assert_eq!(pane.origin(60), (51, 2));
     }
 
     #[test]

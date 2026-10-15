@@ -530,7 +530,8 @@ pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
                         Command::SeekBy(_) | Command::SeekTo(_) => {
                             ui.set_message("Seek requires presenter audio");
                         }
-                        Command::Resize(_) => {}
+                        // Audio has no picture, and only previews are hidden.
+                        Command::Resize(_) | Command::SetVisible(_) => {}
                     }
                 }
                 ui.redraw()?;
