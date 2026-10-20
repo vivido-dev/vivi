@@ -63,11 +63,11 @@ pub struct Config {
     /// Preview in a file manager pane: the arguments are FILE COLUMNS ROWS [COLUMN ROW].
     ///
     /// The media stays in that grid rectangle until stdin closes. Stdin lines `hide` and `show`
-    /// toggle it while something covers the pane. Videos loop with sound unless --mute is given.
+    /// toggle it while something covers the pane. Video and audio loop with sound unless --mute is given.
     #[arg(long, conflicts_with_all = ["inline", "fullscreen", "no_wait"])]
     pub preview: bool,
 
-    /// Mute videos shown with --preview.
+    /// Mute video and audio shown with --preview.
     #[arg(long, requires = "preview")]
     pub mute: bool,
 }

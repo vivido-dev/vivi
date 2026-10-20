@@ -17,12 +17,12 @@ use crate::cli::Config;
 use crate::client::{VividClient, catchup_delivery_rates};
 use crate::ffmpeg::{AudioDemuxer, AudioInfo};
 use crate::image_viewer::{raster_track_configuration, send_full_raster_frame};
-use crate::playback_ui::{Command, PlaybackTimeline, PlaybackUi};
+use crate::playback_ui::{Command, PaneInput, PlaybackTimeline, PlaybackUi};
 use crate::terminal_geometry::{
-    TerminalGeometry, place_full_window_surface, place_surface, reserve_rows,
-    resize_placed_surface, update_full_window_surface,
+    Pane, TerminalGeometry, place_full_window_surface, place_surface, reserve_rows,
+    resize_placed_surface, set_node_visible, update_full_window_surface,
 };
-use crate::video_player::{centered_origin, display_size, effective_audio_gain, media_geometry};
+use crate::video_player::{Layout, display_size, effective_audio_gain};
 
 const INITIAL_BUFFER_US: u64 = 100_000;
 const MAXIMUM_LATENCY_US: u64 = 2_000_000;
@@ -39,21 +39,45 @@ pub fn play(
     client: &mut VividClient,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    play_in(config, client, path, None)
+}
+
+/// Plays one audio file, optionally inside a file manager's preview pane.
+///
+/// Pane input owns visibility and cancellation without taking over the terminal.
+///
+/// # Errors
+///
+/// Returns demuxing, transport, or presenter failures.
+pub fn play_in(
+    config: &Config,
+    client: &mut VividClient,
+    path: &Path,
+    preview: Option<(&PaneInput, Pane)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     crate::client::require_timed_sync(client)?;
     let info = AudioDemuxer::inspect(path)?;
     let gain_available = client.supports(vivid_protocol::registry::AUDIO_GAIN);
-    let ui = PlaybackUi::enter(
-        config,
-        path,
-        info.duration_us,
-        gain_available,
-        true,
-        Some(client.cancel_handle()),
-    )?;
+    let ui = match preview {
+        Some((input, _)) => Some(PlaybackUi::pane(input, info.duration_us)),
+        None => PlaybackUi::enter(
+            config,
+            path,
+            info.duration_us,
+            gain_available,
+            true,
+            Some(client.cancel_handle()),
+        )?,
+    };
 
     let geometry = TerminalGeometry::settled_presenter(client);
-    let layout = media_geometry(geometry, ui.is_some());
-    let (columns, rows) = display_size(BLANK_WIDTH, BLANK_HEIGHT, 1, 1, config.zoom, layout);
+    let layout = match preview {
+        Some((_, pane)) => Layout::Pane(pane),
+        None if ui.is_some() => Layout::FullWindow,
+        None => Layout::Inline,
+    };
+    let fit = layout.fit_geometry(geometry);
+    let (columns, rows) = display_size(BLANK_WIDTH, BLANK_HEIGHT, 1, 1, config.zoom, fit);
     let surface_id = client.allocate_id()?;
     let node_id = client.allocate_id()?;
     let context_id = client.info().root_context_id;
@@ -61,11 +85,11 @@ pub fn play(
         audio_surface(context_id, surface_id, path, BLANK_WIDTH, BLANK_HEIGHT),
         &RequestMetadata::default(),
     )?;
-    let (column, row) = centered_origin(layout, columns, rows);
-    let placed_node = if ui.is_some() {
-        place_full_window_surface(client, &surface, node_id, column, row, columns, rows)
-    } else {
+    let (column, row) = layout.origin(fit, columns, rows);
+    let placed_node = if layout == Layout::Inline {
         place_surface(client, &surface, node_id, columns, rows)
+    } else {
+        place_full_window_surface(client, &surface, node_id, column, row, columns, rows)
     };
     let placed_node = match placed_node {
         Ok(node) => node,
@@ -74,7 +98,7 @@ pub fn play(
             return Err(error.into());
         }
     };
-    if !config.is_dry_run() && ui.is_none() {
+    if !config.is_dry_run() && layout == Layout::Inline {
         reserve_rows(rows)?;
     }
     let mut pane = BlankPane {
@@ -83,8 +107,15 @@ pub fn play(
         row,
         columns,
         rows,
-        full_window: ui.is_some(),
+        layout,
     };
+    if let Some((input, _)) = preview
+        && !input.visible()
+        && let Err(error) = set_node_visible(client, &mut pane.node, false)
+    {
+        teardown_audio_surface(client, &surface, None, None, node_id);
+        return Err(error.into());
+    }
 
     // The blank frame is presentation only: a presenter that refuses the raster track still
     // plays the audio instead of failing the whole file.
@@ -98,6 +129,19 @@ pub fn play(
             None
         }
     };
+
+    if preview.is_some() && config.mute {
+        let result = hold_muted_preview(
+            config,
+            client,
+            &surface,
+            blank.as_ref(),
+            &mut pane,
+            ui.as_ref(),
+        );
+        teardown_audio_surface(client, &surface, None, blank.as_ref(), node_id);
+        return result.map_err(Into::into);
+    }
 
     let track = match setup_audio_track(client, &surface, &info) {
         Ok(track) => track,
@@ -130,7 +174,7 @@ struct BlankPane {
     row: u32,
     columns: u32,
     rows: u32,
-    full_window: bool,
+    layout: Layout,
 }
 
 impl BlankPane {
@@ -140,13 +184,13 @@ impl BlankPane {
         geometry: TerminalGeometry,
         zoom: f32,
     ) -> io::Result<()> {
-        let layout = media_geometry(geometry, self.full_window);
-        let size = display_size(BLANK_WIDTH, BLANK_HEIGHT, 1, 1, zoom, layout);
+        let fit = self.layout.fit_geometry(geometry);
+        let size = display_size(BLANK_WIDTH, BLANK_HEIGHT, 1, 1, zoom, fit);
         if size == (self.columns, self.rows) {
             return Ok(());
         }
-        if self.full_window {
-            (self.column, self.row) = centered_origin(layout, size.0, size.1);
+        if self.layout != Layout::Inline {
+            (self.column, self.row) = self.layout.origin(fit, size.0, size.1);
             update_full_window_surface(
                 client,
                 &mut self.node,
@@ -161,6 +205,45 @@ impl BlankPane {
         (self.columns, self.rows) = size;
         Ok(())
     }
+}
+
+/// Keeps a muted audio preview visible without opening an audio track or device.
+fn hold_muted_preview(
+    config: &Config,
+    client: &mut VividClient,
+    surface: &vivid_sdk::Surface,
+    blank: Option<&Track>,
+    pane: &mut BlankPane,
+    ui: Option<&PlaybackUi>,
+) -> io::Result<()> {
+    if let Some(track) = blank {
+        client.activate_tracks(
+            surface,
+            &[SlotBinding {
+                slot: track.configuration()?.slot,
+                track_id: track.id(),
+                expected_channel_generation: track.channel_generation(),
+                required_milestone: MILESTONE_OUTPUT_READY,
+            }],
+            &RequestMetadata::default(),
+        )?;
+    }
+    while !config.is_dry_run() {
+        let Some(ui) = ui else { return Ok(()) };
+        while let Some(command) = ui.try_command() {
+            match command {
+                Command::Quit => return Ok(()),
+                Command::SetVisible(visible) => set_node_visible(client, &mut pane.node, visible)?,
+                _ => {}
+            }
+        }
+        // Service transport events even while muted so a closed presenter ends the preview.
+        if let Some(geometry) = take_target_geometry(client, 0)? {
+            pane.resize(client, geometry, config.zoom)?;
+        }
+        thread::sleep(Duration::from_micros(UI_POLL_TIMEOUT_US));
+    }
+    Ok(())
 }
 
 /// Creates the blank still-frame raster track and submits its single opaque frame, waiting for
@@ -651,8 +734,7 @@ fn handle_commands(
                 pane.resize(client, geometry, zoom)?;
                 ui.redraw()?;
             }
-            // Audio is never previewed in a file manager pane.
-            Command::SetVisible(_) => {}
+            Command::SetVisible(visible) => set_node_visible(client, &mut pane.node, visible)?,
             Command::Quit => return Ok(Some(ControlAction::Quit)),
         }
     }
@@ -1216,6 +1298,171 @@ mod tests {
         );
         session_b.close().unwrap();
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn audio_previews_place_tracks_inside_the_pane_and_clean_up_on_closed_input() {
+        use clap::Parser;
+
+        let path = write_pcm_wav("preview");
+        for (muted, visible) in [(false, true), (false, false), (true, true)] {
+            let options = if muted { vec!["--mute"] } else { vec![] };
+            let config =
+                Config::try_parse_from(["vivi", "--preview"].into_iter().chain(options).chain([
+                    "audio.wav",
+                    "48",
+                    "20",
+                    "52",
+                    "2",
+                ]))
+                .unwrap();
+            let (_, rectangle) = config.preview_target().unwrap();
+            let presenter = TestPresenter::start(100, 30).unwrap();
+            let session = vivid_sdk::Session::connect(pane_producer(&presenter)).unwrap();
+            let mut client = VividClient::from_session(session);
+            let input = PaneInput::ended(visible);
+            play_in(&config, &mut client, &path, Some((&input, rectangle))).unwrap();
+            client.close().unwrap();
+
+            let observed = presenter.observed();
+            let tracks: Vec<_> = observed
+                .iter()
+                .filter(|r| r.record_type == messages::CREATE_TRACK)
+                .map(|r| {
+                    TrackConfiguration::decode(r.object_id, &Value::Map(r.payload.clone()), false)
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                tracks
+                    .iter()
+                    .any(|t| matches!(t.kind, KindConfiguration::Audio(_))),
+                !muted
+            );
+            assert!(
+                tracks
+                    .iter()
+                    .any(|t| matches!(t.kind, KindConfiguration::Raster(_)))
+            );
+            for track in &tracks {
+                assert!(
+                    observed
+                        .iter()
+                        .any(|r| r.record_type == messages::DESTROY_TRACK
+                            && r.object_id == track.track_id)
+                );
+            }
+            let nodes: Vec<_> = observed
+                .iter()
+                .filter(|r| matches!(r.record_type, messages::CREATE_NODE | messages::UPDATE_NODE))
+                .map(|r| SceneNode::decode(r.object_id, &Value::Map(r.payload.clone())).unwrap())
+                .collect();
+            assert!(!nodes.is_empty());
+            for node in &nodes {
+                let cell = |key| {
+                    node.geometry
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .unwrap()
+                        .1
+                        .as_u64()
+                        .unwrap()
+                        >> 32
+                };
+                assert!(cell(1) >= 52 && cell(1) + cell(3) <= 100);
+                assert!(cell(2) >= 2 && cell(2) + cell(4) <= 22);
+            }
+            assert_eq!(nodes.last().unwrap().visible, visible);
+            assert!(
+                observed
+                    .iter()
+                    .any(|r| r.record_type == messages::DELETE_NODE)
+            );
+            assert!(
+                observed
+                    .iter()
+                    .any(|r| r.record_type == messages::DESTROY_SURFACE)
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn muted_preview_handles_live_hide_show_and_quit_without_an_audio_device() {
+        use clap::Parser;
+
+        let path = write_pcm_wav("preview-visibility");
+        let config = Config::try_parse_from([
+            "vivi",
+            "--preview",
+            "--mute",
+            "audio.wav",
+            "48",
+            "20",
+            "52",
+            "2",
+        ])
+        .unwrap();
+        let (_, rectangle) = config.preview_target().unwrap();
+        let presenter = TestPresenter::start(100, 30).unwrap();
+        let producer = pane_producer(&presenter);
+        let input = PaneInput::idle();
+        let controller = PlaybackUi::pane(&input, None);
+        let audio_path = path.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let session = vivid_sdk::Session::connect(producer).unwrap();
+            let mut client = VividClient::from_session(session);
+            let outcome = play_in(&config, &mut client, &audio_path, Some((&input, rectangle)))
+                .map_err(|error| error.to_string());
+            client.close().unwrap();
+            let _ = done.send(outcome);
+        });
+        let wait_visible = |visible| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let last = presenter.observed().into_iter().rfind(|r| {
+                    matches!(r.record_type, messages::CREATE_NODE | messages::UPDATE_NODE)
+                });
+                if last.is_some_and(|r| {
+                    SceneNode::decode(r.object_id, &Value::Map(r.payload))
+                        .unwrap()
+                        .visible
+                        == visible
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "audio pane visibility did not become {visible}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_visible(true);
+        controller.defer_command(Command::SetVisible(false));
+        wait_visible(false);
+        controller.defer_command(Command::SetVisible(true));
+        wait_visible(true);
+        controller.defer_command(Command::Quit);
+        result
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(
+            !presenter
+                .observed()
+                .iter()
+                .filter(|r| r.record_type == messages::CREATE_TRACK)
+                .any(|r| matches!(
+                    TrackConfiguration::decode(r.object_id, &Value::Map(r.payload.clone()), false)
+                        .unwrap()
+                        .kind,
+                    KindConfiguration::Audio(_)
+                ))
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -498,7 +498,7 @@ pub(crate) enum Layout {
 
 impl Layout {
     /// The terminal geometry media is sized against, before fit margins.
-    fn fit_geometry(self, terminal: TerminalGeometry) -> TerminalGeometry {
+    pub(crate) fn fit_geometry(self, terminal: TerminalGeometry) -> TerminalGeometry {
         match self {
             Self::Inline => terminal,
             Self::FullWindow => media_geometry(terminal, true),
@@ -507,7 +507,7 @@ impl Layout {
     }
 
     /// The grid cell where media of `columns` x `rows` cells starts.
-    fn origin(self, fit: TerminalGeometry, columns: u32, rows: u32) -> (u32, u32) {
+    pub(crate) fn origin(self, fit: TerminalGeometry, columns: u32, rows: u32) -> (u32, u32) {
         match self {
             Self::Pane(pane) => pane.origin(columns),
             Self::Inline | Self::FullWindow => centered_origin(fit, columns, rows),

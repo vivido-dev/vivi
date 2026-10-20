@@ -87,20 +87,28 @@ it, until a key is pressed.
 
 ### File manager previews
 
-`--preview` shows one image or video inside a file manager's preview pane, as
+`--preview` shows an image or plays video/audio inside a file manager's preview pane, as
 [vfm](https://github.com/wensheng/vfm) runs it inside Vivido:
 
 ```bash
 vivi --preview photo.png 48 27 52 2      # FILE COLUMNS ROWS [COLUMN ROW]
 vivi --preview clip.mp4 48 27 52 2
+vivi --preview song.mp3 48 27 52 2
 vivi --mute --preview clip.mp4 48 27 52 2
 ```
 
 The media is placed with a grid node at that 0-based cell rectangle of the window, centered across
-it and at its top, never larger than its natural size. Nothing is written to the terminal. Videos
-loop with sound; `--mute` silences them. The preview lasts until stdin closes; stdin lines `hide`
+it and at its top, never larger than its natural size. Nothing is written to the terminal. Video
+and audio loop with sound; audio uses the same small blank surface as normal audio playback.
+`--mute` suppresses audio tracks and local audio output, leaving the preview surface in place.
+The preview lasts until stdin closes; stdin lines `hide`
 and `show` toggle it while something covers the pane, and other lines are ignored. Errors go to
 stderr.
+
+Audio uses presenter tracks when supported, with the existing local-device fallback for local
+sessions. Local fallback pauses while hidden; remote sessions keep their presenter audio route.
+Files without audio extensions are recognized by the media demuxer after image/video probing.
+Dry runs submit one pass and exit instead of looping.
 
 Current Vivid 1.5 vvmux is supported, including a remote vvmux session entered through vvssh.
 For remote use, run `vvssh`; see [Remote Linux audio](docs/ssh-linux-audio.md). A separate media

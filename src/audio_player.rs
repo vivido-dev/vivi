@@ -470,9 +470,22 @@ mod platform_stub {
 pub use platform_stub::{AudioPlayback, prepare_video};
 
 pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
+    play_in(config, path, None)
+}
+
+/// Plays locally while honoring the file manager's pane visibility and lifetime.
+///
+/// # Errors
+///
+/// Returns audio decoding or output-device failures.
+pub fn play_in(
+    config: &crate::cli::Config,
+    path: &Path,
+    input: Option<&crate::playback_ui::PaneInput>,
+) -> io::Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
-        let _ = (config, path);
+        let _ = (config, path, input);
         return Err(unsupported_platform_error());
     }
 
@@ -485,11 +498,27 @@ pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
         use crate::playback_ui::{Command, PlaybackTimeline, PlaybackUi};
 
         let info = AudioDemuxer::inspect(path)?;
-        let ui = PlaybackUi::enter(config, path, info.duration_us, true, true, None)?;
+        if let Some(input) = input
+            && config.mute
+        {
+            while !input.closed() && !config.is_dry_run() {
+                thread::sleep(Duration::from_millis(50));
+            }
+            return Ok(());
+        }
+        let ui = match input {
+            Some(input) => Some(PlaybackUi::pane(input, info.duration_us)),
+            None => PlaybackUi::enter(config, path, info.duration_us, true, true, None)?,
+        };
         let mut playback = AudioPlayback::open(path, None)?;
-        playback.start()?;
+        if input.is_none_or(crate::playback_ui::PaneInput::visible) {
+            playback.start()?;
+        }
         let mut timeline = PlaybackTimeline::new(0);
         timeline.started();
+        if input.is_some_and(|input| !input.visible()) {
+            timeline.pause();
+        }
         let mut volume_percent = 100_u32;
         let mut muted = false;
         while !playback.is_finished() {
@@ -530,8 +559,16 @@ pub fn play(config: &crate::cli::Config, path: &Path) -> io::Result<()> {
                         Command::SeekBy(_) | Command::SeekTo(_) => {
                             ui.set_message("Seek requires presenter audio");
                         }
-                        // Audio has no picture, and only previews are hidden.
-                        Command::Resize(_) | Command::SetVisible(_) => {}
+                        Command::SetVisible(visible) => {
+                            if visible {
+                                playback.resume()?;
+                                timeline.resume();
+                            } else {
+                                playback.pause();
+                                timeline.pause();
+                            }
+                        }
+                        Command::Resize(_) => {}
                     }
                 }
                 ui.redraw()?;

@@ -99,10 +99,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Shows `path` in a file manager's `pane` until stdin closes, looping videos.
+/// Shows or plays `path` in a file manager's `pane` until stdin closes.
 ///
-/// Files that are neither video nor image by extension are tried as an image, then as video, so
-/// the error for an unreadable file names both attempts.
+/// Unknown types are tried as image, video, then audio, including extensionless files.
 fn preview(
     config: &Config,
     client: &mut VividClient,
@@ -113,28 +112,31 @@ fn preview(
     let placement = image_viewer::Placement::Pane(&input, pane);
     match media_hint(path) {
         MediaHint::Video => {}
-        MediaHint::Audio => {
-            return Err(std::io::Error::other(format!(
-                "{} is audio: there is no picture to preview",
-                path.display()
-            ))
-            .into());
-        }
+        MediaHint::Audio => return loop_audio(config, client, path, &input, pane),
         MediaHint::Unknown => match image_viewer::view_in(config, client, path, placement) {
             Ok(()) => return Ok(()),
             Err(image_error) if input.closed() => return Err(image_error),
             Err(image_error) => {
-                return loop_video(config, client, path, &input, pane).map_err(|video_error| {
-                    std::io::Error::other(format!(
+                return match loop_video(config, client, path, &input, pane) {
+                    Ok(()) => Ok(()),
+                    Err(video_error) if is_no_video_stream(video_error.as_ref()) => {
+                        loop_audio(config, client, path, &input, pane)
+                    }
+                    Err(video_error) => Err(std::io::Error::other(format!(
                         "could not read {} as an image ({image_error}) or video ({video_error})",
                         path.display()
                     ))
-                    .into()
-                });
+                    .into()),
+                };
             }
         },
     }
-    loop_video(config, client, path, &input, pane)
+    match loop_video(config, client, path, &input, pane) {
+        Err(error) if is_no_video_stream(error.as_ref()) => {
+            loop_audio(config, client, path, &input, pane)
+        }
+        result => result,
+    }
 }
 
 /// Plays a video in `pane` again and again, until the file manager closes stdin.
@@ -147,6 +149,26 @@ fn loop_video(
 ) -> Result<(), Box<dyn std::error::Error>> {
     while !input.closed() {
         video_player::play_in(config, client, path, Some((input, pane)))?;
+        if config.is_dry_run() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Loops audio without taking over terminal input or drawing outside the pane.
+fn loop_audio(
+    config: &Config,
+    client: &mut VividClient,
+    path: &Path,
+    input: &playback_ui::PaneInput,
+    pane: terminal_geometry::Pane,
+) -> Result<(), Box<dyn std::error::Error>> {
+    while !input.closed() {
+        play_audio_in(config, client, path, Some((input, pane)))?;
+        if config.is_dry_run() {
+            break;
+        }
     }
     Ok(())
 }
@@ -166,8 +188,21 @@ fn play_audio(
     client: &mut VividClient,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    play_audio_in(config, client, path, None)
+}
+
+fn play_audio_in(
+    config: &Config,
+    client: &mut VividClient,
+    path: &Path,
+    pane: Option<(&playback_ui::PaneInput, terminal_geometry::Pane)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if client.supports(crate::protocol::registry::TIMED_MEDIA) {
-        match audio_streamer::play(config, client, path) {
+        let result = match pane {
+            Some(_) => audio_streamer::play_in(config, client, path, pane),
+            None => audio_streamer::play(config, client, path),
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(error) if !crate::client::local_audio_allowed() => {
                 return Err(std::io::Error::new(
@@ -190,7 +225,10 @@ fn play_audio(
         )
         .into());
     }
-    audio_player::play(config, path)?;
+    match pane {
+        Some((input, _)) => audio_player::play_in(config, path, Some(input))?,
+        None => audio_player::play(config, path)?,
+    }
     Ok(())
 }
 
