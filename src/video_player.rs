@@ -526,7 +526,7 @@ pub fn play(
 /// Plays one video, in `pane` when a file manager previews it.
 ///
 /// A pane takes its commands from the [`PaneInput`] and draws nothing in the terminal. Its video
-/// is muted unless `--sound` was given.
+/// plays with sound unless `--mute` was given.
 ///
 /// # Errors
 ///
@@ -539,8 +539,8 @@ pub fn play_in(
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::client::require_timed_sync(client)?;
     let mut info = VideoDemuxer::inspect(path)?;
-    if pane.is_some() && !config.sound {
-        // A file manager steps through videos as the cursor moves; silent previews by default.
+    if pane.is_some() && config.mute {
+        // Muted previews skip both presenter audio and local-device fallback.
         info.has_audio = false;
         info.audio = None;
     }
@@ -3308,6 +3308,66 @@ fn timeout_us(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_opens_audio_by_default_and_only_mute_disables_it() {
+        use vivid_protocol::cbor::Value;
+        use vivid_protocol::messages::CREATE_TRACK;
+        use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/preview.webm");
+        for (options, audio_expected) in [(&[][..], true), (&["--mute"][..], false)] {
+            let config = <Config as clap::Parser>::try_parse_from(
+                ["vivi", "--preview"]
+                    .into_iter()
+                    .chain(options.iter().copied())
+                    .chain(["preview.webm", "48", "20"]),
+            )
+            .unwrap();
+            let (_, pane) = config.preview_target().unwrap();
+            let presenter = TestPresenter::start(80, 24).unwrap();
+            let session = vivid_sdk::Session::connect(vivid_sdk::ProducerConfig {
+                endpoint_control: Some(presenter.endpoint().to_owned()),
+                endpoint_realtime: Some(presenter.endpoint().to_owned()),
+                endpoint_bulk: Some(presenter.endpoint().to_owned()),
+                authentication: vivid_sdk::ProducerAuthentication::root_hex(ROOT_SECRET_HEX)
+                    .unwrap(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut client = VividClient::from_session(session);
+            // Quit after setup: this presenter validates transport without decoding or a device.
+            let input = PaneInput::ended(true);
+            play_in(&config, &mut client, &path, Some((&input, pane))).unwrap();
+            client.close().unwrap();
+
+            let tracks: Vec<_> = presenter
+                .observed()
+                .into_iter()
+                .filter(|request| request.record_type == CREATE_TRACK)
+                .map(|request| {
+                    TrackConfiguration::decode(
+                        request.object_id,
+                        &Value::Map(request.payload),
+                        false,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert!(
+                tracks
+                    .iter()
+                    .any(|track| matches!(track.kind, KindConfiguration::Video(_)))
+            );
+            assert_eq!(
+                tracks
+                    .iter()
+                    .any(|track| matches!(track.kind, KindConfiguration::Audio(_))),
+                audio_expected,
+                "preview audio with {options:?}"
+            );
+        }
+    }
 
     #[test]
     fn mute_silences_audio_gain_and_unmute_restores_the_stored_volume() {

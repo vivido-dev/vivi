@@ -301,7 +301,7 @@ mod tests {
             no_wait: false,
             fullscreen: false,
             preview: false,
-            sound: false,
+            mute: false,
         };
         producer_config(&config).validate().unwrap();
     }

@@ -1234,7 +1234,7 @@ mod tests {
             no_wait: false,
             fullscreen: false,
             preview: false,
-            sound: false,
+            mute: false,
         };
         let mut client = VividClient::connect(&config).unwrap();
         play(&config, &mut client, &path).unwrap();

@@ -63,13 +63,13 @@ pub struct Config {
     /// Preview in a file manager pane: the arguments are FILE COLUMNS ROWS [COLUMN ROW].
     ///
     /// The media stays in that grid rectangle until stdin closes. Stdin lines `hide` and `show`
-    /// toggle it while something covers the pane. Videos loop, muted unless --sound is given.
+    /// toggle it while something covers the pane. Videos loop with sound unless --mute is given.
     #[arg(long, conflicts_with_all = ["inline", "fullscreen", "no_wait"])]
     pub preview: bool,
 
-    /// Play the sound of videos shown with --preview.
+    /// Mute videos shown with --preview.
     #[arg(long, requires = "preview")]
-    pub sound: bool,
+    pub mute: bool,
 }
 
 impl Config {
@@ -154,7 +154,7 @@ mod tests {
             no_wait: false,
             fullscreen: false,
             preview: false,
-            sound: false,
+            mute: false,
         }
     }
 
@@ -215,7 +215,10 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         assert!(Config::try_parse_from(["vivi", "--preview", "-i", "a.png", "1", "1"]).is_err());
-        assert!(Config::try_parse_from(["vivi", "--sound", "a.mp4"]).is_err());
+        assert!(
+            Config::try_parse_from(["vivi", "--preview", "--sound", "a.mp4", "1", "1"]).is_err()
+        );
+        assert!(Config::try_parse_from(["vivi", "--mute", "a.mp4"]).is_err());
     }
 
     #[test]

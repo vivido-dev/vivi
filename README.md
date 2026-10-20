@@ -92,13 +92,15 @@ it, until a key is pressed.
 
 ```bash
 vivi --preview photo.png 48 27 52 2      # FILE COLUMNS ROWS [COLUMN ROW]
-vivi --sound --preview clip.mp4 48 27 52 2
+vivi --preview clip.mp4 48 27 52 2
+vivi --mute --preview clip.mp4 48 27 52 2
 ```
 
 The media is placed with a grid node at that 0-based cell rectangle of the window, centered across
 it and at its top, never larger than its natural size. Nothing is written to the terminal. Videos
-loop, muted unless `--sound` is given. The preview lasts until stdin closes; stdin lines `hide` and
-`show` toggle it while something covers the pane, and other lines are ignored. Errors go to stderr.
+loop with sound; `--mute` silences them. The preview lasts until stdin closes; stdin lines `hide`
+and `show` toggle it while something covers the pane, and other lines are ignored. Errors go to
+stderr.
 
 Current Vivid 1.5 vvmux is supported, including a remote vvmux session entered through vvssh.
 For remote use, run `vvssh`; see [Remote Linux audio](docs/ssh-linux-audio.md). A separate media
