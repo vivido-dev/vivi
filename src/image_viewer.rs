@@ -1191,7 +1191,14 @@ mod tests {
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="5000" height="5000"/>"#,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("TooLarge"));
+        let size = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<vivid_protocol::media::SizeError>());
+        assert_eq!(
+            size,
+            Some(&vivid_protocol::media::SizeError::TooLarge),
+            "{error}"
+        );
     }
 
     #[test]
