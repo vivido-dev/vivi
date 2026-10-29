@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use vivid_protocol::messages::PayloadMap;
-use vivid_protocol::{cbor::Value, registry};
+use vivid_protocol::cbor::Value;
+use vivid_protocol::messages::{self, PayloadMap};
 use vivid_sdk::{Fit, RequestMetadata, SceneNode, SessionEvent, Surface};
 
 use crate::client::VividClient;
@@ -392,7 +392,7 @@ fn set_node_cell_size(node: &mut SceneNode, columns: u32, rows: u32) -> io::Resu
 fn create_node_with_target_retry(client: &mut VividClient, node: &SceneNode) -> io::Result<()> {
     match client.create_node(node, &RequestMetadata::default()) {
         Ok(_) => Ok(()),
-        Err(error) if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) => {
+        Err(error) if presenter_code(&error) == Some(messages::ERROR_STALE_TARGET_GENERATION) => {
             let mut applied = false;
             while let Some(event) = client.take_event()? {
                 if let SessionEvent::TargetChanged(payload) = event {
@@ -414,7 +414,7 @@ fn create_node_with_target_retry(client: &mut VividClient, node: &SceneNode) -> 
 fn update_node_with_target_retry(client: &mut VividClient, node: &SceneNode) -> io::Result<()> {
     match client.update_node(node, &RequestMetadata::default()) {
         Ok(_) => Ok(()),
-        Err(error) if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) => {
+        Err(error) if presenter_code(&error) == Some(messages::ERROR_STALE_TARGET_GENERATION) => {
             let mut applied = false;
             while let Some(event) = client.take_event()? {
                 if let SessionEvent::TargetChanged(payload) = event {

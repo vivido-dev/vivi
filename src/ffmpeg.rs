@@ -1514,11 +1514,13 @@ unsafe fn audio_info(
     let extradata = normalize_audio_extradata(&codec, &extradata)?;
     if vivid_protocol::media::valid_audio_packetization(&codec, packetization) {
         vivid_protocol::media::validate_audio_initialization(
-            &codec,
-            packetization,
-            &extradata,
-            sample_rate,
-            channels,
+            vivid_protocol::media::AudioInitialization {
+                codec: &codec,
+                packetization,
+                extradata: &extradata,
+                sample_rate,
+                channels,
+            },
         )?;
     }
     let channel_mask = if matches!(parameters.ch_layout.order as u32, 0 | 1) {
